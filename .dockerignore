@@ -1,0 +1,14 @@
+target/
+.venv/
+fixtures/
+dev-answer/
+ref/
+scripts/
+docs/
+.claude/
+.github/
+tools/
+out/
+dev/
+*.md
+.git

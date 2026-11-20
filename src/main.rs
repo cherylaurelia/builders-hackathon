@@ -24,6 +24,7 @@ const WEEK: i64 = 7 * DAY;
 const CHUNK: usize = 4 << 20;
 const EB: usize = 256; // event_id buckets
 const PB: usize = 256; // person buckets
+const UB: usize = 1024; // user_id buckets: each holds a cache-sized slice of the link table
 
 // ---------------------------------------------------------------- hashing
 
@@ -98,6 +99,11 @@ impl Hasher for IdHasher {
     }
 }
 type PreMap<V> = HashMap<PreHashed, V, BuildHasherDefault<IdHasher>>;
+
+#[inline]
+fn uid_bucket(h: u64) -> usize {
+    ((h >> 44) as usize) & (UB - 1)
+}
 
 #[inline]
 fn person_bucket(h: u64) -> usize {
@@ -480,6 +486,12 @@ fn die(msg: &str) -> ! {
     std::process::exit(1)
 }
 
+/// `n` empty vectors, each with room for about `total / (threads * n)` items (+25% for uneven shares).
+fn sized<T>(n: usize, total: usize, threads: usize) -> Vec<Vec<T>> {
+    let each = total / (threads * n).max(1) * 5 / 4 + 16;
+    (0..n).map(|_| Vec::with_capacity(each)).collect()
+}
+
 /// Runs `work(state, i)` for i in 0..n across `threads` threads; returns each thread's state.
 fn par<S: Send>(threads: usize, n: usize, init: impl Fn() -> S + Sync, work: impl Fn(&mut S, usize) + Sync) -> Vec<S> {
     let next = AtomicUsize::new(0);
@@ -579,7 +591,7 @@ struct Ctx {
     day0: i64,
     ndays: usize,
     ncamp: usize, // organic is index ncamp
-    links: BytesMap<Bytes>,
+    links: Vec<PreMap<(Bytes, u64)>>, // by uid_bucket: linked ID -> (person name, its hash)
     products: BytesMap<u16>,
     campaigns: BytesMap<u16>,
     unknown_cat: u16,
@@ -653,17 +665,18 @@ fn main() {
 
     // 1. links
     let links = build_links(&csv_files(&data.join("links")), threads);
-    lap(&format!("links: {} linked ids", links.len()));
+    lap(&format!("links: {} linked ids", links.iter().map(|m| m.len()).sum::<usize>()));
 
     let ctx = Ctx { ws, we, day0, ndays, ncamp, links, products, campaigns, unknown_cat, cat_rank };
 
     // 2. events: parse into event_id buckets
     let ev_files = csv_files(&data.join("events"));
     let ev_chunks = chunks(&ev_files);
+    let ev_est = ev_files.iter().map(|f| f.len()).sum::<usize>() / 60; // lines are ~75 bytes
     let parsed = par(
         threads,
         ev_chunks.len(),
-        || (0..EB).map(|_| Vec::<RawEvent>::new()).collect::<Vec<_>>(),
+        || sized::<RawEvent>(EB, ev_est, threads),
         |buckets, i| {
             let (f, s, e) = ev_chunks[i];
             for_records::<7>(f, s, e, |fields| {
@@ -676,10 +689,11 @@ fn main() {
     lap("events parsed");
 
     // 3. dedup per event bucket, route survivors to person buckets
+    let n_parsed: usize = parsed.iter().flatten().map(|v| v.len()).sum();
     let routed = par(
         threads,
         EB,
-        || (0..PB).map(|_| Vec::<PEvent>::new()).collect::<Vec<_>>(),
+        || sized::<PEvent>(UB, n_parsed, threads),
         |out, b| {
             let mut v: Vec<RawEvent> = Vec::with_capacity(parsed.iter().map(|t| t[b].len()).sum());
             for t in &parsed {
@@ -701,9 +715,9 @@ fn main() {
                     }
                     seen.push(r.eid);
                     if r.keep {
-                        let name = ctx.links.get(r.uid).copied().unwrap_or(r.uid);
-                        let nh = hash_bytes(name);
-                        out[person_bucket(nh)].push(PEvent { nh, name, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind });
+                        // routed by user_id for now; phase 4b swaps in the person
+                        let uh = hash_bytes(r.uid);
+                        out[uid_bucket(uh)].push(PEvent { nh: uh, name: r.uid, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind });
                     }
                 }
                 i = j;
@@ -716,20 +730,50 @@ fn main() {
     // 4. clicks
     let ck_files = csv_files(&data.join("clicks"));
     let ck_chunks = chunks(&ck_files);
+    let ck_est = ck_files.iter().map(|f| f.len()).sum::<usize>() / 40; // lines are ~50 bytes
     let clicks = par(
         threads,
         ck_chunks.len(),
-        || (0..PB).map(|_| Vec::<PClick>::new()).collect::<Vec<_>>(),
+        || sized::<PClick>(UB, ck_est, threads),
         |out, i| {
             let (f, s, e) = ck_chunks[i];
             for_records::<4>(f, s, e, |fields| {
                 if let Some(c) = parse_click(&ctx, fields) {
-                    out[person_bucket(c.nh)].push(c);
+                    out[uid_bucket(c.nh)].push(c);
                 }
             });
         },
     );
     lap("clicks parsed");
+
+    // 4b. per user_id bucket: user_id -> person through that bucket's slice of the link table
+    let n_ev: usize = routed.iter().flatten().map(|v| v.len()).sum();
+    let n_ck: usize = clicks.iter().flatten().map(|v| v.len()).sum();
+    let resolved = par(
+        threads,
+        UB,
+        || (sized::<PEvent>(PB, n_ev, threads), sized::<PClick>(PB, n_ck, threads)),
+        |(oe, oc), u| {
+            let map = &ctx.links[u];
+            let person = |h: u64, s: Bytes| map.get(&PreHashed { h, s }).copied().unwrap_or((s, h));
+            for t in &routed {
+                for e in &t[u] {
+                    let (name, nh) = person(e.nh, e.name);
+                    oe[person_bucket(nh)].push(PEvent { nh, name, ..*e });
+                }
+            }
+            for t in &clicks {
+                for c in &t[u] {
+                    let (name, nh) = person(c.nh, c.name);
+                    oc[person_bucket(nh)].push(PClick { nh, name, ..*c });
+                }
+            }
+        },
+    );
+    drop(routed);
+    drop(clicks);
+    let (routed, clicks): (Vec<_>, Vec<_>) = resolved.into_iter().unzip();
+    lap("user ids resolved");
 
     // 5. per person bucket
     let width = ctx.ndays;
@@ -778,7 +822,7 @@ fn main() {
     lap(&format!("written: {} user rows, {} campaign rows", user_parts.iter().map(|p| p.len()).sum::<usize>(), camp_rows.len()));
 }
 
-fn build_links(files: &[Bytes], threads: usize) -> BytesMap<Bytes> {
+fn build_links(files: &[Bytes], threads: usize) -> Vec<PreMap<(Bytes, u64)>> {
     let ch = chunks(files);
     let parts = par(
         threads,
@@ -829,13 +873,14 @@ fn build_links(files: &[Bytes], threads: usize) -> BytesMap<Bytes> {
             best[r] = i as u32;
         }
     }
-    let mut map: BytesMap<Bytes> = BytesMap::default();
-    map.reserve(n);
+    let mut maps: Vec<PreMap<(Bytes, u64)>> = (0..UB).map(|_| PreMap::default()).collect();
     for i in 0..n {
         let r = find(&mut parent, i as u32) as usize;
-        map.insert(names[i], names[best[r] as usize]);
+        let name = names[best[r] as usize];
+        let h = hash_bytes(names[i]);
+        maps[uid_bucket(h)].insert(PreHashed { h, s: names[i] }, (name, hash_bytes(name)));
     }
-    map
+    maps
 }
 
 #[inline]
@@ -881,8 +926,8 @@ fn parse_click(ctx: &Ctx, [cid, uid, camp, ts]: [Bytes; 4]) -> Option<PClick> {
         return None;
     }
     let camp = *ctx.campaigns.get(camp)?;
-    let name = ctx.links.get(uid).copied().unwrap_or(uid);
-    Some(PClick { nh: hash_bytes(name), name, ts: t, cid, camp })
+    // routed by user_id for now; phase 4b swaps in the person
+    Some(PClick { nh: hash_bytes(uid), name: uid, ts: t, cid, camp })
 }
 
 struct Agg {

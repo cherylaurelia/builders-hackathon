@@ -151,6 +151,64 @@ fn split<const N: usize>(line: &'static [u8]) -> Option<[Bytes; N]> {
     }
 }
 
+/// Bit k set when b[k] is `,`, `"` or `\n`, for the first min(64, len) bytes.
+#[inline(always)]
+fn special_mask(b: &[u8]) -> u64 {
+    if b.len() < 64 {
+        let mut m = 0u64;
+        for (k, &c) in b.iter().enumerate() {
+            m |= ((c == b',' || c == b'"' || c == b'\n') as u64) << k;
+        }
+        return m;
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let p = b.as_ptr();
+        let (cm, qt, nl) = (vdupq_n_u8(b','), vdupq_n_u8(b'"'), vdupq_n_u8(b'\n'));
+        let hit = |v: uint8x16_t| vorrq_u8(vorrq_u8(vceqq_u8(v, cm), vceqq_u8(v, qt)), vceqq_u8(v, nl));
+        let bits: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let bits = vld1q_u8(bits.as_ptr());
+        let t0 = vandq_u8(hit(vld1q_u8(p)), bits);
+        let t1 = vandq_u8(hit(vld1q_u8(p.add(16))), bits);
+        let t2 = vandq_u8(hit(vld1q_u8(p.add(32))), bits);
+        let t3 = vandq_u8(hit(vld1q_u8(p.add(48))), bits);
+        let s0 = vpaddq_u8(t0, t1);
+        let s1 = vpaddq_u8(t2, t3);
+        let s = vpaddq_u8(s0, s1);
+        let s = vpaddq_u8(s, s);
+        return vgetq_lane_u64(vreinterpretq_u64_u8(s), 0);
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let p = b.as_ptr() as *const __m256i;
+        let (cm, qt, nl) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'"' as i8), _mm256_set1_epi8(b'\n' as i8));
+        let hit = |v: __m256i| {
+            _mm256_movemask_epi8(_mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi8(v, cm), _mm256_cmpeq_epi8(v, qt)), _mm256_cmpeq_epi8(v, nl))) as u32 as u64
+        };
+        return hit(_mm256_loadu_si256(p)) | (hit(_mm256_loadu_si256(p.add(1))) << 32);
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let p = b.as_ptr() as *const __m128i;
+        let (cm, qt, nl) = (_mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'"' as i8), _mm_set1_epi8(b'\n' as i8));
+        let hit = |v: __m128i| {
+            _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, cm), _mm_cmpeq_epi8(v, qt)), _mm_cmpeq_epi8(v, nl))) as u32 as u64
+        };
+        return hit(_mm_loadu_si128(p)) | (hit(_mm_loadu_si128(p.add(1))) << 16) | (hit(_mm_loadu_si128(p.add(2))) << 32) | (hit(_mm_loadu_si128(p.add(3))) << 48);
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut m = 0u64;
+        for (k, &c) in b[..64].iter().enumerate() {
+            m |= ((c == b',' || c == b'"' || c == b'\n') as u64) << k;
+        }
+        m
+    }
+}
+
 /// Calls `f` with the N unquoted fields of every well-formed line that starts in [start, end)
 /// of `file`, skipping the header line. Same dialect as `split`, in one SIMD pass over the chunk.
 #[inline]
@@ -188,9 +246,12 @@ fn for_records<const N: usize>(file: Bytes, start: usize, end: usize, mut f: imp
             fs = i + 1;
         }};
     }
-    let base = line;
-    for r in memchr::memchr3_iter(b',', b'"', b'\n', &file[base..]) {
-        let i = base + r;
+    let mut p = line;
+    while p < len {
+        let mut m = special_mask(&file[p..]);
+        while m != 0 {
+        let i = p + m.trailing_zeros() as usize;
+        m &= m - 1;
         match file[i] {
             b'"' => {
                 if q == 0 {
@@ -213,6 +274,8 @@ fn for_records<const N: usize>(file: Bytes, start: usize, end: usize, mut f: imp
                 }
             }
         }
+        }
+        p += 64;
     }
     // last line without a trailing newline
     if line < len {
@@ -250,35 +313,8 @@ fn for_lines(file: Bytes, start: usize, end: usize, mut f: impl FnMut(Bytes)) {
 
 // ---------------------------------------------------------------- timestamps
 
-#[inline]
-fn num(b: &[u8]) -> Option<i64> {
-    let mut v = 0i64;
-    for &c in b {
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        v = v * 10 + (c - b'0') as i64;
-    }
-    Some(v)
-}
 
-fn is_leap(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-}
 
-fn days_in_month(y: i64, m: i64) -> i64 {
-    match m {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        _ => {
-            if is_leap(y) {
-                29
-            } else {
-                28
-            }
-        }
-    }
-}
 
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
@@ -293,39 +329,45 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// `YYYY-MM-DDTHH:MM:SS` (the first 19 bytes) as epoch ms, calendar-checked.
 #[inline]
 fn civil(b: &[u8]) -> Option<i64> {
-    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+    let b: &[u8; 19] = b[..19].try_into().ok()?;
+    let d = |i: usize| b[i].wrapping_sub(b'0') as u32;
+    // every digit position must hold 0-9 and every separator must match
+    let mut bad = (b[4] ^ b'-') | (b[7] ^ b'-') | (b[10] ^ b'T') | (b[13] ^ b':') | (b[16] ^ b':');
+    for i in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+        bad |= (d(i) > 9) as u8;
+    }
+    if bad != 0 {
         return None;
     }
-    let y = num(&b[0..4])?;
-    let mo = num(&b[5..7])?;
-    let d = num(&b[8..10])?;
-    let h = num(&b[11..13])?;
-    let mi = num(&b[14..16])?;
-    let s = num(&b[17..19])?;
-    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) || h > 23 || mi > 59 || s > 59 {
+    let y = d(0) * 1000 + d(1) * 100 + d(2) * 10 + d(3);
+    let mo = d(5) * 10 + d(6);
+    let dd = d(8) * 10 + d(9);
+    let h = d(11) * 10 + d(12);
+    let mi = d(14) * 10 + d(15);
+    let sec = d(17) * 10 + d(18);
+    const DIM: [u32; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if mo.wrapping_sub(1) > 11 || dd == 0 || h > 23 || mi > 59 || sec > 59 {
         return None;
     }
-    Some(days_from_civil(y, mo, d) * DAY + h * 3_600_000 + mi * 60_000 + s * 1000)
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    if dd > DIM[mo as usize] + (mo == 2 && leap) as u32 {
+        return None;
+    }
+    let days = days_from_civil(y as i64, mo as i64, dd as i64);
+    Some(days * DAY + (h * 3_600_000 + mi * 60_000 + sec * 1000) as i64)
 }
 
 /// F1 `...Z`, F2 `...+HH:MM`, F3 digits = epoch ms. None = bad timestamp.
 #[inline]
 fn parse_ts(b: &[u8]) -> Option<i64> {
-    if b.is_empty() {
-        return None;
-    }
-    if b.iter().all(|c| c.is_ascii_digit()) {
-        let mut v = 0i64;
-        for &c in b {
-            v = v.checked_mul(10)?.checked_add((c - b'0') as i64)?;
-        }
-        return Some(v);
-    }
     match b.len() {
         20 if b[19] == b'Z' => civil(b),
         25 if (b[19] == b'+' || b[19] == b'-') && b[22] == b':' => {
-            let oh = num(&b[20..22])?;
-            let om = num(&b[23..25])?;
+            let (h1, h2, m1, m2) = (b[20].wrapping_sub(b'0'), b[21].wrapping_sub(b'0'), b[23].wrapping_sub(b'0'), b[24].wrapping_sub(b'0'));
+            if h1 > 9 || h2 > 9 || m1 > 9 || m2 > 9 {
+                return None;
+            }
+            let (oh, om) = ((h1 * 10 + h2) as i64, (m1 * 10 + m2) as i64);
             if oh > 23 || om > 59 {
                 return None;
             }
@@ -333,7 +375,19 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
             let t = civil(b)?;
             Some(if b[19] == b'+' { t - off } else { t + off })
         }
-        _ => None,
+        0 => None,
+        _ => {
+            // F3: digits only (an all-digit value never has `Z`, `+` or `-` at index 19)
+            let mut v = 0i64;
+            for &c in b {
+                let x = c.wrapping_sub(b'0');
+                if x > 9 {
+                    return None;
+                }
+                v = v.checked_mul(10)?.checked_add(x as i64)?;
+            }
+            Some(v)
+        }
     }
 }
 
@@ -397,6 +451,28 @@ fn chunks(files: &[Bytes]) -> Vec<(Bytes, usize, usize)> {
         }
     }
     out
+}
+
+/// (user + sys CPU seconds, instructions retired) of this process so far; instructions only on macOS
+fn usage() -> (f64, u64) {
+    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) } != 0 {
+        return (0.0, 0);
+    }
+    let t = |v: libc::timeval| v.tv_sec as f64 + v.tv_usec as f64 * 1e-6;
+    #[cfg(target_os = "macos")]
+    let ins = unsafe {
+        let mut ri: libc::rusage_info_v4 = std::mem::zeroed();
+        let p = &mut ri as *mut libc::rusage_info_v4 as *mut libc::rusage_info_t;
+        if libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V4, p) == 0 {
+            ri.ri_instructions
+        } else {
+            0
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let ins = 0;
+    (t(u.ru_utime) + t(u.ru_stime), ins)
 }
 
 fn die(msg: &str) -> ! {
@@ -521,7 +597,13 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8));
-    let lap = |what: &str| eprintln!("[{:7.3}s] {what}", t0.elapsed().as_secs_f64());
+    let usage0 = std::cell::Cell::new(usage());
+    let lap = |what: &str| {
+        let (c, ins) = usage();
+        let (c0, i0) = usage0.get();
+        eprintln!("[{:7.3}s wall, {:6.3}s cpu, {:6.2}G ins] {what}", t0.elapsed().as_secs_f64(), c - c0, (ins - i0) as f64 / 1e9);
+        usage0.set((c, ins));
+    };
 
     // manifest
     let manifest = std::fs::read_to_string(data.join("manifest.json")).unwrap_or_else(|e| die(&format!("manifest.json: {e}")));

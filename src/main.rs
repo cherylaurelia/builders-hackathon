@@ -151,6 +151,78 @@ fn split<const N: usize>(line: &'static [u8]) -> Option<[Bytes; N]> {
     }
 }
 
+/// Calls `f` with the N unquoted fields of every well-formed line that starts in [start, end)
+/// of `file`, skipping the header line. Same dialect as `split`, in one SIMD pass over the chunk.
+#[inline]
+#[allow(unused_assignments)]
+fn for_records<const N: usize>(file: Bytes, start: usize, end: usize, mut f: impl FnMut([Bytes; N])) {
+    let len = file.len();
+    let first = if start == 0 { 0 } else { start - 1 };
+    let Some(nl) = memchr::memchr(b'\n', &file[first..]) else { return };
+    let mut line = first + nl + 1; // first line start at or after `start` (the header when start == 0)
+    if line >= end || line >= len {
+        return;
+    }
+    let mut out: [Bytes; N] = [&[]; N];
+    let mut n = 0usize; // fields closed so far
+    let mut fs = line; // field start
+    let mut q = 0u32; // quotes in this field
+    let mut qlast = 0usize;
+    let mut qfirst = 0usize;
+    let mut bad = false;
+    // closes the field [fs, i): returns false when malformed
+    macro_rules! close {
+        ($i:expr) => {{
+            let i = $i;
+            if n == N {
+                bad = true;
+            } else if q == 0 {
+                out[n] = &file[fs..i];
+            } else if q == 2 && qfirst == fs && qlast + 1 == i {
+                out[n] = &file[fs + 1..i - 1];
+            } else {
+                bad = true;
+            }
+            n += 1;
+            q = 0;
+            fs = i + 1;
+        }};
+    }
+    let base = line;
+    for r in memchr::memchr3_iter(b',', b'"', b'\n', &file[base..]) {
+        let i = base + r;
+        match file[i] {
+            b'"' => {
+                if q == 0 {
+                    qfirst = i;
+                }
+                q += 1;
+                qlast = i;
+            }
+            b',' => close!(i),
+            _ => {
+                close!(i);
+                if !bad && n == N {
+                    f(out);
+                }
+                n = 0;
+                bad = false;
+                line = i + 1;
+                if line >= end {
+                    return;
+                }
+            }
+        }
+    }
+    // last line without a trailing newline
+    if line < len {
+        close!(len);
+        if !bad && n == N {
+            f(out);
+        }
+    }
+}
+
 /// Calls `f` for every line that starts in [start, end) of `file`, skipping the header line.
 #[inline]
 fn for_lines(file: Bytes, start: usize, end: usize, mut f: impl FnMut(Bytes)) {
@@ -512,8 +584,8 @@ fn main() {
         || (0..EB).map(|_| Vec::<RawEvent>::new()).collect::<Vec<_>>(),
         |buckets, i| {
             let (f, s, e) = ev_chunks[i];
-            for_lines(f, s, e, |l| {
-                if let Some(r) = parse_event(&ctx, l) {
+            for_records::<7>(f, s, e, |fields| {
+                if let Some(r) = parse_event(&ctx, fields) {
                     buckets[(r.h >> 56) as usize % EB].push(r);
                 }
             });
@@ -568,8 +640,8 @@ fn main() {
         || (0..PB).map(|_| Vec::<PClick>::new()).collect::<Vec<_>>(),
         |out, i| {
             let (f, s, e) = ck_chunks[i];
-            for_lines(f, s, e, |l| {
-                if let Some(c) = parse_click(&ctx, l) {
+            for_records::<4>(f, s, e, |fields| {
+                if let Some(c) = parse_click(&ctx, fields) {
                     out[person_bucket(c.nh)].push(c);
                 }
             });
@@ -632,11 +704,9 @@ fn build_links(files: &[Bytes], threads: usize) -> BytesMap<Bytes> {
         Vec::<(Bytes, Bytes)>::new,
         |v, i| {
             let (f, s, e) = ch[i];
-            for_lines(f, s, e, |l| {
-                if let Some([a, b]) = split::<2>(l) {
-                    if !a.is_empty() && !b.is_empty() {
-                        v.push((a, b));
-                    }
+            for_records::<2>(f, s, e, |[a, b]| {
+                if !a.is_empty() && !b.is_empty() {
+                    v.push((a, b));
                 }
             });
         },
@@ -687,8 +757,7 @@ fn build_links(files: &[Bytes], threads: usize) -> BytesMap<Bytes> {
 }
 
 #[inline]
-fn parse_event(ctx: &Ctx, line: Bytes) -> Option<RawEvent> {
-    let [eid, uid, ts, ingest, etype, pid, price] = split::<7>(line)?;
+fn parse_event(ctx: &Ctx, [eid, uid, ts, ingest, etype, pid, price]: [Bytes; 7]) -> Option<RawEvent> {
     if eid.is_empty() {
         return None;
     }
@@ -721,8 +790,7 @@ fn parse_event(ctx: &Ctx, line: Bytes) -> Option<RawEvent> {
 }
 
 #[inline]
-fn parse_click(ctx: &Ctx, line: Bytes) -> Option<PClick> {
-    let [cid, uid, camp, ts] = split::<4>(line)?;
+fn parse_click(ctx: &Ctx, [cid, uid, camp, ts]: [Bytes; 4]) -> Option<PClick> {
     if cid.is_empty() || uid.is_empty() {
         return None;
     }

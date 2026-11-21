@@ -5677,6 +5677,74 @@ mod tests {
         assert!(root(5) == ids[6] && root(6) == ids[6]);
     }
 
+    /// `mark_duplicates` against the rule itself, per key: every copy with an event that is ingested after the
+    /// earliest copy is dropped, and of the earliest copies (identical ones) exactly one stays. Keys with one copy
+    /// and with thousands, short IDs, copies without an event, far and late ingest_ts, three shards, four buckets.
+    #[test]
+    fn duplicates_keep_the_earliest_copy() {
+        let mut c = ctx();
+        c.qshift = 62;
+        let (parts, buckets) = (1usize << (16 - c.pshift), 4usize);
+        let mut r = Rng(5);
+        let mut shards: Vec<Shard> = (0..3).map(|_| Shard::new(parts, buckets)).collect();
+        let mut copies: HashMap<u64, Vec<(i64, *mut ERec)>> = HashMap::new();
+        let mut n = 0;
+        for k in 0..70_000usize {
+            let id = if k < 1200 { format!("e{k}") } else { format!("e{k:08}") };
+            let key = c.names.key(id.as_bytes());
+            let count = match r.below(100) {
+                0..=79 => 1,
+                80..=94 => 2,
+                95..=98 => 3 + r.below(3),
+                _ => 30,
+            } + if k == 4242 { 5000 } else { 0 };
+            let first = match r.below(100) {
+                0 => c.ilo - DAY - 1000 * r.below(1000) as i64, // far before the window: kept exact on the side
+                1 => c.ihi + 1000 * (1 + r.below(1000) as i64), // late whatever its ts: never has an event
+                _ => c.ws + 1000 * r.below(14 * 86_400) as i64,
+            };
+            let (mut ingest, mut valid) = (first, r.below(10) != 0 && first <= c.ihi);
+            for _ in 0..count {
+                // one in ten copies is identical to the one before it; the others are ingested later
+                if r.below(10) != 0 {
+                    ingest += 1000 * (1 + r.below(600) as i64);
+                    valid = r.below(10) != 0 && ingest <= c.ihi;
+                }
+                let Shard { arena, ev, .. } = &mut shards[r.below(3)];
+                let rec = if valid { ev[r.below(parts)].push(arena, EV_BLOCK, ERec { person: 7, ts: 5, pay: 9 }) } else { std::ptr::null_mut() };
+                let loc = if valid { loc_of(c.abase, rec) } else { 0 };
+                shards[r.below(3)].log(&c, key, ingest, loc);
+                copies.entry(key).or_default().push((ingest, rec));
+                n += 1;
+            }
+        }
+        for s in &mut shards {
+            s.ev.iter_mut().for_each(Stream::finish);
+            s.lg.iter_mut().for_each(Stream::finish);
+        }
+        assert!(n > 100_000 && shards.iter().all(|s| s.lg.iter().all(|l| l.len(LG_BLOCK) > 4 * LG_BLOCK)));
+        let cands = mark_duplicates(&c, &shards, buckets, 3);
+        assert!(cands > n / 4 && cands <= n, "{cands} of {n}");
+        // a dropped event has its ts and pay zeroed (`mark_duplicates`)
+        let dropped = |rec: *mut ERec| unsafe { (*rec).ts == 0 && (*rec).pay == 0 };
+        let (mut kept, mut gone) = (0, 0);
+        for (key, list) in &copies {
+            let min = list.iter().map(|x| x.0).min().unwrap();
+            let (first, later): (Vec<&(i64, *mut ERec)>, Vec<&(i64, *mut ERec)>) = list.iter().filter(|x| !x.1.is_null()).partition(|x| x.0 == min);
+            for x in &later {
+                assert!(dropped(x.1), "key {key:x}: a later copy stayed");
+            }
+            // the earliest copies are identical: all of them have an event or none has, and one of them stays
+            if !first.is_empty() {
+                assert_eq!(first.len(), list.iter().filter(|x| x.0 == min).count());
+                assert_eq!(first.iter().filter(|x| !dropped(x.1)).count(), 1, "key {key:x}: {} earliest copies", first.len());
+                kept += 1;
+            }
+            gone += later.len() + first.len().saturating_sub(1);
+        }
+        assert!(kept > 50_000 && gone > 20_000, "{kept} {gone}");
+    }
+
     /// `build_links` against a plain union-find over the lines `split` takes: files larger than a chunk, IDs of
     /// every kind (short, 9 bytes, long, not ASCII), quoted fields, self links, empty sides, malformed lines, lines
     /// past the 64-byte masks, a file that is only its header and one without a last newline.

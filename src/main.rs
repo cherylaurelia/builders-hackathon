@@ -825,6 +825,42 @@ struct UserRow {
     top: Option<u16>,
 }
 
+/// Small read-only map from an ID to a u16 (products -> category, campaigns -> index); open addressing on
+/// inline IDs, no hashing of bytes and no pointer chase.
+struct IdMap {
+    slots: Vec<(SStr, u16)>,
+    mask: usize,
+}
+impl IdMap {
+    const EMPTY: u16 = u16::MAX;
+    fn build(items: impl Iterator<Item = (SStr, u16)>, n: usize) -> IdMap {
+        let cap = (2 * n + 2).next_power_of_two().max(16);
+        let mut m = IdMap { slots: vec![(SStr([0; 16]), IdMap::EMPTY); cap], mask: cap - 1 };
+        for (k, v) in items {
+            let mut i = (k.hash() >> 32) as usize & m.mask;
+            while m.slots[i].1 != IdMap::EMPTY {
+                i = (i + 1) & m.mask;
+            }
+            m.slots[i] = (k, v);
+        }
+        m
+    }
+    #[inline(always)]
+    fn get(&self, k: SStr) -> Option<u16> {
+        let mut i = (k.hash() >> 32) as usize & self.mask;
+        loop {
+            let (key, v) = &self.slots[i];
+            if *v == IdMap::EMPTY {
+                return None;
+            }
+            if *key == k {
+                return Some(*v);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
 struct Ctx {
     ws: i64,
     we: i64,
@@ -832,8 +868,8 @@ struct Ctx {
     day0: i64,
     ndays: usize,
     ncamp: usize, // organic is index ncamp
-    products: BytesMap<u16>,
-    campaigns: BytesMap<u16>,
+    products: IdMap,
+    campaigns: IdMap,
     unknown_cat: u16,
     cat_rank: Vec<u32>,
 }
@@ -1137,7 +1173,7 @@ impl Table {
 
 // ---------------------------------------------------------------- parsing
 
-fn parse_click(ctx: &Ctx, [cid, uid, camp, ts]: [Bytes; 4]) -> Option<RawClick> {
+fn parse_click(ctx: &Ctx, [cid, uid, camp, ts]: [Bytes; 4], end: usize) -> Option<RawClick> {
     if cid.is_empty() || uid.is_empty() {
         return None;
     }
@@ -1145,7 +1181,7 @@ fn parse_click(ctx: &Ctx, [cid, uid, camp, ts]: [Bytes; 4]) -> Option<RawClick> 
     if t < ctx.ws - WEEK || t >= ctx.we {
         return None;
     }
-    let camp = *ctx.campaigns.get(camp)?;
+    let camp = ctx.campaigns.get(SStr::field(camp, end))?;
     Some(RawClick { uid, cid, ts: t, camp })
 }
 
@@ -1307,7 +1343,7 @@ fn parse_clicks(ctx: &Ctx, st: &mut P1, f: Bytes, s: usize, e: usize) {
     let end = f.as_ptr() as usize + f.len();
     let base = ctx.base;
     for_records::<4>(f, s, e, |fields| {
-        if let Some(c) = parse_click(ctx, fields) {
+        if let Some(c) = parse_click(ctx, fields, end) {
             let uid = SStr::field(c.uid, end);
             let uh = uid.hash() | 2;
             st.tbl.prefetch(uh);
@@ -1658,7 +1694,7 @@ fn parse_event(ctx: &Ctx, [eid, uid, ts, ingest, etype, pid, price]: [Bytes; 7])
     if r.kind == PURCHASE {
         let Some(p) = parse_price(price) else { return Some(r) };
         r.price = p;
-        r.cat = ctx.products.get(pid).copied().unwrap_or(ctx.unknown_cat);
+        r.cat = ctx.products.get(SStr::new(pid)).unwrap_or(ctx.unknown_cat);
     }
     if ingest - t > DAY {
         return Some(r);
@@ -1773,7 +1809,8 @@ unsafe fn fast_event(ctx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, st:
         let (rp, rl) = f(6);
         let Some(p) = parse_price(std::slice::from_raw_parts(rp, rl)) else { return st.reject(h, eid, ingest) };
         price = p;
-        cat = ctx.products.get(std::slice::from_raw_parts(pp, pl)).copied().unwrap_or(ctx.unknown_cat);
+        let key = if pl <= 15 { SStr((load16(pp, pl) | (pl as u128) << 120).to_le_bytes()) } else { SStr::new(std::slice::from_raw_parts(pp, pl)) };
+        cat = ctx.products.get(key).unwrap_or(ctx.unknown_cat);
     }
     let (uh, uid) = if ul <= 15 {
         let v = load16(up, ul);
@@ -1858,6 +1895,8 @@ fn main() {
     let ncamp = camp_ids.len();
     lap("small tables");
 
+    let products = IdMap::build(products.iter().map(|(k, v)| (SStr::new(*k), *v)), products.len());
+    let campaigns = IdMap::build(campaigns.iter().map(|(k, v)| (SStr::new(*k), *v)), campaigns.len());
     let ctx = Ctx { ws, we, base: ws - WEEK, day0, ndays, ncamp, products, campaigns, unknown_cat, cat_rank };
 
     let link_files = csv_files(&data.join("links"));
@@ -2548,9 +2587,7 @@ mod tests {
     }
 
     fn ctx() -> Ctx {
-        let mut products = BytesMap::default();
-        products.insert(&b"p1"[..], 0u16);
-        products.insert(&b"p2"[..], 1u16);
+        let products = IdMap::build([(SStr::new(b"p1"), 0u16), (SStr::new(b"p2"), 1u16)].into_iter(), 2);
         Ctx {
             ws: parse_ts(b"2028-02-20T00:00:00Z").unwrap(),
             we: parse_ts(b"2028-03-05T00:00:00Z").unwrap(),
@@ -2559,7 +2596,7 @@ mod tests {
             ndays: 14,
             ncamp: 0,
             products,
-            campaigns: BytesMap::default(),
+            campaigns: IdMap::build(std::iter::empty(), 0),
             unknown_cat: 2,
             cat_rank: vec![0, 1, 2],
         }

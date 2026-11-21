@@ -2884,7 +2884,10 @@ struct Work {
     cstart: Vec<u32>,
     act: Vec<u32>, // the people of the partition at hand who have events: the first `nact` entries
     nact: usize,
-    ev: Vec<u64>,
+    ev: Vec<u32>,           // the partition's events by person: their ts
+    pl: Vec<[u32; 3]>,      // its purchases as they are found: person, ts, pay
+    pls: Vec<(u32, u32)>,   // and by person: ts, pay
+    pstart: Vec<u32>,       // like `start`, for `pls`
     ck: Vec<CRec>,  // the partition's clicks by person
     ckt: Vec<CRec>, // room for the sort of a person's many clicks
     sat: Vec<u32>,  // and its counts per 30-minute bin
@@ -2893,7 +2896,6 @@ struct Work {
     ccamp: A32,
     bins: Vec<Bin>, // the bins of the person at hand (all free between people)
     bits: Vec<u64>, // which bins are taken
-    purch: Vec<(u32, u32)>, // (bin, pay) of the person's purchases
     // the sessions of the person at hand
     ses: Vec<Ses>,
     dcats: Vec<(u32, u16, i64)>, // (row, category, price sum)
@@ -2929,6 +2931,9 @@ impl Work {
             act: filled(local + 2, 0),
             nact: 0,
             ev: huge_vec(ev_cap),
+            pl: Vec::new(),
+            pls: Vec::new(),
+            pstart: filled(local + 2, 0),
             ck: huge_vec(ck_cap),
             ckt: Vec::new(),
             sat: vec![0; nbins.next_multiple_of(8) + 3],
@@ -2936,7 +2941,6 @@ impl Work {
             ccamp: A32([0; 72]),
             bins: vec![FREE_BIN; nbins],
             bits: vec![0; nbins / 64 + 1],
-            purch: Vec::new(),
             ses: vec![Ses { start: 0, d: 0, row: 0, rev: 0 }; nbins + 1],
             dcats: Vec::new(),
             best: vec![0; nbins + 1],
@@ -3113,7 +3117,9 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     // events: counting sort by person (the low bits of the slot number), with no branch and no bounds check; a
     // dropped copy stays with its person (person_work leaves it out). `start[l + 2]` counts person l; then
     // `start[l + 1]` is where l's events begin, and moves to their end as they are placed, so afterwards person l
-    // has `start[l]..start[l + 1]`. An event goes as its ts and pay in one word, ts low.
+    // has `start[l]..start[l + 1]`. An event goes as its ts alone, 4 bytes: twice the events a cache line of the
+    // 8 bytes of ts and pay, both when they are placed and when they are read. The few with a pay, the purchases,
+    // are listed apart and sorted by person the same way.
     let st = w.start.as_mut_ptr();
     let lm = lmask as usize;
     // SAFETY: start and cstart hold local + 3 entries, and every index below is at most local + 2
@@ -3145,10 +3151,17 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
             w.ev.resize(run as usize, 0);
         }
         let ev = w.ev.as_mut_ptr();
-        let place = |r: &ERec| {
-            let f = st.add(ev_bin(r) + 1);
-            *ev.add(*f as usize) = ((r as *const ERec as *const u8).add(4) as *const u64).read_unaligned();
+        let pl = &mut w.pl;
+        pl.clear();
+        let mut place = |r: &ERec| {
+            let l = ev_bin(r);
+            let f = st.add(l + 1);
+            let e = ((r as *const ERec as *const u8).add(4) as *const u64).read_unaligned(); // ts | pay << 32
+            *ev.add(*f as usize) = e as u32;
             *f += 1;
+            if e >> 32 != 0 {
+                pl.push([l as u32, e as u32, (e >> 32) as u32]);
+            }
         };
         for s in shards {
             for blk in s.ev[p].slices(EV_BLOCK) {
@@ -3159,7 +3172,25 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
                     place(&r[2]);
                     place(&r[3]);
                 }
-                four.remainder().iter().for_each(place);
+                four.remainder().iter().for_each(&mut place);
+            }
+        }
+        // the purchases by person: `pstart[l]..pstart[l + 1]` of `pls`, as (ts, pay)
+        let pt = w.pstart.as_mut_ptr();
+        std::ptr::write_bytes(pt, 0, local + 3);
+        if !pl.is_empty() {
+            for q in pl.iter() {
+                *pt.add(q[0] as usize + 2) += 1;
+            }
+            offsets(pt, local, std::ptr::null_mut());
+            if w.pls.len() < pl.len() {
+                w.pls.resize(pl.len(), (0, 0));
+            }
+            let pls = w.pls.as_mut_ptr();
+            for q in pl.iter() {
+                let f = pt.add(q[0] as usize + 1);
+                *pls.add(*f as usize) = (q[1], q[2]);
+                *f += 1;
             }
         }
 
@@ -3196,22 +3227,20 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
         let (a, b) = (w.start[l] as usize, w.start[l + 1] as usize);
         let name = cx.ids.slots[(p << cx.pshift) | l].key.load(Relaxed);
         let (ca, cb) = (w.cstart[l] as usize, w.cstart[l + 1] as usize);
-        person_work(cx, name, &ev[a..b], ca, cb - ca, w);
+        let (pa, pb) = (w.pstart[l] as usize, w.pstart[l + 1] as usize);
+        person_work(cx, name, &ev[a..b], pa, pb - pa, ca, cb - ca, w);
     }
     w.ev = ev;
 }
 
-/// A person's events into their 30-minute bins: returns (the purchases written to `pp`, the words of the bitmap
-/// at `wp` with a bin taken). `e` = ts | pay << 32. On its own, with nothing else to keep in registers.
+/// A person's events (their ts) into their 30-minute bins: returns the words of the bitmap at `wp` with a bin
+/// taken. On its own, with nothing else to keep in registers.
 ///
-/// SAFETY: every ts / GAP is a bin of `bp` and a bit of `wp`, in one of its first 64 words; `pp` has room for
-/// `evs.len()` entries.
+/// SAFETY: every ts / GAP is a bin of `bp` and a bit of `wp`, in one of its first 64 words.
 #[inline(never)]
-unsafe fn bin_events(evs: &[u64], bp: *mut Bin, wp: *mut u64, pp: *mut (u32, u32)) -> (usize, u64) {
-    let mut np = 0;
+unsafe fn bin_events(evs: &[u32], bp: *mut Bin, wp: *mut u64) -> u64 {
     let mut wm = 0u64;
-    let mut one = |e: u64| {
-        let (ts, pay) = (e as u32, (e >> 32) as u32);
+    let mut one = |ts: u32| {
         let b = (ts / GAP as u32) as usize;
         let bin = bp.add(b);
         (*bin).cnt += 1;
@@ -3229,9 +3258,6 @@ unsafe fn bin_events(evs: &[u64], bp: *mut Bin, wp: *mut u64, pp: *mut (u32, u32
         }
         *wp.add(b >> 6) |= 1 << (b & 63);
         wm |= 1 << (b >> 6);
-        // every event is written to the purchase list, which only keeps the ones with a price
-        *pp.add(np) = (b as u32, pay);
-        np += (pay != 0) as usize;
     };
     let mut two = evs.chunks_exact(2);
     for e in &mut two {
@@ -3239,7 +3265,7 @@ unsafe fn bin_events(evs: &[u64], bp: *mut Bin, wp: *mut u64, pp: *mut (u32, u32
         one(e[1]);
     }
     two.remainder().iter().for_each(|&e| one(e));
-    (np, wm)
+    wm
 }
 
 /// The taken bins in order are the sessions, and the sessions in order the rows (one per day with a session
@@ -3288,22 +3314,20 @@ unsafe fn scan_bins(bp: *mut Bin, wp: *mut u64, mut wm: u64, sp: *mut Ses, rp: *
     (ns, nr)
 }
 
-/// One person: `evs` = their events as `ts | pay << 32`, a dropped copy as 0; their `nc` valid clicks are the
-/// entries from `ca` of `w.ck`, in any order.
+/// One person: `evs` = the ts of their events, a dropped copy as 0; their `np` purchases are the entries from `pa`
+/// of `w.pls`, and their `nc` valid clicks the entries from `ca` of `w.ck`, in any order.
 #[inline(never)]
-fn person_work(cx: &Ctx, name: u64, evs: &[u64], ca: usize, nc: usize, w: &mut Work) {
+fn person_work(cx: &Ctx, name: u64, evs: &[u32], pa: usize, np: usize, ca: usize, nc: usize, w: &mut Work) {
     let nbins = w.bins.len();
-    w.purch.clear();
-    w.purch.reserve(evs.len());
     w.rows.reserve(nbins + 1); // a row per session at most, and one being written
     let row0 = w.rows.len();
-    debug_assert!(evs.iter().all(|&e| ((e as u32 / GAP as u32) as usize) < nbins) && nbins <= 64 * 64 && w.bits.len() * 64 >= nbins);
+    debug_assert!(evs.iter().all(|&e| ((e / GAP as u32) as usize) < nbins) && nbins <= 64 * 64 && w.bits.len() * 64 >= nbins);
     // SAFETY: an event's ts is below we - base, so its bin is below bins.len(), a bit of bits, which has at most
-    // 64 words (the window is under 2^32 ms); purch has room for every event. The sessions (at most one per
-    // taken bin, and `ses` holds nbins + 1) and the rows (room for nbins + 1 past row0) are written in order.
-    let (np, ns) = unsafe {
+    // 64 words (the window is under 2^32 ms). The sessions (at most one per taken bin, and `ses` holds nbins + 1)
+    // and the rows (room for nbins + 1 past row0) are written in order.
+    let ns = unsafe {
         let (bp, wp) = (w.bins.as_mut_ptr(), w.bits.as_mut_ptr());
-        let (np, mut wm) = bin_events(evs, bp, wp, w.purch.as_mut_ptr());
+        let mut wm = bin_events(evs, bp, wp);
         // the dropped copies are in bin 0 (ts 0), which no event of the window is in (it starts 7 days after
         // `Ctx::base`): out of the bitmap, and out of `wm` when its word is left empty
         *bp = FREE_BIN;
@@ -3315,17 +3339,17 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], ca: usize, nc: usize, w: &mut W
         if nr != 0 {
             w.people.push((name, nr as u32));
         }
-        w.purch.set_len(np);
-        (np, ns)
+        ns
     };
 
     // purchases: into their session and row; then each row's top category
     if np != 0 {
-        let Work { rows, purch, bins, ses, dcats, best, .. } = w;
+        let Work { rows, pls, bins, ses, dcats, best, .. } = w;
         let rows = &mut rows[row0..];
         dcats.clear();
-        for &(b, pay) in purch.iter() {
-            let s = &mut ses[bins[b as usize].sess as usize];
+        for &(ts, pay) in &pls[pa..pa + np] {
+            // the bin of a kept event is one this person took, so its `sess` is this person's
+            let s = &mut ses[bins[(ts / GAP as u32) as usize].sess as usize];
             let (price, cat) = ((pay & 0xff_ffff) as i64, (pay >> 24) as u16);
             s.rev += price;
             let g = s.row;
@@ -3344,7 +3368,6 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], ca: usize, nc: usize, w: &mut W
                 *top = sum;
             }
         }
-        purch.clear();
     }
 
     // credit and assists

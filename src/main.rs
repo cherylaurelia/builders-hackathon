@@ -503,7 +503,7 @@ impl STab {
         }
         t
     }
-    #[inline]
+    #[inline(always)]
     fn get(&self, s: SStr) -> Option<u16> {
         let mut i = s.hash() as usize & self.mask;
         loop {
@@ -807,12 +807,20 @@ fn swar8(x: u64) -> Option<u64> {
 }
 
 /// F3: digits only. More than 18 significant digits is far outside any window: None either way.
-#[inline]
+#[inline(always)]
 fn f3(b: &[u8]) -> Option<i64> {
     if b.len() == 13 && b[0] != b'0' {
         let hi = swar8(u64::from_le_bytes(b[..8].try_into().unwrap()))?;
-        // the last 5 digits, as 8 with 3 leading zeros
-        let lo = swar8(u64::from_le_bytes(b[5..13].try_into().unwrap()) & !0xFF_FFFF | 0x30_3030)?;
+        let mut lo = 0u64;
+        let mut bad = 0u8;
+        for &c in &b[8..13] {
+            let d = c.wrapping_sub(b'0');
+            bad |= (d > 9) as u8;
+            lo = lo * 10 + d as u64;
+        }
+        if bad != 0 {
+            return None;
+        }
         return Some((hi * 100_000 + lo) as i64);
     }
     let mut v: i64 = 0;
@@ -1141,47 +1149,11 @@ fn main() {
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
 
-    // products -> categories; "unknown" is its own category, never one of the file's
-    let mut cat_names: Vec<Bytes> = Vec::new();
-    let mut cat_idx: BytesMap<u16> = BytesMap::default();
-    let mut products: BytesMap<u16> = BytesMap::default();
-    for (p, c) in small_table(&data.join("products.csv")) {
-        let n = cat_names.len() as u16;
-        let ci = *cat_idx.entry(c).or_insert_with(|| {
-            cat_names.push(c);
-            n
-        });
-        products.insert(p, ci);
-    }
-    let unknown_cat = cat_names.len() as u16;
-    cat_names.push(b"unknown");
-    if cat_names.len() > 1 << 16 {
-        die("more than 65536 categories");
-    }
-    let mut order: Vec<usize> = (0..cat_names.len()).collect();
-    order.sort_by(|&a, &b| cat_names[a].cmp(cat_names[b]));
-    let mut cat_rank = vec![0u32; cat_names.len()];
-    for (r, &i) in order.iter().enumerate() {
-        cat_rank[i] = r as u32;
-    }
-
-    // campaigns
-    let mut camp_ids: Vec<Bytes> = Vec::new();
-    let mut camp_channel: Vec<Bytes> = Vec::new();
-    let mut seen: BytesMap<u16> = BytesMap::default();
-    for (c, ch) in small_table(&data.join("campaigns.csv")) {
-        if seen.contains_key(c) {
-            continue;
-        }
-        seen.insert(c, camp_ids.len() as u16);
-        camp_ids.push(c);
-        camp_channel.push(ch);
-    }
-    let ncamp = camp_ids.len();
-    if ncamp >= u16::MAX as usize {
-        die("too many campaigns");
-    }
-    let camps = STab::new(&camp_ids.iter().enumerate().map(|(i, &c)| (c, i as u16)).collect::<Vec<_>>());
+    // products and campaigns load on their own thread: only the event and click parse needs them
+    let small = {
+        let data = data.clone();
+        std::thread::spawn(move || load_small(&data))
+    };
 
     let base = ws - WEEK;
     if we - base >= 1 << 31 {
@@ -1189,7 +1161,6 @@ fn main() {
     }
     // dates any in-window ts (F2 local dates: +-1 day) or a typical ingest_ts can fall on
     let dates = Dates::new(base.div_euclid(DAY) - 2, (we - 1).div_euclid(DAY) + 7);
-    let ctx = Ctx { ws, we, base, ing_base: ws.div_euclid(1000) - (1 << 31), day0, ndays, ncamp, products, camps, unknown_cat, cat_rank, dates };
 
     let link_files = csv_files(&data.join("links"));
     let ev_files = csv_files(&data.join("events"));
@@ -1247,6 +1218,10 @@ fn main() {
         });
     }
     lap(&format!("links: {} edges", st.iter().map(|s| s.edges.len()).sum::<usize>()));
+
+    let (cat_names, products, unknown_cat, cat_rank, camp_ids, camp_channel, camps) = small.join().unwrap_or_else(|_| die("loading products/campaigns failed"));
+    let ncamp = camp_ids.len();
+    let ctx = Ctx { ws, we, base, ing_base: ws.div_euclid(1000) - (1 << 31), day0, ndays, ncamp, products, camps, unknown_cat, cat_rank, dates };
 
     // 2. events + clicks
     let mut work: Vec<(Bytes, usize, usize, bool)> = chunks(&ev_files, CHUNK).into_iter().map(|(f, s, e)| (f, s, e, true)).collect();
@@ -1327,6 +1302,54 @@ fn main() {
     lap(&format!("written: {} user rows, {} campaign rows", user_parts.iter().map(|p| p.len()).sum::<usize>(), camp_rows.len()));
     // everything is on disk: no destructors, the memory is released in parallel
     fast_exit(threads)
+}
+
+/// products.csv -> (category names, product -> category, unknown category, byte-wise rank of each category);
+/// campaigns.csv -> (ids, channels, id -> index).
+#[allow(clippy::type_complexity)]
+fn load_small(data: &Path) -> (Vec<Bytes>, BytesMap<u16>, u16, Vec<u32>, Vec<Bytes>, Vec<Bytes>, STab) {
+    // products -> categories; "unknown" is its own category, never one of the file's
+    let mut cat_names: Vec<Bytes> = Vec::new();
+    let mut cat_idx: BytesMap<u16> = BytesMap::default();
+    let mut products: BytesMap<u16> = BytesMap::default();
+    for (p, c) in small_table(&data.join("products.csv")) {
+        let n = cat_names.len() as u16;
+        let ci = *cat_idx.entry(c).or_insert_with(|| {
+            cat_names.push(c);
+            n
+        });
+        products.insert(p, ci);
+    }
+    let unknown_cat = cat_names.len() as u16;
+    cat_names.push(b"unknown");
+    if cat_names.len() > 1 << 16 {
+        die("more than 65536 categories");
+    }
+    let mut order: Vec<usize> = (0..cat_names.len()).collect();
+    order.sort_by(|&a, &b| cat_names[a].cmp(cat_names[b]));
+    let mut cat_rank = vec![0u32; cat_names.len()];
+    for (r, &i) in order.iter().enumerate() {
+        cat_rank[i] = r as u32;
+    }
+
+    // campaigns
+    let mut camp_ids: Vec<Bytes> = Vec::new();
+    let mut camp_channel: Vec<Bytes> = Vec::new();
+    let mut seen: BytesMap<u16> = BytesMap::default();
+    for (c, ch) in small_table(&data.join("campaigns.csv")) {
+        if seen.contains_key(c) {
+            continue;
+        }
+        seen.insert(c, camp_ids.len() as u16);
+        camp_ids.push(c);
+        camp_channel.push(ch);
+    }
+    if camp_ids.len() >= u16::MAX as usize {
+        die("too many campaigns");
+    }
+    let camps = STab::new(&camp_ids.iter().enumerate().map(|(i, &c)| (c, i as u16)).collect::<Vec<_>>());
+    (cat_names, products, unknown_cat, cat_rank, camp_ids, camp_channel, camps)
+
 }
 
 // ---------------------------------------------------------------- parse

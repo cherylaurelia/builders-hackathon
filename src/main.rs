@@ -2950,7 +2950,7 @@ struct Work {
     rev: Vec<i64>, // revenue of the credited sessions, per cell of `cred`
     assist: Vec<u32>,
     stamp: Vec<bool>,
-    iv: Vec<(i64, i64)>,
+    iv: Vec<(u32, u32)>, // per campaign, the sessions a..b its clicks so far assist (`person_work`, many clicks)
     seen: Vec<u32>,
     sctr: u32,
     start: Vec<u32>,  // see partition_work
@@ -3487,40 +3487,48 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
             }
             credit(camp, s);
         }
-        // assists: a click at t assists sessions starting in [t, t + 7d]; merge per campaign
-        let flush = |assist: &mut [u32], k: usize, lo: i64, hi: i64, sessions: &[Sess], day_groups: &[(usize, usize)]| {
-            let a = sessions.partition_point(|s| s.start < lo);
-            let b = sessions.partition_point(|s| s.start <= hi);
+        // assists: a click at t assists the sessions that start in [t, t + 7d]. Those are sessions a..b, where a
+        // (the sessions before t) and b (the sessions up to t + 7d) only grow from one click to the next, so there
+        // is nothing to search for. Per campaign, ranges that touch or overlap are one range, and a range adds
+        // the sessions it holds of each day it spans.
+        let flush = |assist: &mut [u32], k: usize, (a, b): (u32, u32)| {
+            let (a, b) = (a as usize, b as usize);
             if a >= b {
                 return;
             }
-            for (g, &(d, first)) in day_groups.iter().enumerate() {
-                let end = day_groups.get(g + 1).map(|x| x.1).unwrap_or(sessions.len());
-                let n = end.min(b) as i64 - first.max(a) as i64;
-                if n > 0 {
-                    assist[k * width + d] += n as u32;
-                }
+            // every day group from a's through the last session's has a session in a..b
+            for g in sess_day[a] as usize..=sess_day[b - 1] as usize {
+                let (d, first) = day_groups[g];
+                let end = day_groups.get(g + 1).map_or(ns, |x| x.1);
+                assist[k * width + d] += (end.min(b) - first.max(a)) as u32;
             }
         };
         touched.clear();
+        let (mut a, mut b) = (0, 0);
         for c in cs {
-            let k = ccamp(c);
-            let t = cts(c);
+            let (k, t) = (ccamp(c), cts(c));
+            while a < ns && sessions[a].start < t {
+                a += 1;
+            }
+            if a == ns {
+                break; // this click and the later ones come after every session
+            }
+            while b < ns && sessions[b].start <= t + WEEK {
+                b += 1;
+            }
             if !stamp[k] {
                 stamp[k] = true;
-                iv[k] = (t, t + WEEK);
+                iv[k] = (a as u32, b as u32);
                 touched.push(k);
-            } else if t <= iv[k].1 {
-                iv[k].1 = t + WEEK;
+            } else if a as u32 <= iv[k].1 {
+                iv[k].1 = b as u32;
             } else {
-                let (lo, hi) = iv[k];
-                flush(assist, k, lo, hi, sessions, day_groups);
-                iv[k] = (t, t + WEEK);
+                flush(assist, k, iv[k]);
+                iv[k] = (a as u32, b as u32);
             }
         }
         for &k in touched.iter() {
-            let (lo, hi) = iv[k];
-            flush(assist, k, lo, hi, sessions, day_groups);
+            flush(assist, k, iv[k]);
             stamp[k] = false;
         }
     }

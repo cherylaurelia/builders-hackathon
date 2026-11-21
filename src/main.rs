@@ -321,6 +321,15 @@ fn map_anon(bytes: usize) -> *mut u8 {
     p as *mut u8
 }
 
+/// `n` copies of `v` in memory written now. `vec![0; n]` gets untouched pages instead, which map the shared zero
+/// page on a first read; the write that follows must then flush that mapping from every CPU running a thread of
+/// this process (an IPI to each, per 4 KiB page).
+fn filled<T: Clone>(n: usize, v: T) -> Vec<T> {
+    let mut x = Vec::with_capacity(n);
+    x.resize(n, v);
+    x
+}
+
 /// A thread's bump allocator for stream blocks.
 struct Arena {
     cur: usize,
@@ -1929,7 +1938,7 @@ fn main() {
         drop(tx);
         // campaign_daily
         let mut cred = vec![[0i64; 3]; (ncamp + 1) * width];
-        let mut assist = vec![0i64; (ncamp + 1) * width];
+        let mut assist = filled((ncamp + 1) * width, 0i64);
         for _ in 0..threads {
             let (c, a) = rx.recv().unwrap_or_else(|_| die("a worker ended without its campaign cells"));
             for (x, y) in cred.iter_mut().zip(&c) {
@@ -1980,7 +1989,11 @@ struct IdMap {
 impl IdMap {
     fn new(ids: &[(Bytes, u16)]) -> IdMap {
         let cap = (ids.len() * 2).next_power_of_two().max(16);
+<<<<<<< HEAD
         let mut m = IdMap { slots: vec![(0, 0); cap], shift: 64 - cap.trailing_zeros(), other: BytesMap::default() };
+=======
+        let mut m = IdMap { slots: filled(cap, (0, 0)), other: BytesMap::default() };
+>>>>>>> c166174 (tables filled by real writes (filled()) instead of vec![0; n]: a first read of an untouched page maps the shared zero page and the write after it flushes that mapping from every CPU of the process; the product IdMap did this ~512 times while the link workers ran (14% of the links phase in IPIs). TLB/function-call IPIs per 20M run 8,400 -> 2,000. Box guard ok; AB vs cfedecc 0.977, 1.004, 0.979)
         for &(id, v) in ids {
             match pack(id) {
                 0 => {
@@ -2458,15 +2471,15 @@ impl Work {
         Work {
             rows: Vec::new(),
             cred: vec![Cred::default(); cells],
-            assist: vec![0; cells + 4], // + cells for the unused steps of the vector window
+            assist: filled(cells + 4, 0), // + cells for the unused steps of the vector window
             stamp: vec![false; cx.ncamp + 1],
             iv: vec![(0, 0); cx.ncamp + 1],
-            seen: vec![0; cx.ncamp + 1],
+            seen: filled(cx.ncamp + 1, 0),
             sctr: 0,
-            start: vec![0; local],
-            fill: vec![0; local],
-            cstart: vec![0; local],
-            cfill: vec![0; local],
+            start: filled(local, 0),
+            fill: filled(local, 0),
+            cstart: filled(local, 0),
+            cfill: filled(local, 0),
             ev: Vec::new(),
             ck: Vec::new(),
             sessions: Vec::new(),

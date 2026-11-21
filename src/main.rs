@@ -2847,6 +2847,8 @@ struct Work {
     doff: i64, // ts (ms after `Ctx::base`) + doff = ms after the midnight that starts day 0 of the window
     start: Vec<u32>, // see partition_work
     cstart: Vec<u32>,
+    act: Vec<u32>, // the people of the partition at hand who have events: the first `nact` entries
+    nact: usize,
     ev: Vec<u64>,
     // the partition's clicks by person, as three arrays (8 readable entries past the last click)
     cts: Vec<u32>,
@@ -2887,6 +2889,8 @@ impl Work {
             doff: cx.base - cx.day0 * DAY,
             start: filled(local + 2, 0),
             cstart: filled(local + 2, 0),
+            act: filled(local + 2, 0),
+            nact: 0,
             ev: huge_vec(ev_cap),
             cts: huge_vec(ck_cap + 8),
             ccamp: huge_vec(ck_cap + 8),
@@ -3038,15 +3042,22 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
                 }
             }
         }
+        // the people with events, listed as the counts turn into offsets (no branch: every person is written to
+        // the list, and stays when it has events)
+        let act = w.act.as_mut_ptr();
+        let mut na = 0;
         let mut run = 0;
         for l in 0..=local {
             let c = *st.add(l + 2);
             *st.add(l + 1) = run;
             run += c;
+            *act.add(na) = l as u32;
+            na += (c != 0 && l != local) as usize;
         }
-        if *st.add(local + 1) == 0 {
+        if na == 0 {
             return;
         }
+        w.nact = na;
         if w.ev.len() < run as usize {
             w.ev.resize(run as usize, 0);
         }
@@ -3104,11 +3115,9 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     }
 
     let ev = std::mem::take(&mut w.ev);
-    for l in 0..local {
+    for i in 0..w.nact {
+        let l = w.act[i] as usize;
         let (a, b) = (w.start[l] as usize, w.start[l + 1] as usize);
-        if a == b {
-            continue;
-        }
         let name = cx.ids.slots[(p << cx.pshift) | l].key.load(Relaxed);
         let (ca, cb) = (w.cstart[l] as usize, w.cstart[l + 1] as usize);
         person_work(cx, name, &ev[a..b], ca, cb - ca, w);
@@ -3746,66 +3755,111 @@ fn put_name(b: &mut Vec<u8>, names: &Interner, k: u64, tmp: &mut Vec<u8>) {
     b.extend_from_slice(tmp);
 }
 
-/// DELTA_BINARY_PACKED body of `v`: blocks of 128 deltas in four miniblocks of 32, each miniblock at the bit width
-/// its largest value (delta minus the block's smallest delta) needs.
-fn put_delta(b: &mut Vec<u8>, v: &[i64]) {
-    fn uleb(b: &mut Vec<u8>, mut x: u64) {
-        while x >= 0x80 {
-            b.push(x as u8 | 0x80);
-            x >>= 7;
-        }
-        b.push(x as u8);
-    }
+/// DELTA_BINARY_PACKED body of the `n` values `get(0..n)`: blocks of 128 deltas in four miniblocks of 32, each
+/// miniblock at the bit width its largest value (delta minus the block's smallest delta) needs.
+#[inline(always)]
+fn put_delta(b: &mut Vec<u8>, n: usize, get: impl Fn(usize) -> i64) {
     let zz = |x: i64| ((x << 1) ^ (x >> 63)) as u64;
-    uleb(b, 128);
-    uleb(b, 4);
-    uleb(b, v.len() as u64);
-    uleb(b, zz(v.first().copied().unwrap_or(0)));
-    let mut i = 1;
-    while i < v.len() {
-        let m = (v.len() - i).min(128);
-        let mut d = [0i64; 128];
-        let mut min = i64::MAX;
-        for j in 0..m {
-            d[j] = v[i + j].wrapping_sub(v[i + j - 1]);
-            min = min.min(d[j]);
-        }
-        uleb(b, zz(min));
-        // a miniblock past the last delta is absent; the last one is padded with zeros (the smallest residual)
-        let mut r = [0u64; 128];
-        for j in 0..m {
-            r[j] = d[j].wrapping_sub(min) as u64;
-        }
-        let mut w = [0u8; 4];
-        for k in 0..m.div_ceil(32) {
-            w[k] = (64 - r[k * 32..k * 32 + 32].iter().fold(0u64, |a, &x| a | x).leading_zeros()) as u8;
-        }
-        b.extend_from_slice(&w);
-        for k in 0..m.div_ceil(32) {
-            let w = w[k] as u32;
-            if w == 0 {
-                continue;
+    // room for everything at once: four varints, then per block a varint, four widths and up to 128 * 8 bytes
+    // (+ 8: a packed value is stored as a whole word)
+    b.reserve(48 + n.div_ceil(128) * (16 + 1024) + 8);
+    // SAFETY: every write below stays inside the room just reserved
+    unsafe {
+        let start = b.as_mut_ptr().add(b.len());
+        let mut p = start;
+        let uleb = |p: &mut *mut u8, mut x: u64| {
+            while x >= 0x80 {
+                p.write(x as u8 | 0x80);
+                *p = p.add(1);
+                x >>= 7;
             }
-            let (mut acc, mut nb) = (0u128, 0u32);
-            for &x in &r[k * 32..k * 32 + 32] {
-                acc |= (x as u128) << nb;
-                nb += w;
-                if nb >= 64 {
-                    b.extend_from_slice(&(acc as u64).to_le_bytes());
-                    acc >>= 64;
-                    nb -= 64;
+            p.write(x as u8);
+            *p = p.add(1);
+        };
+        uleb(&mut p, 128);
+        uleb(&mut p, 4);
+        uleb(&mut p, n as u64);
+        let mut prev = if n > 0 { get(0) } else { 0 };
+        uleb(&mut p, zz(prev));
+        let mut i = 1;
+        while i < n {
+            let m = (n - i).min(128);
+            // a miniblock past the last delta is absent; the last one is padded with zeros (the smallest residual)
+            let mut r = [0u64; 128];
+            let mut min = i64::MAX;
+            for (j, d) in r[..m].iter_mut().enumerate() {
+                let v = get(i + j);
+                let x = v.wrapping_sub(prev);
+                prev = v;
+                *d = x as u64;
+                min = min.min(x);
+            }
+            uleb(&mut p, zz(min));
+            for d in r[..m].iter_mut() {
+                *d = (*d as i64).wrapping_sub(min) as u64;
+            }
+            let minis = m.div_ceil(32);
+            let mut w = [0u8; 4];
+            for k in 0..minis {
+                w[k] = (64 - r[k * 32..k * 32 + 32].iter().fold(0u64, |a, &x| a | x).leading_zeros()) as u8;
+            }
+            (p as *mut [u8; 4]).write_unaligned(w);
+            p = p.add(4);
+            for k in 0..minis {
+                let w = w[k] as u32;
+                let vals = &r[k * 32..k * 32 + 32];
+                if w == 0 {
+                    continue;
+                }
+                if w <= 56 {
+                    // up to 7 bits wait from the value before: the whole bytes go out with every value
+                    let (mut acc, mut nb) = (0u64, 0u32);
+                    for &x in vals {
+                        acc |= x << nb;
+                        nb += w;
+                        (p as *mut u64).write_unaligned(acc.to_le());
+                        let bytes = nb >> 3;
+                        p = p.add(bytes as usize);
+                        acc >>= bytes * 8;
+                        nb &= 7;
+                    }
+                } else {
+                    let (mut acc, mut nb) = (0u128, 0u32);
+                    for &x in vals {
+                        acc |= (x as u128) << nb;
+                        nb += w;
+                        if nb >= 64 {
+                            (p as *mut u64).write_unaligned((acc as u64).to_le());
+                            p = p.add(8);
+                            acc >>= 64;
+                            nb -= 64;
+                        }
+                    }
+                    // 32 values of w bits are a whole number of bytes
+                    std::ptr::copy_nonoverlapping(acc.to_le_bytes().as_ptr(), p, (nb / 8) as usize);
+                    p = p.add((nb / 8) as usize);
                 }
             }
-            if nb > 0 {
-                b.extend_from_slice(&acc.to_le_bytes()[..nb.div_ceil(8) as usize]);
-            }
+            i += m;
         }
-        i += m;
+        let len = b.len() + (p as usize - start as usize);
+        b.set_len(len);
     }
 }
 
-/// One run of the RLE/bit-packed hybrid: `run` copies of the `vb`-byte value `idx`.
+/// One run of the RLE/bit-packed hybrid: `run` copies of the `vb`-byte value `idx` (vb <= 4).
+#[inline(always)]
 fn put_run(b: &mut Vec<u8>, run: usize, idx: u32, vb: usize) {
+    if run < 64 {
+        // one byte of header: header and value go out as one word, of which 1 + vb bytes count
+        b.reserve(8);
+        // SAFETY: 8 bytes are reserved past the length
+        unsafe {
+            (b.as_mut_ptr().add(b.len()) as *mut u64).write_unaligned((((run as u64) << 1) | (idx as u64) << 8).to_le());
+            b.set_len(b.len() + 1 + vb);
+        }
+        return;
+    }
     let mut v = (run as u64) << 1;
     while v >= 0x80 {
         b.push(v as u8 | 0x80);
@@ -3821,7 +3875,6 @@ fn write_users(path: &Path, rows: &[UserRow], cat_names: &[Bytes], names: &Inter
     let n: usize = segs.iter().map(|s| s.len()).sum();
     let mut part: Vec<&[UserRow]> = Vec::new();
     let mut run: Vec<u8> = Vec::new();
-    let mut vals: Vec<i64> = Vec::new();
     // user_id is dictionary encoded: one entry per run of equal IDs (a person's days are consecutive rows), and
     // the data pages are runs of that entry's index
     let (mut entries, mut idx, mut last): (usize, u32, Option<u64>) = (0, u32::MAX, None);
@@ -3862,14 +3915,15 @@ fn write_users(path: &Path, rows: &[UserRow], cat_names: &[Bytes], names: &Inter
                 }
             }
             1..=4 => {
-                vals.clear();
-                vals.extend(part.iter().flat_map(|s| s.iter()).map(|r| match c {
-                    1 => r.day as i64,
-                    2 => r.sessions as i64,
-                    3 => r.events as i64,
-                    _ => r.revenue,
-                }));
-                put_delta(b, &vals);
+                // straight from the rows, one loop per column
+                let rs = &rows[lo..hi];
+                // SAFETY (the four): put_delta asks for indices below rs.len()
+                match c {
+                    1 => put_delta(b, rs.len(), |i| unsafe { rs.get_unchecked(i) }.day as i64),
+                    2 => put_delta(b, rs.len(), |i| unsafe { rs.get_unchecked(i) }.sessions as i64),
+                    3 => put_delta(b, rs.len(), |i| unsafe { rs.get_unchecked(i) }.events as i64),
+                    _ => put_delta(b, rs.len(), |i| unsafe { rs.get_unchecked(i) }.revenue),
+                }
             }
             _ => {
                 // definition levels: one bit-packed run of ceil(rows / 8) groups of 8 bits (1 = present)

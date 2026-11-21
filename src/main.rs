@@ -1,7 +1,7 @@
 //! Shopping Sessions pipeline. rules.md is the spec; each phase names the rule it implements.
 //!
 //! One shuffle, no pointers into the input. Every ID (event, user, click) becomes an exact 64-bit key: an ID of up
-//! to 10 bytes from [0-9A-Z_a-z] packs losslessly, any other ID is interned. The input is read with pread into a
+//! to 9 ASCII bytes packs losslessly (7 bits a byte), any other ID is interned. The input is read with pread into a
 //! small per-thread buffer, so no input page is ever mapped; with a cold page cache a few extra threads ask the
 //! kernel for the whole input up front (`read_ahead`).
 //!
@@ -68,17 +68,6 @@ fn hash_bytes(b: &[u8]) -> u64 {
     mix(h)
 }
 
-/// The `len` (<= 16) bytes at `p`, zero padded to 16; reads 16 bytes.
-#[inline(always)]
-unsafe fn load16(p: *const u8, len: usize) -> u128 {
-    let v = (p as *const u128).read_unaligned();
-    if len == 0 {
-        0
-    } else {
-        v & (u128::MAX >> (128 - 8 * len as u32))
-    }
-}
-
 /// Hasher for byte-string keys: one call to `write` carries the whole key.
 #[derive(Default)]
 struct BytesHasher(u64);
@@ -98,137 +87,54 @@ type BytesMap<V> = HashMap<Bytes, V, BuildHasherDefault<BytesHasher>>;
 /// Bit 63 of a key: the ID did not pack, the rest is its number in the `Interner`.
 const INTERNED: u64 = 1 << 63;
 
-/// Byte -> digit 1..=63 for [0-9A-Z_a-z] in byte order, 0 for any other byte.
-const fn pack_table() -> [u8; 256] {
-    let mut t = [0u8; 256];
-    let mut d = 1u8;
-    let mut c = 0usize;
-    while c < 256 {
-        let b = c as u8;
-        if (b >= b'0' && b <= b'9') || (b >= b'A' && b <= b'Z') || b == b'_' || (b >= b'a' && b <= b'z') {
-            t[c] = d;
-            d += 1;
-        }
-        c += 1;
-    }
-    t
-}
-static PACK: [u8; 256] = pack_table();
-
-const fn unpack_table() -> [u8; 64] {
-    let p = pack_table();
-    let mut t = [0u8; 64];
-    let mut c = 0usize;
-    while c < 256 {
-        if p[c] != 0 {
-            t[p[c] as usize] = c as u8;
-        }
-        c += 1;
-    }
-    t
-}
-static UNPACK: [u8; 64] = unpack_table();
-
-/// An ID of 1..=10 bytes from [0-9A-Z_a-z] as a number: six bits a byte, first byte highest, zero filled.
-/// 0 = it does not pack. Digits rise with the byte values, so two packed IDs compare as their bytes do.
+/// An ID of 1..=9 bytes, each 1..=127 (ASCII, no NUL), as a number: seven bits a byte, first byte highest, zero
+/// filled. 0 = it does not pack. A byte is never 0, so the zero fill ends the ID: distinct IDs give distinct numbers,
+/// and two packed IDs compare as their bytes do.
 #[inline]
 fn pack(b: &[u8]) -> u64 {
-    if b.len() > 10 {
+    if b.len() > 9 {
         return 0;
     }
     let mut v = 0u64;
     for &c in b {
-        let d = PACK[c as usize];
-        if d == 0 {
+        if c == 0 || c >= 128 {
             return 0;
         }
-        v = (v << 6) | d as u64;
+        v = (v << 7) | c as u64;
     }
-    v << (6 * (10 - b.len()))
+    v << (7 * (9 - b.len()))
 }
 
-/// `pack` of the `len` (<= 16) bytes whose `load16` is `v`.
+/// `pack` of the `len` bytes at `p`; 9 bytes at `p` must be readable.
 #[inline(always)]
-fn pack16(v: u128, len: usize) -> u64 {
-    if len > 10 {
-        return 0;
-    }
-    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
-    unsafe {
-        use std::arch::x86_64::*;
-        let c = _mm_set_epi64x((v >> 64) as i64, v as i64);
-        // A byte is in the alphabet when its two nibbles agree on a class (one bit each): high nibble 3 with low
-        // 0..=9 (bit 0), 4 or 6 with 1..=F (bit 1), 5 with 0..=A or F (bit 2), 7 with 0..=A (bit 3). A byte of
-        // 0x80 or more looks up nothing with its low nibble.
-        const LO: [u8; 16] = [13, 15, 15, 15, 15, 15, 15, 15, 15, 15, 14, 2, 2, 2, 2, 6];
-        const HI: [u8; 16] = [0, 0, 0, 1, 2, 4, 2, 8, 0, 0, 0, 0, 0, 0, 0, 0];
-        // digit = byte - offset: 47 for a digit, 54 for A-Z, 59 for a-z by the high nibble alone, 4 more for `_`
-        const OFF: [u8; 16] = [0, 0, 0, 47, 54, 54, 59, 59, 0, 0, 0, 0, 0, 0, 0, 0];
-        let tbl = |t: &[u8; 16]| _mm_loadu_si128(t.as_ptr() as *const __m128i);
-        let hi = _mm_and_si128(_mm_srli_epi16(c, 4), _mm_set1_epi8(0x0F));
-        let class = _mm_and_si128(_mm_shuffle_epi8(tbl(&LO), c), _mm_shuffle_epi8(tbl(&HI), hi));
-        let invalid = _mm_movemask_epi8(_mm_cmpeq_epi8(class, _mm_setzero_si128())) as u32;
-        if invalid & ((1u32 << len) - 1) != 0 {
+unsafe fn pack_at(p: *const u8, len: usize) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        use std::arch::x86_64::{_bzhi_u64, _pext_u64};
+        const ONES: u64 = 0x0101_0101_0101_0101;
+        if len.wrapping_sub(1) >= 9 {
             return 0;
         }
-        // the zero bytes past `len` have offset 0 and stay 0
-        let us = _mm_cmpeq_epi8(c, _mm_set1_epi8(b'_' as i8));
-        let off = _mm_add_epi8(_mm_shuffle_epi8(tbl(&OFF), hi), _mm_and_si128(us, _mm_set1_epi8(4)));
-        let d = _mm_sub_epi8(c, off);
-        let w = _mm_maddubs_epi16(d, _mm_set1_epi16(0x0140)); // two digits -> 12 bits
-        let l = _mm_madd_epi16(w, _mm_set1_epi32(0x0001_1000)); // four digits -> 24 bits
-        let lo = _mm_cvtsi128_si64(l) as u64;
-        let l2 = _mm_extract_epi32(l, 2) as u32 as u64;
-        return ((lo & 0xffff_ffff) << 36) | ((lo >> 32) << 12) | (l2 >> 12);
+        // the first 8 bytes (a count of 64 or more keeps them all), and the ninth
+        let n8 = 8 * len as u32;
+        let lo = _bzhi_u64((p as *const u64).read_unaligned(), n8);
+        let b8 = if len == 9 { *p.add(8) as u64 } else { 0 };
+        // every byte of the ID must be 1..=127: none with its high bit set, none zero among the first `len` (the
+        // zero test can only be wrong above a zero byte, and the bytes past `len` are cut from it)
+        let zero = _bzhi_u64(lo.wrapping_sub(ONES) & !lo, n8);
+        if ((lo | b8 | zero) & (ONES << 7)) != 0 || (len == 9 && b8 == 0) {
+            return 0;
+        }
+        // first byte highest: swap, then squeeze the seven low bits of each byte together
+        return (_pext_u64(lo.swap_bytes(), ONES * 0x7F) << 7) | b8;
     }
     #[allow(unreachable_code)]
     {
-        pack(&v.to_le_bytes()[..len])
+        pack(std::slice::from_raw_parts(p, len))
     }
 }
 
-/// `pack` of two IDs at once: the `la` bytes at `pa` and the `lb` bytes at `pb` (16 bytes readable at each), one in
-/// each half of a 256-bit register, so the pair costs little more than one `pack16`.
-#[inline(always)]
-unsafe fn pack2(pa: *const u8, la: usize, pb: *const u8, lb: usize) -> (u64, u64) {
-    // an ID of more than 10 bytes does not pack: taken as an empty one it comes out 0
-    let (la, lb) = (if la > 10 { 0 } else { la }, if lb > 10 { 0 } else { lb });
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    {
-        use std::arch::x86_64::*;
-        // the first `len` bytes of an ID's 16: KEEP read from 16 - len is `len` ones, then zeros
-        static KEEP: [u8; 32] = [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let id = |p: *const u8, len: usize| _mm_and_si128(_mm_loadu_si128(p as *const __m128i), _mm_loadu_si128(KEEP.as_ptr().add(16 - len) as *const __m128i));
-        let c = _mm256_inserti128_si256(_mm256_castsi128_si256(id(pa, la)), id(pb, lb), 1);
-        // classes and offsets as in `pack16`
-        const LO: [u8; 16] = [13, 15, 15, 15, 15, 15, 15, 15, 15, 15, 14, 2, 2, 2, 2, 6];
-        const HI: [u8; 16] = [0, 0, 0, 1, 2, 4, 2, 8, 0, 0, 0, 0, 0, 0, 0, 0];
-        const OFF: [u8; 16] = [0, 0, 0, 47, 54, 54, 59, 59, 0, 0, 0, 0, 0, 0, 0, 0];
-        let tbl = |t: &[u8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr() as *const __m128i));
-        let hi = _mm256_and_si256(_mm256_srli_epi16(c, 4), _mm256_set1_epi8(0x0F));
-        let class = _mm256_and_si256(_mm256_shuffle_epi8(tbl(&LO), c), _mm256_shuffle_epi8(tbl(&HI), hi));
-        let invalid = _mm256_movemask_epi8(_mm256_cmpeq_epi8(class, _mm256_setzero_si256())) as u32;
-        if invalid & (((1u32 << la) - 1) | ((1u32 << lb) - 1) << 16) != 0 {
-            // one of them holds a byte outside the alphabet: each on its own
-            return (pack16(load16(pa, la), la), pack16(load16(pb, lb), lb));
-        }
-        let us = _mm256_cmpeq_epi8(c, _mm256_set1_epi8(b'_' as i8));
-        let off = _mm256_add_epi8(_mm256_shuffle_epi8(tbl(&OFF), hi), _mm256_and_si256(us, _mm256_set1_epi8(4)));
-        let d = _mm256_sub_epi8(c, off);
-        let w = _mm256_maddubs_epi16(d, _mm256_set1_epi16(0x0140));
-        let l = _mm256_madd_epi16(w, _mm256_set1_epi32(0x0001_1000));
-        let key = |l: __m128i| {
-            let lo = _mm_cvtsi128_si64(l) as u64;
-            let l2 = _mm_extract_epi32(l, 2) as u32 as u64;
-            ((lo & 0xffff_ffff) << 36) | ((lo >> 32) << 12) | (l2 >> 12)
-        };
-        return (key(_mm256_castsi256_si128(l)), key(_mm256_extracti128_si256(l, 1)));
-    }
-    #[allow(unreachable_code)]
-    (pack16(load16(pa, la), la), pack16(load16(pb, lb), lb))
-}
-
-/// The IDs that do not pack (longer than 10 bytes, or a byte outside [0-9A-Z_a-z]): each gets a number, exact on
+/// The IDs that do not pack (longer than 9 bytes, or a byte that is NUL or not ASCII): each gets a number, exact on
 /// its bytes. Locked and slow; generated data never comes here.
 struct Interner {
     shards: Vec<Mutex<(HashMap<Box<[u8]>, u32, BuildHasherDefault<BytesHasher>>, Vec<Box<[u8]>>)>>,
@@ -267,11 +173,12 @@ impl Interner {
         }
     }
 
-    /// The key of the `len` bytes at `p`, given `pack2`'s answer for them (0 = they do not pack).
+    /// `key` of the `len` (> 0) bytes at `p` (9 bytes must be readable).
     #[inline(always)]
-    unsafe fn key_or(&self, packed: u64, p: *const u8, len: usize) -> u64 {
-        if packed != 0 {
-            return packed;
+    unsafe fn key_at(&self, p: *const u8, len: usize) -> u64 {
+        let k = pack_at(p, len);
+        if k != 0 {
+            return k;
         }
         self.intern(std::slice::from_raw_parts(p, len))
     }
@@ -284,12 +191,12 @@ impl Interner {
             out.extend_from_slice(&g.1[key as u32 as usize]);
             return;
         }
-        for i in 0..10 {
-            let d = (key >> (54 - 6 * i)) & 63;
+        for i in 0..9 {
+            let d = (key >> (56 - 7 * i)) & 127;
             if d == 0 {
                 break;
             }
-            out.push(UNPACK[d as usize]);
+            out.push(d as u8);
         }
     }
 
@@ -2245,11 +2152,9 @@ impl IdMap {
     /// `get` of the `len` bytes at `p` (16 bytes must be readable).
     #[inline(always)]
     unsafe fn get_at(&self, p: *const u8, len: usize) -> Option<u16> {
-        if len <= 10 {
-            let k = pack16(load16(p, len), len);
-            if k != 0 {
-                return self.packed(k);
-            }
+        let k = pack_at(p, len);
+        if k != 0 {
+            return self.packed(k);
         }
         self.other.get(std::slice::from_raw_parts(p, len)).copied()
     }
@@ -2443,9 +2348,7 @@ unsafe fn fast_event(cx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, st: 
     }
     let Some(ingest) = ts_memo(line.add(f.at(3).0), f.at(3).1, &mut st.days) else { return };
     let (up, ul, pl) = (line.add(f.at(1).0), f.at(1).1, f.at(5).1);
-    // both IDs at once; the user ID is interned (when it does not pack) only once the event is known to be kept
-    let (ek, uk) = pack2(ep, el, up, ul);
-    let ekey = cx.names.key_or(ek, ep, el);
+    let ekey = cx.names.key_at(ep, el);
     let ts = match ts_memo(line.add(f.at(2).0), f.at(2).1, &mut st.days) {
         Some(t) if ul != 0 && pl != 0 && t >= cx.ws && t < cx.we && ingest - t <= DAY => t,
         _ => return st.log(cx, ekey, ingest, 0),
@@ -2461,8 +2364,7 @@ unsafe fn fast_event(cx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, st: 
         }
         _ => return st.log(cx, ekey, ingest, 0),
     };
-    let ukey = cx.names.key_or(uk, up, ul);
-    st.keep(cx, ekey, ingest, ukey, ts, pay);
+    st.keep(cx, ekey, ingest, cx.names.key_at(up, ul), ts, pay);
 }
 
 /// Parses the event lines that start in [start, end) of the `len` bytes at `buf` (see `scan_lines`) into `st`.
@@ -2510,8 +2412,7 @@ unsafe fn fast_click(cx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, st: 
     };
     let Some(camp) = cx.campaigns.get_short(line.add(f.at(2).0), f.at(2).1) else { return };
     let (cp, cl, up, ul) = (line.add(f.at(0).0), f.at(0).1, line.add(f.at(1).0), f.at(1).1);
-    let (ck, uk) = pack2(cp, cl, up, ul);
-    st.click(cx, cx.names.key_or(ck, cp, cl), cx.names.key_or(uk, up, ul), t, camp);
+    st.click(cx, cx.names.key_at(cp, cl), cx.names.key_at(up, ul), t, camp);
 }
 
 /// `fast_click` for a line that ends in its first 64 bytes.
@@ -2527,8 +2428,7 @@ unsafe fn fast_click64(cx: &Ctx, line: *const u8, e: usize, c: u64, q: u64, st: 
     };
     let Some(camp) = cx.campaigns.get_short(line.add(f.at(2).0), f.at(2).1) else { return };
     let (cp, cl, up, ul) = (line.add(f.at(0).0), f.at(0).1, line.add(f.at(1).0), f.at(1).1);
-    let (ck, uk) = pack2(cp, cl, up, ul);
-    st.click(cx, cx.names.key_or(ck, cp, cl), cx.names.key_or(uk, up, ul), t, camp);
+    st.click(cx, cx.names.key_at(cp, cl), cx.names.key_at(up, ul), t, camp);
 }
 
 unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: usize, st: &mut Shard) {
@@ -3672,12 +3572,12 @@ fn page_slices<'a>(segs: &[&'a [UserRow]], lo: usize, hi: usize, out: &mut Vec<&
 #[inline]
 fn put_name(b: &mut Vec<u8>, names: &Interner, k: u64, tmp: &mut Vec<u8>) {
     if k & INTERNED == 0 {
-        // a packed ID: five digit pairs to ten bytes, the zero digits past its length cut off
-        let mut buf = [0u8; 10];
-        for (i, sh) in [48, 36, 24, 12, 0].into_iter().enumerate() {
-            buf[2 * i..2 * i + 2].copy_from_slice(&PAIRS[((k >> sh) & 0xfff) as usize].to_le_bytes());
+        // a packed ID: nine 7-bit bytes, first byte highest; the zero bytes past its length cut off
+        let mut buf = [0u8; 9];
+        for (i, c) in buf.iter_mut().enumerate() {
+            *c = ((k >> (56 - 7 * i)) & 127) as u8;
         }
-        let len = 10 - (k.trailing_zeros() / 6) as usize;
+        let len = 9 - (k.trailing_zeros() / 7) as usize;
         b.extend_from_slice(&(len as u32).to_le_bytes());
         b.extend_from_slice(&buf[..len]);
         return;
@@ -3687,17 +3587,6 @@ fn put_name(b: &mut Vec<u8>, names: &Interner, k: u64, tmp: &mut Vec<u8>) {
     b.extend_from_slice(&(tmp.len() as u32).to_le_bytes());
     b.extend_from_slice(tmp);
 }
-
-/// The 6-bit digit pairs of a packed ID as two bytes: 4096 entries, the first character in the low byte.
-static PAIRS: [u16; 4096] = {
-    let mut t = [0u16; 4096];
-    let mut x = 0;
-    while x < 4096 {
-        t[x] = UNPACK[x >> 6] as u16 | (UNPACK[x & 63] as u16) << 8;
-        x += 1;
-    }
-    t
-};
 
 /// DELTA_BINARY_PACKED body of `v`: blocks of 128 deltas in four miniblocks of 32, each miniblock at the bit width
 /// its largest value (delta minus the block's smallest delta) needs.
@@ -4242,70 +4131,45 @@ mod tests {
     }
 
     #[test]
-    fn pack2_matches_pack() {
-        let mut r = Rng(77);
-        let alphabet: Vec<u8> = (0u8..=255).filter(|&c| PACK[c as usize] != 0).collect();
-        let mut both = 0;
-        for i in 0..400_000 {
-            let mut ids: Vec<Vec<u8>> = (0..2)
-                .map(|_| {
-                    let len = r.below(17);
-                    (0..len).map(|_| alphabet[r.below(63)]).collect()
-                })
-                .collect();
-            if i % 4 == 0 {
-                let which = r.below(2);
-                let len = ids[which].len();
-                if len > 0 {
-                    ids[which][r.below(len)] = r.next() as u8; // usually a byte that does not pack
-                }
-            }
-            let bufs: Vec<Vec<u8>> = ids
-                .iter()
-                .map(|id| {
-                    let mut b = id.clone();
-                    b.extend((0..32).map(|_| r.next() as u8));
-                    b
-                })
-                .collect();
-            let want = (pack(&ids[0]), pack(&ids[1]));
-            let got = unsafe { pack2(bufs[0].as_ptr(), ids[0].len(), bufs[1].as_ptr(), ids[1].len()) };
-            assert_eq!(got, want, "{ids:?}");
-            both += (want.0 != 0 && want.1 != 0) as usize;
-        }
-        assert!(both > 50_000, "too few packable pairs ({both}) to mean anything");
-    }
-
-    #[test]
-    fn pack16_matches_pack_and_keeps_order() {
+    fn pack_at_matches_pack_and_keeps_order() {
         let mut r = Rng(42);
-        let alphabet: Vec<u8> = (0u8..=255).filter(|&c| PACK[c as usize] != 0).collect();
-        assert_eq!(alphabet.len(), 63);
         let names = Interner::new();
         let mut prev: Option<(Vec<u8>, u64)> = None;
-        for i in 0..200_000 {
-            let len = r.below(13);
-            let mut id: Vec<u8> = (0..len).map(|_| alphabet[r.below(63)]).collect();
+        let mut packed = 0;
+        for i in 0..300_000 {
+            let len = r.below(12);
+            let mut id: Vec<u8> = (0..len).map(|_| 1 + r.below(127) as u8).collect();
             if i % 5 == 0 && len > 0 {
-                id[r.below(len)] = r.next() as u8; // usually a byte that does not pack
+                id[r.below(len)] = [0u8, 0x80, 0xff, 0xc3, 0x7f, 1][r.below(6)]; // mostly bytes that do not pack
             }
             let mut buf = id.clone();
             buf.extend((0..32).map(|_| r.next() as u8));
             let k = pack(&id);
-            assert_eq!(pack16(unsafe { load16(buf.as_ptr(), len) }, len), k, "{id:?}");
+            assert_eq!(k != 0, (1..=9).contains(&len) && id.iter().all(|&c| c != 0 && c < 128), "{id:?}");
+            assert_eq!(unsafe { pack_at(buf.as_ptr(), len) }, k, "{id:?}");
             if k == 0 {
                 continue;
             }
+            packed += 1;
+            assert!(k & INTERNED == 0);
             let mut back = Vec::new();
             names.bytes(k, &mut back);
             assert_eq!(back, id);
+            let (mut out, mut tmp) = (Vec::new(), Vec::new());
+            put_name(&mut out, &names, k, &mut tmp);
+            assert_eq!(out[..4], (id.len() as u32).to_le_bytes());
+            assert_eq!(out[4..], id[..]);
             if let Some((pid, pk)) = &prev {
                 assert_eq!(pid.cmp(&id), pk.cmp(&k), "{pid:?} {id:?}");
             }
             prev = Some((id, k));
         }
+        assert!(packed > 100_000);
+        // a prefix sorts first, and so does an upper-case variant
+        assert!(pack(b"u1") < pack(b"u10") && pack(b"U9zzzzzzz") < pack(b"u1") && pack(b"u1") != pack(b"u1\0"));
+        assert_eq!(pack(b"0123456789"), 0);
         // IDs that do not pack: exact, and ordered by their bytes against packed ones
-        let (a, b, c) = (names.key(b"user-with-dash"), names.key(b"user-with-dash"), names.key(b" u1"));
+        let (a, b, c) = (names.key(b"user-with-dash"), names.key(b"user-with-dash"), names.key(" \u{e9}1".as_bytes()));
         assert!(a == b && a != c && a & INTERNED != 0);
         assert!(names.less(c, pack(b"u1")) && names.less(pack(b"u1"), a) && !names.less(a, a));
     }

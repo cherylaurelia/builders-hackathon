@@ -834,6 +834,16 @@ unsafe fn masks64(p: *const u8) -> [u64; 3] {
     }
 }
 
+/// `masks64` for the 32 bytes at `p`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn masks32(p: *const u8) -> [u64; 3] {
+    use std::arch::x86_64::*;
+    let a = _mm256_loadu_si256(p as *const __m256i);
+    let m = |c: u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, _mm256_set1_epi8(c as i8))) as u32 as u64;
+    [m(b','), m(b'"'), m(b'\n')]
+}
+
 /// Calls `f` with the N unquoted fields of every well-formed line that starts in [start, end)
 /// of `file`, skipping the header line. Same dialect as `split`, in one SIMD pass over the chunk.
 #[inline]
@@ -1154,12 +1164,16 @@ unsafe fn ts_memo(p: *const u8, len: usize, days: &mut [Day; 32]) -> Option<i64>
     if (x.wrapping_add(ADD) | x) & HI != 0 {
         return None;
     }
-    let pb = x * 10 + (x >> 8);
-    let (h, mi, sec) = (pb & 0xFF, (pb >> 24) & 0xFF, (pb >> 48) & 0xFF);
-    if (h > 23) | (mi > 59) | (sec > 59) {
+    // hours in byte 0, minutes in byte 3, seconds in byte 6, each 0..=99
+    let pb = (x * 10 + (x >> 8)) & 0x00FF_0000_FF00_00FF;
+    // adding 127 - 23 (127 - 59) carries an hour over 23 (a minute or second over 59) into its byte's high bit
+    if pb.wrapping_add(0x0044_0000_4400_0068) & 0x0080_0000_8000_0080 != 0 {
         return None;
     }
-    let t = day.ms + (h * 3_600_000 + mi * 60_000 + sec * 1000) as i64;
+    // one multiply: h * 3600 + mi * 60 + sec (17 bits) lands at bit 48 of the product; the other terms end below
+    // bit 36 or start at bit 72
+    let secs = ((pb as u128 * ((3600u128 << 48) | (60 << 24) | 1)) >> 48) as u64 & 0x1_FFFF;
+    let t = day.ms + (secs * 1000) as i64;
     if f1 {
         return Some(t);
     }
@@ -1329,6 +1343,17 @@ unsafe fn scan_lines<S>(
     while p < end && p < len {
         let line = buf.add(p);
         let [c0, q0, n0] = masks64(line);
+        // nearly every line ends in its first 96 bytes: the last 32 of the 128 are looked at only when it does not
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        let [c1, q1, n1] = {
+            let [mut c1, mut q1, mut n1] = masks32(line.add(64));
+            if n0 | n1 == 0 {
+                let [c, q, n] = masks32(line.add(96));
+                (c1, q1, n1) = (c1 | c << 32, q1 | q << 32, n1 | n << 32);
+            }
+            [c1, q1, n1]
+        };
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
         let [c1, q1, n1] = masks64(line.add(64));
         let n = n0 as u128 | (n1 as u128) << 64;
         if n != 0 {

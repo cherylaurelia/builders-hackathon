@@ -2240,7 +2240,7 @@ fn main() {
                     }
                     let path = ud.join(format!("part-{t}.parquet"));
                     if w.file.n > 0 {
-                        w.file.write(&path).unwrap_or_else(|e| die(&format!("write user_daily: {e}")));
+                        w.file.write(&path, cat_names).unwrap_or_else(|e| die(&format!("write user_daily: {e}")));
                     } else if t == 0 {
                         // thread 0 writes even with no rows: the table needs at least one file
                         write_users(&path, &[], cat_names, &cx.names).unwrap_or_else(|e| die(&format!("write user_daily: {e}")));
@@ -2961,10 +2961,14 @@ struct Work {
     cred: Vec<Cred>,
     rev: Vec<i64>, // revenue of the credited sessions, per cell of `cred`
     assist: Vec<u32>,
-    stamp: Vec<bool>,
-    iv: Vec<(i64, i64)>,
-    seen: Vec<u32>,
-    sctr: u32,
+    sb: Vec<i64>,   // per 30-minute bin, the start of the session of the person at hand that starts in it (between people: none)
+    pre: Vec<u32>,  // per bin, the person's sessions that start in the bins before it
+    best: Vec<(i64, u32, u64)>, // per session, the latest click (ts, campaign, click key) whose first session it is
+    cmark: Vec<u64>, // per campaign: stamp of the person at hand << 32 | the campaign's set in `cbm`
+    cctr: u32,
+    slots: Vec<u32>, // the campaigns of the person at hand, by set
+    cbm: Vec<u64>,   // per set, a bit per session
+    gm: Vec<(u32, u32, u64, u64, u32)>, // per day of the person: the words of a set and the bits in them of its sessions, the day
     start: Vec<u32>,  // see partition_work
     cstart: Vec<u32>,
     ev: Vec<u64>,
@@ -2972,7 +2976,6 @@ struct Work {
     sessions: Vec<Sess>,
     day_groups: Vec<(usize, usize)>, // (d, first session index)
     cats: Vec<(u16, i64)>,
-    touched: Vec<usize>,
     bins: Vec<Bin>, // the bins of the person at hand (all free between people)
     bits: Vec<u64>, // which bins are taken
     bin_sess: Vec<u32>, // the session of each bin taken by the person at hand
@@ -2995,10 +2998,14 @@ impl Work {
             cred: vec![Cred::default(); cells],
             rev: filled(cells, 0),
             assist: filled(cells + 4, 0), // + cells for the unused steps of the vector window
-            stamp: vec![false; cx.ncamp + 1],
-            iv: vec![(0, 0); cx.ncamp + 1],
-            seen: filled(cx.ncamp + 1, 0),
-            sctr: 0,
+            sb: Vec::new(),
+            pre: Vec::new(),
+            best: Vec::new(),
+            cmark: filled(cx.ncamp + 1, 0),
+            cctr: 0,
+            slots: Vec::new(),
+            cbm: Vec::new(),
+            gm: Vec::new(),
             start: filled(local + 2, 0),
             cstart: filled(local + 2, 0),
             ev: huge_vec(ev_cap),
@@ -3006,7 +3013,6 @@ impl Work {
             sessions: Vec::new(),
             day_groups: Vec::new(),
             cats: Vec::new(),
-            touched: Vec::new(),
             bins: vec![FREE_BIN; ((cx.we - cx.base) / GAP) as usize + 2],
             bits: vec![0; ((cx.we - cx.base) / GAP) as usize / 64 + 2],
             bin_sess: vec![0; ((cx.we - cx.base) / GAP) as usize + 2],
@@ -3259,7 +3265,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     }
 
     let ev = std::mem::take(&mut w.ev);
-    let mut ck = std::mem::take(&mut w.ck);
+    let ck = std::mem::take(&mut w.ck);
     for l in 0..local {
         let (a, b) = (w.start[l] as usize, w.start[l + 1] as usize);
         if a == b {
@@ -3268,11 +3274,9 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
         let name = cx.ids.slots[(p << cx.pshift) | l].key.load(Relaxed);
         let (ca, cb) = (w.cstart[l] as usize, w.cstart[l + 1] as usize);
         let evs = &ev[a..b];
-        // the clicks: sorted in place, or (up to 64) as the arrays of the vector window
+        // the clicks: up to 64 as the sorted arrays of the vector window; more are used as they are
         let nc = cb - ca;
-        if nc > 64 {
-            ck[ca..cb].sort_unstable_by_key(|c| c.k);
-        } else if nc > 0 {
+        if nc > 0 && nc <= 64 {
             let mut rank = [0u8; 64];
             if nc > 1 {
                 ranks_small(nc, |i| (ck[ca + i].k >> 32) as u32, &mut rank);
@@ -3307,7 +3311,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
 fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
     let width = cx.ndays;
     let organic = cx.ncamp;
-    let Work { rows, cred, rev, assist, stamp, iv, seen, sctr, sessions, day_groups, cats, touched, small, bins, bits, bin_sess, purch, sess_day, days, dcats, .. } = w;
+    let Work { rows, cred, rev, assist, sessions, day_groups, cats, small, bins, bits, bin_sess, purch, sess_day, days, dcats, sb, pre, best, cmark, cctr, slots, cbm, gm, .. } = w;
 
     // sessions + user_daily rows: the events go into their 30-minute bins, and the bins in order are the sessions
     // through raw pointers taken once (the vectors' fields would be reloaded from memory after every store), with
@@ -3385,8 +3389,6 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
         rows.push(finish_row(UserRow { name, day, sessions: x.sessions, events: x.events, revenue: x.revenue, top: NO_CAT }, cats, &cx.cat_rank));
     }
 
-    let cts = |c: &Ck| (c.k >> 32) as i64;
-    let ccamp = |c: &Ck| (c.k & 0xffff_ffff) as usize;
     let mut credit = |camp: usize, s: &Sess| {
         let a = &mut cred[camp * width + s.d];
         a.sessions += 1;
@@ -3395,19 +3397,6 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
             // apart from the counts: most sessions buy nothing, and the cells every session touches stay half as big
             rev[camp * width + s.d] += s.revenue;
         }
-    };
-    // the campaign of the latest click among cs[lo..hi] (all at or before the session start); tie -> smallest click_id
-    let latest = |lo: usize, hi: usize| -> usize {
-        let t = cts(&cs[hi - 1]);
-        let mut best = &cs[hi - 1];
-        let mut k = hi - 1;
-        while k > lo && cts(&cs[k - 1]) == t {
-            k -= 1;
-            if cx.names.less(cs[k].cid, best.cid) {
-                best = &cs[k];
-            }
-        }
-        ccamp(best)
     };
     let (nc, ns) = (cs.len(), sessions.len());
     if nc == 0 {
@@ -3457,84 +3446,93 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
             }
             credit(camp, s);
         }
-    } else if nc * ns <= 2048 {
-        // few sessions: per session, look at the clicks of its 7-day window [start - 7d, start]
-        // (a contiguous run of cs) for the credit and for the distinct assisting campaigns
-        let (mut lo, mut hi) = (0, 0);
-        for s in sessions.iter() {
-            while hi < nc && cts(&cs[hi]) <= s.start {
-                hi += 1;
-            }
-            while lo < hi && s.start - cts(&cs[lo]) > WEEK {
-                lo += 1;
-            }
-            let mut camp = organic;
-            if hi > lo {
-                camp = latest(lo, hi);
-                // assists: each distinct campaign of the window once
-                if *sctr == u32::MAX {
-                    seen.fill(0);
-                    *sctr = 0;
-                }
-                *sctr += 1;
-                for c in &cs[lo..hi] {
-                    let kk = ccamp(c);
-                    if seen[kk] != *sctr {
-                        seen[kk] = *sctr;
-                        assist[kk * width + s.d] += 1;
-                    }
-                }
-            }
-            credit(camp, s);
-        }
     } else {
-        // credit: latest click with start - 7d <= ts <= start
-        let mut q = 0;
+        // more clicks, in any order. A click at t can serve the sessions that start in [t, t + 7d]: the sessions
+        // lo..hi of the person's (sorted) sessions, read from a table over the 30-minute bins - a session starts
+        // more than 30 minutes after the one before, so a bin holds at most one start: `pre` = the starts in the
+        // bins before, `sb` = the start in the bin (else none).
+        let nb = bins.len() + (WEEK / GAP) as usize + 1;
+        if sb.len() < nb {
+            sb.resize(nb, i64::MAX);
+            pre.resize(nb, 0);
+        }
         for s in sessions.iter() {
-            while q < nc && cts(&cs[q]) <= s.start {
-                q += 1;
-            }
-            let mut camp = organic;
-            if q > 0 && s.start - cts(&cs[q - 1]) <= WEEK {
-                camp = latest(0, q);
-            }
-            credit(camp, s);
+            sb[(s.start / GAP) as usize] = s.start;
         }
-        // assists: a click at t assists sessions starting in [t, t + 7d]; merge per campaign
-        let flush = |assist: &mut [u32], k: usize, lo: i64, hi: i64, sessions: &[Sess], day_groups: &[(usize, usize)]| {
-            let a = sessions.partition_point(|s| s.start < lo);
-            let b = sessions.partition_point(|s| s.start <= hi);
-            if a >= b {
-                return;
-            }
-            for (g, &(d, first)) in day_groups.iter().enumerate() {
-                let end = day_groups.get(g + 1).map(|x| x.1).unwrap_or(sessions.len());
-                let n = end.min(b) as i64 - first.max(a) as i64;
-                if n > 0 {
-                    assist[k * width + d] += n as u32;
-                }
-            }
-        };
-        touched.clear();
+        let mut run = 0u32;
+        for (p, &x) in pre[..nb].iter_mut().zip(&sb[..nb]) {
+            *p = run;
+            run += (x != i64::MAX) as u32;
+        }
+        // credit: per session index, the latest of the clicks whose first session it is (tie -> smallest click_id);
+        // a session takes the latest click at or before its start, if within 7 days
+        best.clear();
+        best.resize(ns + 1, (-1, 0, 0));
+        // assists: per campaign of the person, the set of sessions its clicks can serve
+        let wn = ns.div_ceil(64);
+        if *cctr == u32::MAX {
+            cmark.fill(0);
+            *cctr = 0;
+        }
+        *cctr += 1;
+        let stamp = (*cctr as u64) << 32;
+        slots.clear();
+        cbm.clear();
         for c in cs {
-            let k = ccamp(c);
-            let t = cts(c);
-            if !stamp[k] {
-                stamp[k] = true;
-                iv[k] = (t, t + WEEK);
-                touched.push(k);
-            } else if t <= iv[k].1 {
-                iv[k].1 = t + WEEK;
+            let (t, camp) = ((c.k >> 32) as i64, c.k as u32);
+            let (b1, b2) = ((t / GAP) as usize, ((t + WEEK) / GAP) as usize);
+            let lo = (pre[b1] + (sb[b1] < t) as u32) as usize;
+            let hi = (pre[b2] + (sb[b2] <= t + WEEK) as u32) as usize;
+            if lo >= hi {
+                continue;
+            }
+            let x = &mut best[lo];
+            if t > x.0 || (t == x.0 && cx.names.less(c.cid, x.2)) {
+                *x = (t, camp, c.cid);
+            }
+            let m = &mut cmark[camp as usize];
+            if *m & !0xffff_ffff != stamp {
+                *m = stamp | slots.len() as u64;
+                slots.push(camp);
+                cbm.resize(cbm.len() + wn, 0);
+            }
+            let set = &mut cbm[(*m as u32 as usize) * wn..][..wn];
+            let (w0, w1) = (lo >> 6, (hi - 1) >> 6);
+            let (m0, m1) = (!0u64 << (lo & 63), !0u64 >> (63 - ((hi - 1) & 63)));
+            if w0 == w1 {
+                set[w0] |= m0 & m1;
             } else {
-                let (lo, hi) = iv[k];
-                flush(assist, k, lo, hi, sessions, day_groups);
-                iv[k] = (t, t + WEEK);
+                set[w0] |= m0;
+                set[w0 + 1..w1].fill(!0);
+                set[w1] |= m1;
             }
         }
-        for &k in touched.iter() {
-            let (lo, hi) = iv[k];
-            flush(assist, k, lo, hi, sessions, day_groups);
-            stamp[k] = false;
+        for s in sessions.iter() {
+            sb[(s.start / GAP) as usize] = i64::MAX;
+        }
+        let mut cur = (-1i64, 0u32, 0u64);
+        for (i, s) in sessions.iter().enumerate() {
+            // a later first session means a later click: the clicks of `best[i]` are after those before it
+            if best[i].0 >= 0 {
+                cur = best[i];
+            }
+            credit(if cur.0 >= 0 && s.start - cur.0 <= WEEK { cur.1 as usize } else { organic }, s);
+        }
+        // the sessions of each campaign's set, counted per day: the sessions of a day are consecutive and at most
+        // 48 (one start per bin), so they are bits of one word of the set or of two neighbours
+        gm.clear();
+        for (g, &(d, first)) in day_groups.iter().enumerate() {
+            let end = day_groups.get(g + 1).map_or(ns, |x| x.1);
+            let (w0, w1) = (first >> 6, (end - 1) >> 6);
+            let (m0, m1) = (!0u64 << (first & 63), !0u64 >> (63 - ((end - 1) & 63)));
+            gm.push(if w0 == w1 { (w0 as u32, w0 as u32, m0 & m1, 0, d as u32) } else { (w0 as u32, w1 as u32, m0, m1, d as u32) });
+            debug_assert!(w1 <= w0 + 1);
+        }
+        for (k, set) in slots.iter().zip(cbm.chunks_exact(wn)) {
+            let row = &mut assist[*k as usize * width..][..width];
+            for &(w0, w1, m0, m1, d) in gm.iter() {
+                row[d as usize] += (set[w0 as usize] & m0).count_ones() + (set[w1 as usize] & m1).count_ones();
+            }
         }
     }
 }
@@ -3917,6 +3915,29 @@ fn put_delta(b: &mut Vec<u8>, v: &[i64]) {
             if w == 0 {
                 continue;
             }
+            if w <= 56 {
+                // 32 values of w bits are 4 w whole bytes: each value is or-ed into a word that is stored at once
+                // (its bits past the bytes done so far are stored again by the next), without a branch
+                let bytes = 4 * w as usize;
+                b.reserve(bytes + 8);
+                // SAFETY: the stores end at most 8 bytes past the 4 w reserved bytes, inside the reserve; every
+                // byte below `bytes` is written (the last value's store ends at or after it)
+                unsafe {
+                    let p = b.as_mut_ptr().add(b.len());
+                    let (mut acc, mut nb, mut o) = (0u64, 0u32, 0usize);
+                    for &x in &r[k * 32..k * 32 + 32] {
+                        acc |= x << nb; // x < 2^w and nb < 8: no bit is lost
+                        (p.add(o) as *mut u64).write_unaligned(acc.to_le());
+                        let adv = (nb + w) >> 3; // whole bytes done, at most 7
+                        o += adv as usize;
+                        acc >>= adv * 8;
+                        nb = (nb + w) & 7;
+                    }
+                    debug_assert!(o == bytes && nb == 0);
+                    b.set_len(b.len() + bytes);
+                }
+                continue;
+            }
             let (mut acc, mut nb) = (0u128, 0u32);
             for &x in &r[k * 32..k * 32 + 32] {
                 acc |= (x as u128) << nb;
@@ -4044,7 +4065,8 @@ fn write_users(path: &Path, rows: &[UserRow], cat_names: &[Bytes], names: &Inter
 const FLUSH_ROWS: usize = 4096;
 
 /// One thread's user_daily file, built a page per column at a time while the sessions run; `write` puts the column
-/// chunks together. The encodings are those of `write_users`, which still writes a file without rows.
+/// chunks together. user_id and the delta columns are encoded as in `write_users`, which still writes a file
+/// without rows; top_category is dictionary encoded (the dictionary is every category).
 struct UserFile {
     cols: [Vec<u8>; 6], // each column's data pages so far, headers included
     dict: Vec<u8>,      // the body of the user_id dictionary page: one entry per run of equal IDs
@@ -4069,7 +4091,7 @@ impl UserFile {
         }
     }
 
-    fn add_page(&mut self, rows: &[UserRow], cat_names: &[Bytes], names: &Interner) {
+    fn add_page(&mut self, rows: &[UserRow], _cat_names: &[Bytes], names: &Interner) {
         let UserFile { cols, dict, entries, last, n, page, vals, run, tmp } = self;
         *n += rows.len();
         for c in 0..6 {
@@ -4135,33 +4157,59 @@ impl UserFile {
                     }
                     b.extend_from_slice(&((run.len()) as u32).to_le_bytes());
                     b.extend_from_slice(run);
+                    // the values: indices into the dictionary of all categories, 8 bits each (`small_tables` allows
+                    // 256 names), as one bit-packed run of groups of 8 (the last one padded)
+                    b.push(8);
+                    let at = b.len();
+                    b.extend_from_slice(&[0; 10]); // room for the run header, moved up against the values below
+                    let v0 = b.len();
                     for r in rows {
                         if r.top != NO_CAT {
-                            let v = cat_names[r.top as usize];
-                            b.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                            b.extend_from_slice(v);
+                            b.push(r.top as u8);
                         }
+                    }
+                    let present = b.len() - v0;
+                    b.resize(v0 + present.next_multiple_of(8), 0);
+                    let mut hdr = [0u8; 10];
+                    let mut hn = 0;
+                    let mut v = ((present.div_ceil(8) as u64) << 1) | 1;
+                    while v >= 0x80 {
+                        hdr[hn] = v as u8 | 0x80;
+                        hn += 1;
+                        v >>= 7;
+                    }
+                    hdr[hn] = v as u8;
+                    hn += 1;
+                    if present == 0 {
+                        b.truncate(at); // no value: the width alone
+                    } else {
+                        b[at..at + hn].copy_from_slice(&hdr[..hn]);
+                        b.drain(at + hn..v0);
                     }
                 }
             }
             if i32::try_from(page.len() - HDR_ROOM).is_err() {
                 die("page over 2 GiB");
             }
-            let at = page_header(page, false, rows.len(), if c == 0 { 8 } else if USER_COLS[c].delta { 5 } else { 0 }); // RLE_DICTIONARY, DELTA_BINARY_PACKED, PLAIN
+            let at = page_header(page, false, rows.len(), if USER_COLS[c].delta { 5 } else { 8 }); // DELTA_BINARY_PACKED, RLE_DICTIONARY
             cols[c].extend_from_slice(&page[at..]);
         }
     }
 
     /// Writes the file (at least one row was added): the dictionary page and the data pages of user_id, the pages
     /// of the other columns, the footer; one write(2), as `write_parquet`.
-    fn write(&mut self, path: &Path) -> std::io::Result<()> {
+    fn write(&mut self, path: &Path, cat_names: &[Bytes]) -> std::io::Result<()> {
         use std::io::Write;
         let mut f = std::fs::File::create(path)?;
         i32::try_from(self.dict.len()).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
         let mut dpage = vec![0u8; HDR_ROOM + self.dict.len()];
         dpage[HDR_ROOM..].copy_from_slice(&self.dict);
         let at = page_header(&mut dpage, true, self.entries, 0);
-        let mut out: Vec<u8> = Vec::with_capacity(self.cols.iter().map(|c| c.len()).sum::<usize>() + dpage.len() + 4096);
+        // top_category: every category, by its number
+        let mut cpage = vec![0u8; HDR_ROOM];
+        plain_bytes(&mut cpage, cat_names.iter().copied());
+        let cat = page_header(&mut cpage, true, cat_names.len(), 0);
+        let mut out: Vec<u8> = Vec::with_capacity(self.cols.iter().map(|c| c.len()).sum::<usize>() + dpage.len() + cpage.len() + 4096);
         out.extend_from_slice(b"PAR1");
         let mut chunks = Vec::with_capacity(6);
         for (c, pages) in self.cols.iter().enumerate() {
@@ -4169,6 +4217,9 @@ impl UserFile {
             let mut dict_off = None;
             if c == 0 {
                 out.extend_from_slice(&dpage[at..]);
+                dict_off = Some(start);
+            } else if c == 5 {
+                out.extend_from_slice(&cpage[cat..]);
                 dict_off = Some(start);
             }
             let data_off = out.len() as i64;

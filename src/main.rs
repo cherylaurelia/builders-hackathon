@@ -2236,8 +2236,21 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
             };
             for (t, s) in shards.iter().enumerate() {
                 let mut me = ((t as u32) << POS_T) + 1;
-                for blk in s.lg[b].slices(LG_BLOCK) {
+                let blks: Vec<&[LRec]> = s.lg[b].slices(LG_BLOCK).collect();
+                for (k, blk) in blks.iter().enumerate() {
                     for (i, r) in blk.iter().enumerate() {
+                        // the stream ~1 KB ahead, into the next block at the end of this one
+                        if i % 4 == 0 {
+                            const RA: usize = 40;
+                            match blk.get(i + RA) {
+                                Some(f) => prefetch(f),
+                                None => {
+                                    if let Some(f) = blks.get(k + 1).and_then(|n| n.get(i + RA - blk.len())) {
+                                        prefetch(f);
+                                    }
+                                }
+                            }
+                        }
                         if let Some(f) = blk.get(i + 8) {
                             prefetch(&table[(fib(f.key) >> shift) as usize]);
                         }

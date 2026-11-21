@@ -440,11 +440,13 @@ const GROUP: usize = 192;
 /// long) and writes the full group with non-temporal stores, three whole lines that are never read. A record's
 /// address is known when it is pushed; until its group is full or `finish` runs, its bytes are only in the stage.
 /// The caller fences (`sfence`) before others read, and calls `finish` once the pushing is over.
+#[repr(C, align(64))]
 struct Stream<T> {
     cur: *mut T,
     end: *mut T,
-    blocks: Vec<*mut T>,
     n: usize,                    // records of the current group, in `stage`
+    blocks: Vec<*mut T>,
+    _pad: [u64; 2],              // the stage on its own three cache lines
     stage: [u64; GROUP / 8],     // 8-byte aligned, as every record here
     _t: std::marker::PhantomData<T>,
 }
@@ -454,7 +456,7 @@ impl<T> Stream<T> {
 
     fn new() -> Stream<T> {
         const { assert!(GROUP % std::mem::size_of::<T>() == 0 && std::mem::align_of::<T>() <= 8 && !std::mem::needs_drop::<T>()) };
-        Stream { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), blocks: Vec::new(), n: 0, stage: [0; GROUP / 8], _t: std::marker::PhantomData }
+        Stream { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), n: 0, blocks: Vec::new(), _pad: [0; 2], stage: [0; GROUP / 8], _t: std::marker::PhantomData }
     }
 
     #[inline(always)]

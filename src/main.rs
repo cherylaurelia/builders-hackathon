@@ -35,11 +35,89 @@ type Bytes = &'static [u8];
 /// blocks (the rows, the counting-sort buffers, the duplicate finder's tables, the file buffers) were 4 KiB pages:
 /// a fault and a zeroed page per 4 KiB written. A block that grows moves its pages (mremap) into a new aligned
 /// reservation instead of copying them.
+///
+/// Spare memory comes before a new mapping: arena chunks whose records are dead (`give`: the dedup records, once the
+/// duplicates are marked). A block cut from one takes no page fault and no zeroed page, as its pages are in memory
+/// already; it holds whatever the records left, so a block that must read as zeros (`alloc_zeroed`) is never cut.
 #[cfg(target_os = "linux")]
 mod huge_alloc {
     use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use std::sync::Mutex;
     const BIG: usize = 1 << 20;
     const HP: usize = 2 << 20;
+    const PAGE: usize = 4096;
+
+    /// The spare chunks no thread has taken yet, as (address, bytes).
+    static SPARE: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+    /// The address range all spare chunks are in (0..0 before `give`). No mapping of `map` is ever inside it: the
+    /// arena range was reserved before, so a block in it is a block cut from a chunk.
+    static LO: AtomicUsize = AtomicUsize::new(0);
+    static HI: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        /// This thread's chunk: (the next free address, its end, the block cut last). Blocks are cut one after the
+        /// other; only the last one can grow in place or be taken back.
+        static CUT: Cell<(usize, usize, usize)> = const { Cell::new((0, 0, 0)) };
+    }
+
+    /// Makes `chunks` (address, bytes; page aligned, mapped, read by nobody any more) spare memory.
+    pub fn give(mut chunks: Vec<(usize, usize)>) {
+        let (Some(lo), Some(hi)) = (chunks.iter().map(|c| c.0).min(), chunks.iter().map(|c| c.0 + c.1).max()) else { return };
+        chunks.sort_unstable_by(|a, b| b.1.cmp(&a.1)); // the largest first: `cut` takes the first that is large enough
+        // a list that cannot be had leaves the heap as it was
+        if let Ok(mut list) = SPARE.lock() {
+            *list = chunks;
+            LO.store(lo, Relaxed);
+            HI.store(hi, Relaxed);
+        }
+    }
+
+    fn spare(p: *mut u8) -> bool {
+        (p as usize) >= LO.load(Relaxed) && (p as usize) < HI.load(Relaxed)
+    }
+
+    /// A block of `size` bytes cut from this thread's chunk, or from a new one when it has no room; null when
+    /// there is no spare memory for it.
+    fn cut(l: &Layout) -> *mut u8 {
+        if l.align() > PAGE || HI.load(Relaxed) == 0 {
+            return std::ptr::null_mut();
+        }
+        let need = (l.size() + PAGE - 1) & !(PAGE - 1);
+        let (mut next, mut end, _) = CUT.with(|c| c.get());
+        if end - next < need {
+            let Ok(mut list) = SPARE.lock() else { return std::ptr::null_mut() };
+            let Some(i) = list.iter().position(|c| c.1 >= need) else { return std::ptr::null_mut() };
+            let (a, n) = list.remove(i);
+            (next, end) = (a, a + n);
+        }
+        CUT.with(|c| c.set((next + need, end, next)));
+        next as *mut u8
+    }
+
+    /// Resizes the cut block at `p` to `new` bytes where it is: true when it is this thread's last block and its
+    /// chunk has the room.
+    fn recut(p: *mut u8, new: usize) -> bool {
+        let need = (new + PAGE - 1) & !(PAGE - 1);
+        CUT.with(|c| {
+            let (_, end, last) = c.get();
+            let fits = last == p as usize && end - last >= need;
+            if fits {
+                c.set((last + need, end, last));
+            }
+            fits
+        })
+    }
+
+    /// Takes the cut block at `p` back when it is this thread's last one; any other stays in its chunk, unused.
+    fn uncut(p: *mut u8) {
+        CUT.with(|c| {
+            let (_, end, last) = c.get();
+            if last == p as usize {
+                c.set((last, end, 0));
+            }
+        })
+    }
 
     pub struct Huge;
 
@@ -78,22 +156,39 @@ mod huge_alloc {
 
     unsafe impl GlobalAlloc for Huge {
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            if big(&l) { map(l.size()) } else { System.alloc(l) }
+            if !big(&l) {
+                return System.alloc(l);
+            }
+            let p = cut(&l);
+            if p.is_null() { map(l.size()) } else { p }
         }
         unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
             if big(&l) { map(l.size()) } else { System.alloc_zeroed(l) } // fresh mappings read as zeros
         }
         unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            if big(&l) {
-                libc::munmap(p as *mut libc::c_void, span(l.size()));
-            } else {
+            if !big(&l) {
                 System.dealloc(p, l)
+            } else if spare(p) {
+                uncut(p)
+            } else {
+                libc::munmap(p as *mut libc::c_void, span(l.size()));
             }
         }
         unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
             let nl = Layout::from_size_align_unchecked(new, l.align());
             match (big(&l), big(&nl)) {
                 (false, false) => System.realloc(p, l, new),
+                (true, true) if spare(p) => {
+                    if recut(p, new) {
+                        return p;
+                    }
+                    // not the last block of its chunk, or no room there: a new block, and this one stays unused
+                    let q = self.alloc(nl);
+                    if !q.is_null() {
+                        std::ptr::copy_nonoverlapping(p, q, l.size().min(new));
+                    }
+                    q
+                }
                 (true, true) => {
                     let (old, len) = (span(l.size()), span(new));
                     if len <= old {
@@ -474,6 +569,8 @@ struct Arena {
     cur: usize,
     end: usize,
     ready: usize, // the chunk's pages below this address have been asked for (`populate`)
+    first: usize, // bytes of the first chunk, when more than CHUNK
+    chunks: Vec<(usize, usize)>, // every chunk taken, as (address, bytes)
 }
 
 impl Arena {
@@ -482,17 +579,25 @@ impl Arena {
     const STEP: usize = 2 << 20;
 
     fn new() -> Arena {
-        Arena { cur: 0, end: 0, ready: 0 }
+        Arena::with_first(0)
+    }
+
+    /// An arena whose first chunk has `first` bytes (CHUNK when that is more): what is expected to go in the arena,
+    /// so that it is one stretch of memory.
+    fn with_first(first: usize) -> Arena {
+        Arena { cur: 0, end: 0, ready: 0, first, chunks: Vec::new() }
     }
 
     #[inline]
     fn alloc(&mut self, bytes: usize) -> *mut u8 {
         debug_assert!(bytes % 64 == 0); // blocks stay 64-byte aligned (see `Stream`)
         if self.cur + bytes > self.end {
-            let n = bytes.max(Self::CHUNK).next_multiple_of(Self::STEP);
+            let first = if self.chunks.is_empty() { self.first } else { 0 };
+            let n = bytes.max(Self::CHUNK).max(first).next_multiple_of(Self::STEP);
             self.cur = arena_chunk(n) as usize;
             self.end = self.cur + n;
             self.ready = self.cur;
+            self.chunks.push((self.cur, n));
         }
         let p = self.cur;
         self.cur += bytes;
@@ -1835,6 +1940,7 @@ const RING: usize = 16;
 /// One parse thread's output.
 struct Shard {
     arena: Arena,
+    larena: Arena, // the dedup records' own: its chunks are dead, whole, once the duplicates are marked
     ev: Vec<Stream<ERec>>,
     ck: Vec<Stream<CRec>>,
     lg: Vec<Stream<LRec>>,
@@ -1926,6 +2032,7 @@ impl Shard {
     fn new(parts: usize, buckets: usize) -> Shard {
         Shard {
             arena: Arena::new(),
+            larena: Arena::new(),
             ev: (0..parts).map(|_| Stream::new()).collect(),
             ck: (0..parts).map(|_| Stream::new()).collect(),
             lg: (0..buckets).map(|_| Stream::new()).collect(),
@@ -1947,7 +2054,7 @@ impl Shard {
     /// from there at the end of the first pass.
     #[inline(never)]
     fn drain<const EVENTS: bool>(&mut self, cx: &Ctx) {
-        let Shard { arena, ev, ck, lg, far, ins, bt, .. } = self;
+        let Shard { arena, larena, ev, ck, lg, far, ins, bt, .. } = self;
         let n = bt.n.min(BATCH);
         bt.n = 0;
         // what the loops need, in locals: nothing is read again through `cx` or `self` per record
@@ -1999,7 +2106,7 @@ impl Shard {
                         far.push((a, loc, bt.b[i]));
                         ING_FAR
                     });
-                    (*lgp.add((spread(a) >> qshift) as usize)).push(arena, LG_BLOCK, LRec { key: a, ing, loc });
+                    (*lgp.add((spread(a) >> qshift) as usize)).push(larena, LG_BLOCK, LRec { key: a, ing, loc });
                 } else {
                     (*ckp.add(part)).push(arena, CK_BLOCK, CRec::new(a, person & ((1 << pshift) - 1), (tx >> 32) as u32, tx as u32));
                 }
@@ -2038,7 +2145,7 @@ impl Shard {
             ING_FAR
         });
         // SAFETY: q is below the 2^qbits streams of `lg`: the shift leaves qbits bits
-        unsafe { self.lg.get_unchecked_mut(q) }.push(&mut self.arena, LG_BLOCK, LRec { key: ekey, ing, loc });
+        unsafe { self.lg.get_unchecked_mut(q) }.push(&mut self.larena, LG_BLOCK, LRec { key: ekey, ing, loc });
     }
 
     /// A valid, non-late event: into its person's partition, plus its dedup record, once its user ID is at hand.
@@ -2173,12 +2280,20 @@ fn main() {
     };
     lap(&format!("small tables, links joined: {n_links} lines; 2^{id_bits} id slots, 2^{pbits} person partitions, 2^{qbits} event buckets"));
 
+    // a thread's dedup records (16 bytes an event line) in one chunk when the threads share the lines evenly, with a
+    // quarter to spare: after the dedup phase it is one stretch of spare memory for a sessions thread's rows and file
+    // (`huge_alloc::give`). At most 256 MiB each, whatever the input: the arena range is finite.
+    let lg_first = (ev_est * std::mem::size_of::<LRec>() / threads * 5 / 4).min(256 << 20);
     // 2. events and clicks, from the one queue
     let (np, nq) = (1usize << pbits, 1usize << qbits);
     let mut shards = par(
         threads,
         work.len(),
-        || Shard::new(np, nq),
+        || {
+            let mut st = Shard::new(np, nq);
+            st.larena = Arena::with_first(lg_first);
+            st
+        },
         |st, i| {
             let (kind, fi, s, e) = work[i];
             let f = if kind == 0 { &ev_files[fi] } else { &ck_files[fi] };
@@ -2211,6 +2326,11 @@ fn main() {
     // 3. duplicates
     let n_dups = mark_duplicates(&cx, &shards, nq, threads);
     lap(&format!("duplicates marked: {n_dups} candidates"));
+    // the dedup records have been read for the last time: their chunks are spare memory for the heap's big blocks
+    // from here on (the rows, the file buffers), which then take no new pages. `release_regions` still gives the
+    // chunks back at the end, when every worker is joined and nothing reads those blocks either.
+    #[cfg(target_os = "linux")]
+    huge_alloc::give(shards.iter().flat_map(|s| s.larena.chunks.iter().copied()).collect());
 
     // 4. per person partition, the largest first; each thread writes its rows when the queue is empty
     let ud = out.join("user_daily");
@@ -2998,6 +3118,9 @@ impl Work {
     fn new(cx: &Ctx, rows_cap: usize, ev_cap: usize, ck_cap: usize) -> Work {
         let cells = (cx.ncamp + 1) * cx.ndays;
         let local = (1usize << cx.pshift) + 1;
+        // the counting sorts' buffers before the rows: the rows are then the last block cut from this thread's spare
+        // chunk (`huge_alloc`), the one that grows where it is should a thread get more than twice its share
+        let (ev, ck) = (huge_vec(ev_cap), huge_vec(ck_cap));
         Work {
             rows: huge_vec(rows_cap),
             cred: vec![Cred::default(); cells],
@@ -3009,8 +3132,8 @@ impl Work {
             sctr: 0,
             start: filled(local + 2, 0),
             cstart: filled(local + 2, 0),
-            ev: huge_vec(ev_cap),
-            ck: huge_vec(ck_cap),
+            ev,
+            ck,
             sessions: Vec::new(),
             day_groups: Vec::new(),
             cats: Vec::new(),

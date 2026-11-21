@@ -1675,15 +1675,31 @@ struct LRec {
 #[derive(Clone, Copy)]
 struct CRec {
     cid: u64,
-    person: u32,
-    ts: u32, // ms after `Ctx::base`
-    camp: u32,
-    _pad: u32,
+    w: u64, // ts (ms after `Ctx::base`) | campaign << 32 | the person's number within its partition << 48
+}
+
+impl CRec {
+    #[inline(always)]
+    fn new(cid: u64, local: u32, ts: u32, camp: u32) -> CRec {
+        CRec { cid, w: ts as u64 | (camp as u64) << 32 | (local as u64) << 48 }
+    }
+    #[inline(always)]
+    fn ts(self) -> u32 {
+        self.w as u32
+    }
+    #[inline(always)]
+    fn camp(self) -> u32 {
+        (self.w >> 32) as u16 as u32
+    }
+    #[inline(always)]
+    fn local(self) -> u32 {
+        (self.w >> 48) as u32
+    }
 }
 
 const EV_BLOCK: usize = 512;
 const LG_BLOCK: usize = 256;
-const CK_BLOCK: usize = 128;
+const CK_BLOCK: usize = 192; // records: a whole number of 192-byte groups of 16-byte CRecs (3072 bytes, as before)
 
 /// A valid event or click whose user ID is on its way from memory (`IdTable::aim`).
 #[derive(Clone, Copy, Default)]
@@ -1831,7 +1847,7 @@ impl Shard {
 
     #[inline(always)]
     fn put_click(&mut self, cx: &Ctx, p: Pend, person: u32) {
-        self.ck[(person >> cx.pshift) as usize].push(&mut self.arena, CK_BLOCK, CRec { cid: p.a, person, ts: p.ts, camp: p.x, _pad: 0 });
+        self.ck[(person >> cx.pshift) as usize].push(&mut self.arena, CK_BLOCK, CRec::new(p.a, person & ((1 << cx.pshift) - 1), p.ts, p.x));
     }
 }
 
@@ -1893,7 +1909,7 @@ fn main() {
     // about 90,000 events per person partition and per event-key bucket: more of them slow the parse (one open
     // block each per thread), fewer leave the later phases with work that no longer fits a core's cache
     let ev_est = ev_bytes / 72;
-    let pbits = (env_num("SESS_PBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000))).clamp(4, 12.min(id_bits - 4));
+    let pbits = (env_num("SESS_PBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000))).clamp(4, 12.min(id_bits - 4)).max(id_bits.saturating_sub(16));
     let qbits = (env_num("SESS_QBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000))).clamp(4, 12);
     // 128 KiB a read: the copy from the page cache passes the piece through the core's cache twice (as source and
     // as copy), and a larger piece pushes the thread's open stream groups out of it (L2 is 1 MiB, and on the scorer
@@ -2925,7 +2941,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     for s in shards {
         for blk in s.ck[p].slices(CK_BLOCK) {
             for r in blk {
-                let l = (r.person & lmask) as usize;
+                let l = r.local() as usize;
                 w.cstart[l + 1] += (w.start[l + 1] != w.start[l]) as u32;
             }
         }
@@ -2942,10 +2958,10 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     for s in shards {
         for blk in s.ck[p].slices(CK_BLOCK) {
             for r in blk {
-                let l = (r.person & lmask) as usize;
+                let l = r.local() as usize;
                 if w.start[l + 1] != w.start[l] {
                     let f = &mut w.cfill[l];
-                    w.ck[*f as usize] = Ck { k: (r.ts as u64) << 32 | r.camp as u64, cid: r.cid };
+                    w.ck[*f as usize] = Ck { k: (r.ts() as u64) << 32 | r.camp() as u64, cid: r.cid };
                     *f += 1;
                 }
             }

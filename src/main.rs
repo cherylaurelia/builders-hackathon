@@ -710,13 +710,78 @@ fn main() {
     let routed = par(
         threads,
         EB,
-        || sized::<PEvent>(UB, n_parsed, threads),
-        |out, b| {
-            let mut v: Vec<RawEvent> = Vec::with_capacity(parsed.iter().map(|t| t[b].len()).sum());
+        || (sized::<PEvent>(UB, n_parsed, threads), Vec::<u64>::new(), Vec::<u64>::new(), Vec::<RawEvent>::new()),
+        |(out, table, dupkeys, v), b| {
+            // Pass 1: find hashes seen more than once (2-4% of events). Key = hash | 1 so 0 marks an empty slot;
+            // merging two hashes that differ only in bit 0 just sends both to the exact path below.
+            let n: usize = parsed.iter().map(|t| t[b].len()).sum();
+            let cap = (n * 2).next_power_of_two().max(16);
+            let mask = cap - 1;
+            table.clear();
+            table.resize(cap, 0);
+            dupkeys.clear();
             for t in &parsed {
-                v.extend_from_slice(&t[b]);
+                for r in &t[b] {
+                    let k = r.h | 1;
+                    let mut s = (k as usize >> 1) & mask;
+                    loop {
+                        let x = table[s];
+                        if x == 0 {
+                            table[s] = k;
+                            break;
+                        }
+                        if x == k {
+                            dupkeys.push(k);
+                            break;
+                        }
+                        s = (s + 1) & mask;
+                    }
+                }
             }
-            v.sort_unstable_by_key(|r| r.h);
+            // small set of duplicated keys, reusing the front of the table
+            let dcap = (dupkeys.len() * 4).next_power_of_two().max(16);
+            let dmask = dcap - 1;
+            table[..dcap].fill(0);
+            for &k in dupkeys.iter() {
+                let mut s = (k as usize >> 1) & dmask;
+                while table[s] != 0 && table[s] != k {
+                    s = (s + 1) & dmask;
+                }
+                table[s] = k;
+            }
+            let is_dup = |k: u64| {
+                let mut s = (k as usize >> 1) & dmask;
+                loop {
+                    let x = table[s];
+                    if x == k {
+                        return true;
+                    }
+                    if x == 0 {
+                        return false;
+                    }
+                    s = (s + 1) & dmask;
+                }
+            };
+            let route = |out: &mut Vec<Vec<PEvent>>, r: &RawEvent| {
+                // routed by user_id for now; phase 4b swaps in the person
+                let uid = r.uid.get();
+                let uh = hash_bytes(uid);
+                out[uid_bucket(uh)].push(PEvent { nh: uh, name: uid, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind });
+            };
+            // Pass 2: a hash seen once is a single copy: keep it if valid. Others go to the exact path.
+            v.clear();
+            for t in &parsed {
+                for r in &t[b] {
+                    if dupkeys.is_empty() || !is_dup(r.h | 1) {
+                        if r.keep {
+                            route(out, r);
+                        }
+                    } else {
+                        v.push(*r);
+                    }
+                }
+            }
+            v.sort_unstable_by_key(|r| (r.h, r.ingest));
             let mut seen: Vec<Bytes> = Vec::new(); // distinct event_ids among equal hashes
             let mut i = 0;
             while i < v.len() {
@@ -724,10 +789,7 @@ fn main() {
                 while j < v.len() && v[j].h == v[i].h {
                     j += 1;
                 }
-                // copies share a hash; ordered by ingest, the first copy of each distinct event_id is the kept copy
-                if j - i > 1 {
-                    v[i..j].sort_unstable_by_key(|r| r.ingest);
-                }
+                // ordered by ingest, the first copy of each distinct event_id is the kept copy
                 seen.clear();
                 for r in &v[i..j] {
                     if seen.contains(&r.eid.get()) {
@@ -735,16 +797,14 @@ fn main() {
                     }
                     seen.push(r.eid.get());
                     if r.keep {
-                        // routed by user_id for now; phase 4b swaps in the person
-                        let uid = r.uid.get();
-                        let uh = hash_bytes(uid);
-                        out[uid_bucket(uh)].push(PEvent { nh: uh, name: uid, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind });
+                        route(out, r);
                     }
                 }
                 i = j;
             }
         },
     );
+    let routed: Vec<Vec<Vec<PEvent>>> = routed.into_iter().map(|(o, ..)| o).collect();
     drop(parsed);
     lap("events deduped");
 

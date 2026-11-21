@@ -340,7 +340,11 @@ fn filled<T: Clone>(n: usize, v: T) -> Vec<T> {
 /// off) it is 36 ms at the exit for 20M events, against 18 ms here.
 fn release_regions(threads: usize) {
     const STEP: usize = 8 << 20;
-    let regions = std::mem::take(&mut *REGIONS.lock().unwrap_or_else(|_| die("region list poisoned")));
+    // The output is written by now, so nothing here may end the run: a list that cannot be had, a thread that
+    // cannot start or a refused hint leaves memory to the exit, which only takes longer.
+    let Ok(mut list) = REGIONS.lock() else { return };
+    let regions = std::mem::take(&mut *list);
+    drop(list);
     let mut pieces = Vec::new();
     for (p, n) in regions {
         let mut o = 0;
@@ -349,15 +353,21 @@ fn release_regions(threads: usize) {
             o += STEP;
         }
     }
-    par(
-        threads,
-        pieces.len(),
-        || (),
-        |_, i| {
-            // SAFETY: a piece of a live anonymous mapping that nothing reads any more; a hint, fine if refused
-            unsafe { libc::madvise(pieces[i].0 as *mut libc::c_void, pieces[i].1, libc::MADV_DONTNEED) };
-        },
-    );
+    let next = AtomicUsize::new(0);
+    let work = || loop {
+        let i = next.fetch_add(1, Relaxed);
+        if i >= pieces.len() {
+            break;
+        }
+        // SAFETY: a piece of a live anonymous mapping that nothing reads any more
+        unsafe { libc::madvise(pieces[i].0 as *mut libc::c_void, pieces[i].1, libc::MADV_DONTNEED) };
+    };
+    std::thread::scope(|sc| {
+        for _ in 1..threads {
+            let _ = std::thread::Builder::new().spawn_scoped(sc, &work);
+        }
+        work();
+    });
 }
 
 /// Set at the start when the kernel never gives huge pages (transparent huge pages switched off).

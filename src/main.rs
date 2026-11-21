@@ -505,37 +505,36 @@ impl Arena {
     }
 }
 
-/// Bytes a stream writes at a time: three cache lines, a whole number of records of every size here (12, 16).
-const GROUP: usize = 192;
-
 /// An append-only list of `T` in blocks of `per` records; a record never moves.
 ///
-/// Records reach memory a group at a time: a thread appends to some 800 streams at once, and a record stored
-/// directly first reads its cache line from memory (read for ownership) and crowds the cache. A stream keeps the
-/// records of its current group (block offset a multiple of GROUP: blocks are 64-byte aligned, whole groups
-/// long) and writes the full group with non-temporal stores, three whole lines that are never read. A record's
-/// address is known when it is pushed; until its group is full and the next record comes, or `finish` runs, its
-/// bytes are only in the stage. The caller fences (`sfence`) before others read, and calls `finish` once the
-/// pushing is over.
-struct Stream<T> {
+/// Records reach memory a group at a time: a thread appends to a thousand streams and more at once, and a record
+/// stored directly first reads its cache line from memory (read for ownership) and crowds the cache. A stream
+/// keeps the records of its current group (L cache lines, at a block offset that is a multiple of GROUP: blocks
+/// are 64-byte aligned, whole groups long) and writes the full group with non-temporal stores, whole lines that
+/// are never read. A record's address is known when it is pushed; until its group is full and the next record
+/// comes, or `finish` runs, its bytes are only in the stage. The caller fences (`sfence`) before others read,
+/// and calls `finish` once the pushing is over.
+struct Stream<T, const L: usize> {
     grp: *mut u8,            // where the staged group belongs in the current block; null before the first push
     end: *mut u8,            // the end of the current block
     pos: usize,              // bytes staged; GROUP = the group is full (or there is no block yet): `next` first
-    stage: [u64; GROUP / 8], // 8-byte aligned, as every record here
+    stage: [[u64; 8]; L],    // 8-byte aligned, as every record here
     blocks: Vec<*mut T>,
 }
 
-impl<T> Stream<T> {
+impl<T, const L: usize> Stream<T, L> {
     const SIZE: usize = std::mem::size_of::<T>();
+    /// Bytes written at a time: L cache lines.
+    const GROUP: usize = L * 64;
 
-    fn new() -> Stream<T> {
-        const { assert!(GROUP % std::mem::size_of::<T>() == 0 && std::mem::align_of::<T>() <= 8 && !std::mem::needs_drop::<T>()) };
-        Stream { grp: std::ptr::null_mut(), end: std::ptr::null_mut(), pos: GROUP, stage: [0; GROUP / 8], blocks: Vec::new() }
+    fn new() -> Stream<T, L> {
+        const { assert!(L > 0 && (L * 64) % std::mem::size_of::<T>() == 0 && std::mem::align_of::<T>() <= 8 && !std::mem::needs_drop::<T>()) };
+        Stream { grp: std::ptr::null_mut(), end: std::ptr::null_mut(), pos: Self::GROUP, stage: [[0; 8]; L], blocks: Vec::new() }
     }
 
     #[inline(always)]
     fn push(&mut self, arena: &mut Arena, per: usize, v: T) -> *mut T {
-        if self.pos == GROUP {
+        if self.pos == Self::GROUP {
             self.next(arena, per);
         }
         let pos = self.pos;
@@ -554,8 +553,8 @@ impl<T> Stream<T> {
         if !self.grp.is_null() {
             // SAFETY: GROUP bytes at a 64-byte aligned address of the block
             unsafe {
-                stream_group(self.grp, self.stage.as_ptr() as *const u8);
-                self.grp = self.grp.add(GROUP);
+                stream_group(self.grp, self.stage.as_ptr() as *const u8, Self::GROUP);
+                self.grp = self.grp.add(Self::GROUP);
             }
         }
         if self.grp == self.end {
@@ -567,7 +566,7 @@ impl<T> Stream<T> {
     #[cold]
     #[inline(never)]
     fn grow(&mut self, arena: &mut Arena, per: usize) {
-        debug_assert!(per * Self::SIZE % GROUP == 0);
+        debug_assert!(per * Self::SIZE % Self::GROUP == 0);
         let p = arena.alloc(per * Self::SIZE);
         debug_assert!(p as usize % 64 == 0);
         self.blocks.push(p as *mut T);
@@ -604,19 +603,118 @@ impl<T> Stream<T> {
     }
 }
 
-/// Copies a GROUP of bytes to `dst` (64-byte aligned) with non-temporal stores where available.
+/// Records in a block of a `Log`: 4 KiB of keys, then 4 KiB of payloads.
+const LG_BLOCK: usize = 512;
+
+/// The dedup records of one event-key bucket from one thread: per record a key and a payload of 8 bytes each,
+/// append-only, in blocks of LG_BLOCK records whose keys fill one page and whose payloads fill the next. The
+/// passes that only look at keys (`mark_duplicates`) then read half the bytes, a page at a time (a hardware
+/// prefetcher stops at the end of a page, so it does not fetch the payloads behind the keys).
+///
+/// Like a `Stream`, eight records at a time reach memory: their keys as one cache line and their payloads as
+/// another, with non-temporal stores. The caller fences (`sfence`) before others read, and calls `finish` once
+/// the pushing is over.
+struct Log {
+    kp: *mut u64,      // where the staged keys belong, in the key page of the current block; null before the first push
+    end: *mut u64,     // the end of that key page
+    pos: usize,        // records staged; 8 = the group is full (or there is no block yet): `next` first
+    stage: [u64; 16],  // 8 keys, then their 8 payloads
+    blocks: Vec<*mut u64>,
+}
+
+impl Log {
+    fn new() -> Log {
+        Log { kp: std::ptr::null_mut(), end: std::ptr::null_mut(), pos: 8, stage: [0; 16], blocks: Vec::new() }
+    }
+
+    /// `arena` must hand out nothing but this type's blocks: they are 8 KiB each, so every block starts on a page.
+    #[inline(always)]
+    fn push(&mut self, arena: &mut Arena, key: u64, pay: u64) {
+        if self.pos == 8 {
+            self.next(arena);
+        }
+        let pos = self.pos;
+        self.pos = pos + 1;
+        // SAFETY: pos < 8
+        unsafe {
+            *self.stage.get_unchecked_mut(pos) = key;
+            *self.stage.get_unchecked_mut(8 + pos) = pay;
+        }
+    }
+
+    #[inline(always)]
+    fn next(&mut self, arena: &mut Arena) {
+        if !self.kp.is_null() {
+            // SAFETY: a cache line of the key page and the one as far into the payload page, 64-byte aligned
+            unsafe {
+                let st = self.stage.as_ptr() as *const u8;
+                stream_group(self.kp as *mut u8, st, 64);
+                stream_group(self.kp.add(LG_BLOCK) as *mut u8, st.add(64), 64);
+                self.kp = self.kp.add(8);
+            }
+        }
+        if self.kp == self.end {
+            self.grow(arena);
+        }
+        self.pos = 0;
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, arena: &mut Arena) {
+        let p = arena.alloc(LG_BLOCK * 16) as *mut u64;
+        debug_assert!(p as usize % 4096 == 0);
+        self.blocks.push(p);
+        self.kp = p;
+        self.end = unsafe { p.add(LG_BLOCK) };
+    }
+
+    /// Writes the records still staged to memory with plain stores.
+    fn finish(&mut self) {
+        if !self.kp.is_null() {
+            // SAFETY: the staged records belong at kp and LG_BLOCK entries on, inside the block
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.stage.as_ptr(), self.kp, self.pos);
+                std::ptr::copy_nonoverlapping(self.stage.as_ptr().add(8), self.kp.add(LG_BLOCK), self.pos);
+            }
+        }
+    }
+
+    /// Records in the last block `b`.
+    fn tail(&self, b: *mut u64) -> usize {
+        (self.kp as usize - b as usize) / 8 + self.pos
+    }
+
+    fn len(&self) -> usize {
+        match self.blocks.last() {
+            None => 0,
+            Some(&b) => (self.blocks.len() - 1) * LG_BLOCK + self.tail(b),
+        }
+    }
+
+    /// Per block, its keys and their payloads.
+    fn blocks(&self) -> impl Iterator<Item = (&[u64], &[u64])> {
+        let n = self.blocks.len();
+        self.blocks.iter().enumerate().map(move |(i, &b)| {
+            let len = if i + 1 == n { self.tail(b) } else { LG_BLOCK };
+            unsafe { (std::slice::from_raw_parts(b as *const u64, len), std::slice::from_raw_parts(b.add(LG_BLOCK) as *const u64, len)) }
+        })
+    }
+}
+
+/// Copies `bytes` bytes (whole cache lines) to `dst` (64-byte aligned) with non-temporal stores where available.
 #[inline(always)]
-unsafe fn stream_group(dst: *mut u8, src: *const u8) {
+unsafe fn stream_group(dst: *mut u8, src: *const u8, bytes: usize) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
         use std::arch::x86_64::*;
-        for i in 0..GROUP / 32 {
+        for i in 0..bytes / 32 {
             _mm256_stream_si256(dst.add(32 * i) as *mut __m256i, _mm256_loadu_si256(src.add(32 * i) as *const __m256i));
         }
         return;
     }
     #[allow(unreachable_code)]
-    std::ptr::copy_nonoverlapping(src, dst, GROUP);
+    std::ptr::copy_nonoverlapping(src, dst, bytes);
 }
 
 /// Orders this thread's non-temporal stores before its later stores.
@@ -1972,24 +2070,42 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
 
 // ---------------------------------------------------------------- records
 
-/// A valid, non-late event in its person partition. `ts` and `pay` are 0 once dedup finds an earlier copy: no
+/// A valid, non-late event in its person partition, 8 bytes. `ts` is 0 once dedup finds an earlier copy: no
 /// event of the window has ts 0 (the window starts 7 days after `Ctx::base`).
+///
+/// A purchase is two records: the one right before it in memory (same block) is its pay record, whose `ts` is
+/// category << 24 | price_cents and whose person number is one past the partition's last, a person no event
+/// has, so the counting sort puts the pay records away without a branch.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ERec {
-    person: u32,
-    ts: u32,  // ms after `Ctx::base`
-    pay: u32, // 0, or category << 24 | price_cents for a purchase
+    ts: u32, // ms after `Ctx::base`
+    lw: u32, // the person's number within its partition; HAS_PAY for a purchase
 }
+/// In `ERec::lw`: the record before this one is its pay record.
+const HAS_PAY: u32 = 1 << 31;
 
 /// One parsed event line in its event-key bucket, 16 bytes: `loc` is its `ERec` (`loc_of`), 0 for an invalid or
-/// late event (it still takes part in dedup); `ing` is its ingest_ts (`Ctx::ing`).
+/// late event (it still takes part in dedup); `ing` is its ingest_ts (`Ctx::ing`). In a `Log` the record is its
+/// key and the payload `LRec::pay`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct LRec {
     key: u64,
     ing: u32,
     loc: u32,
+}
+
+impl LRec {
+    /// `ing` and `loc` as the payload of a `Log` record.
+    #[inline(always)]
+    fn pay(ing: u32, loc: u32) -> u64 {
+        ing as u64 | (loc as u64) << 32
+    }
+    #[inline(always)]
+    fn of(key: u64, pay: u64) -> LRec {
+        LRec { key, ing: pay as u32, loc: (pay >> 32) as u32 }
+    }
 }
 
 /// `LRec::ing` of an ingest_ts above `Ctx::ihi`: such an event is late or invalid whatever its ts (a valid ts is
@@ -2029,9 +2145,12 @@ impl CRec {
     }
 }
 
-const EV_BLOCK: usize = 512;
-const LG_BLOCK: usize = 384; // records: a whole number of 192-byte groups of 16-byte LRecs (6144 bytes, as before)
-const CK_BLOCK: usize = 192; // records: a whole number of 192-byte groups of 16-byte CRecs (3072 bytes, as before)
+const EV_BLOCK: usize = 768; // records: 6144 bytes
+/// Cache lines a stream of each kind writes at a time (`Stream`); a block is a whole number of them. One line:
+/// the stages are what a parse thread keeps in its half of the L2 (Intel VM, 60M: 1, 2 and 4 lines parse alike).
+const EV_LINES: usize = 1;
+const CK_LINES: usize = 1;
+const CK_BLOCK: usize = 192; // records: 3072 bytes
 
 /// Events or clicks whose user IDs are on their way from memory at a time (`Batch`).
 const BATCH: usize = 64;
@@ -2054,9 +2173,10 @@ const RING: usize = 16;
 /// One parse thread's output.
 struct Shard {
     arena: Arena,
-    ev: Vec<Stream<ERec>>,
-    ck: Vec<Stream<CRec>>,
-    lg: Vec<Stream<LRec>>,
+    ev: Vec<Stream<ERec, EV_LINES>>,
+    ck: Vec<Stream<CRec, CK_LINES>>,
+    lg: Vec<Log>,
+    larena: Arena, // the blocks of `lg`, and nothing else (`Log::push`)
     far: Vec<(u64, u32, i64)>, // (event key, loc, ingest_ts) of the records whose `ing` is ING_FAR
     buf: Vec<u8>,
     ins: usize,
@@ -2152,9 +2272,10 @@ impl Shard {
     fn new(parts: usize, buckets: usize) -> Shard {
         Shard {
             arena: Arena::new(),
+            larena: Arena::new(),
             ev: (0..parts).map(|_| Stream::new()).collect(),
             ck: (0..parts).map(|_| Stream::new()).collect(),
-            lg: (0..buckets).map(|_| Stream::new()).collect(),
+            lg: (0..buckets).map(|_| Log::new()).collect(),
             far: Vec::new(),
             buf: Vec::new(),
             ins: 0,
@@ -2176,11 +2297,12 @@ impl Shard {
     /// pass. The streams' stages are not asked for: they stay in the L2 (Intel 20M: asking cost 1.4% wall).
     #[inline(never)]
     fn drain<const EVENTS: bool>(&mut self, cx: &Ctx) {
-        let Shard { arena, ev, ck, lg, far, ins, bt, .. } = self;
+        let Shard { arena, larena, ev, ck, lg, far, ins, bt, .. } = self;
         let n = bt.n.min(BATCH);
         bt.n = 0;
         // what the loops need, in locals: nothing is read again through `cx` or `self` per record
         let (ids, pshift, qshift, abase) = (&cx.ids, cx.pshift, cx.qshift, cx.abase);
+        let (lmask, pay_bin) = ((1u32 << pshift) - 1, 1u32 << pshift);
         let (evp, ckp, lgp) = (ev.as_mut_ptr(), ck.as_mut_ptr(), lg.as_mut_ptr());
         let mut person = [0u32; BATCH];
         let mut late = [0u8; BATCH];
@@ -2207,13 +2329,25 @@ impl Shard {
             // the shift of the event key leaves qbits bits, a bucket below the 2^qbits streams of `lg`
             unsafe {
                 if EVENTS {
-                    let rec = (*evp.add(part)).push(arena, EV_BLOCK, ERec { person, ts: (tx >> 32) as u32, pay: tx as u32 });
+                    let s = &mut *evp.add(part);
+                    let (ts, pay, l) = ((tx >> 32) as u32, tx as u32, person & lmask);
+                    let rec = if pay == 0 {
+                        s.push(arena, EV_BLOCK, ERec { ts, lw: l })
+                    } else {
+                        // the pay record and its event in one group, so next to each other in memory: when one
+                        // place is left in the group it goes to a pay record of nothing
+                        if s.pos == EV_LINES * 64 - 8 {
+                            s.push(arena, EV_BLOCK, ERec { ts: 0, lw: pay_bin });
+                        }
+                        s.push(arena, EV_BLOCK, ERec { ts: pay, lw: pay_bin });
+                        s.push(arena, EV_BLOCK, ERec { ts, lw: l | HAS_PAY })
+                    };
                     let loc = loc_of(abase, rec);
                     let ing = cx.ing(bt.b[i]).unwrap_or_else(|| {
                         far.push((a, loc, bt.b[i]));
                         ING_FAR
                     });
-                    (*lgp.add((spread(a) >> qshift) as usize)).push(arena, LG_BLOCK, LRec { key: a, ing, loc });
+                    (*lgp.add((spread(a) >> qshift) as usize)).push(larena, a, LRec::pay(ing, loc));
                 } else {
                     (*ckp.add(part)).push(arena, CK_BLOCK, CRec::new(a, person & ((1 << pshift) - 1), (tx >> 32) as u32, tx as u32));
                 }
@@ -2252,7 +2386,7 @@ impl Shard {
             ING_FAR
         });
         // SAFETY: q is below the 2^qbits streams of `lg`: the shift leaves qbits bits
-        unsafe { self.lg.get_unchecked_mut(q) }.push(&mut self.arena, LG_BLOCK, LRec { key: ekey, ing, loc });
+        unsafe { self.lg.get_unchecked_mut(q) }.push(&mut self.larena, ekey, LRec::pay(ing, loc));
     }
 
     /// A valid, non-late event: into its person's partition, plus its dedup record, once its user ID is at hand.
@@ -2413,7 +2547,7 @@ fn main() {
     for s in &mut shards {
         s.ev.iter_mut().for_each(Stream::finish);
         s.ck.iter_mut().for_each(Stream::finish);
-        s.lg.iter_mut().for_each(Stream::finish);
+        s.lg.iter_mut().for_each(Log::finish);
     }
     let n_ev: usize = shards.iter().flat_map(|s| s.ev.iter()).map(|s| s.len(EV_BLOCK)).sum();
     let n_ck: usize = shards.iter().flat_map(|s| s.ck.iter()).map(|s| s.len(CK_BLOCK)).sum();
@@ -3207,9 +3341,9 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
     par(
         threads,
         buckets,
-        || (Vec::<u64>::new(), Vec::<LRec>::new(), Vec::<LRec>::new(), 0usize),
+        || (Vec::<u64>::new(), Vec::<(u64, usize)>::new(), Vec::<LRec>::new(), 0usize),
         |(seen, cand, table, total), b| {
-            let n: usize = shards.iter().map(|s| s.lg[b].len(LG_BLOCK)).sum();
+            let n: usize = shards.iter().map(|s| s.lg[b].len()).sum();
             if n == 0 {
                 return;
             }
@@ -3227,44 +3361,53 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
             let s0 = 64 - qb - sbits;
             let wb = seen.as_mut_ptr().wrapping_sub(b << (sbits - 5));
             // SAFETY (both passes): hash >> s0 is b << sbits | slot, so the word is one of `seen`
-            let first = |r: &LRec| unsafe {
-                let x = spread(r.key) >> s0;
+            let first = |key: u64| unsafe {
+                let x = spread(key) >> s0;
                 let w = wb.wrapping_add((x >> 5) as usize);
                 let (v, t) = (*w, (1u32 << (x as u32 & 31)) as u64);
                 *w = v | t | (v & t) << 32;
             };
             for s in shards {
-                for blk in s.lg[b].slices(LG_BLOCK) {
-                    let mut four = blk.chunks_exact(4);
+                for (keys, _) in s.lg[b].blocks() {
+                    let mut four = keys.chunks_exact(4);
                     for p in &mut four {
-                        first(&p[0]);
-                        first(&p[1]);
-                        first(&p[2]);
-                        first(&p[3]);
+                        first(p[0]);
+                        first(p[1]);
+                        first(p[2]);
+                        first(p[3]);
                     }
-                    four.remainder().iter().for_each(first);
+                    four.remainder().iter().for_each(|&k| first(k));
                 }
             }
             cand.clear();
             cand.reserve(n);
             let cp = cand.as_mut_ptr();
             let mut c = 0;
-            // SAFETY: c < n, the room reserved: every record is written, and kept when its slot says "again"
-            let mut second = |r: &LRec| unsafe {
-                let x = spread(r.key) >> s0;
-                *cp.add(c) = *r;
+            // SAFETY: c < n, the room reserved: every record is written, as its key and where its payload is (not
+            // read here), and kept when its slot says "again"
+            let mut second = |key: &u64, pay: *const u64| unsafe {
+                let x = spread(*key) >> s0;
+                *cp.add(c) = (*key, pay as usize);
                 c += (((*wb.wrapping_add((x >> 5) as usize) >> 32) as u32 >> (x as u32 & 31)) & 1) as usize;
             };
             for s in shards {
-                for blk in s.lg[b].slices(LG_BLOCK) {
-                    let mut four = blk.chunks_exact(4);
-                    for p in &mut four {
-                        second(&p[0]);
-                        second(&p[1]);
-                        second(&p[2]);
-                        second(&p[3]);
+                for (keys, pays) in s.lg[b].blocks() {
+                    let pp = pays.as_ptr();
+                    let mut i = 0;
+                    while i + 4 <= keys.len() {
+                        // SAFETY: i + 3 < len, of both slices
+                        unsafe {
+                            second(keys.get_unchecked(i), pp.add(i));
+                            second(keys.get_unchecked(i + 1), pp.add(i + 1));
+                            second(keys.get_unchecked(i + 2), pp.add(i + 2));
+                            second(keys.get_unchecked(i + 3), pp.add(i + 3));
+                        }
+                        i += 4;
                     }
-                    four.remainder().iter().for_each(&mut second);
+                    while i < keys.len() {
+                        second(&keys[i], unsafe { pp.add(i) });
+                        i += 1;
+                    }
                 }
             }
             // SAFETY: the first c entries are written
@@ -3279,7 +3422,10 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
             table.clear();
             table.resize(slots, LRec { key: 0, ing: 0, loc: 0 });
             let mut zero: Option<LRec> = None;
-            'cands: for r in cand.iter() {
+            'cands: for &(key, pay) in cand.iter() {
+                // SAFETY: the payload of a record of a live block; the candidates come in the order of the blocks,
+                // so these reads run forward through the payload pages
+                let r = &LRec::of(key, unsafe { *(pay as *const u64) });
                 let best: &mut LRec = if r.key == 0 {
                     match &mut zero {
                         Some(z) => z,
@@ -3305,9 +3451,10 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
                 };
                 let lost = if cx.ingest_of(r, far) < cx.ingest_of(best, far) { std::mem::replace(best, *r) } else { *r };
                 if lost.loc != 0 {
-                    // dropped: ts and pay 0, an event of bin 0 that is not a purchase (person_work)
+                    // dropped: ts 0, an event of bin 0 (person_work) and no purchase (partition_work). Only
+                    // stored, never read here: the record's cache line is not waited for
                     // SAFETY: the address of an ERec in a live arena; no other thread touches this record now
-                    unsafe { ((rec_at(abase, lost.loc) as *mut u8).add(4) as *mut u64).write_unaligned(0) };
+                    unsafe { (*rec_at(abase, lost.loc)).ts = 0 };
                 }
             }
         },
@@ -3422,7 +3569,7 @@ impl Work {
             around: filled(cells, 0),
             buy: filled(cells, Buy { purchasing: 0, revenue: 0 }),
             doff: cx.base - cx.day0 * DAY,
-            start: filled(local + 2, 0),
+            start: filled(2 * local + 2, 0),
             cstart: filled(local + 2, 0),
             act: filled(local + 2, 0),
             nact: 0,
@@ -3618,9 +3765,13 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     // are listed apart and sorted by person the same way.
     let st = w.start.as_mut_ptr();
     let lm = lmask as usize;
-    // SAFETY: start and cstart hold local + 3 entries, and every index below is at most local + 2
+    // a pay record counts as an event of person `local`, one past the last: `bm` lets that number through, and
+    // `start` has room for every number it lets through
+    let bm = 2 * local - 1;
+    // SAFETY: start holds 2 * local + 3 entries, cstart and pstart local + 3; an event's index below is at most
+    // bm + 2, a click's and a purchase's at most local + 1
     unsafe {
-        let ev_bin = |r: &ERec| r.person as usize & lm;
+        let ev_bin = |r: &ERec| r.lw as usize & bm;
         std::ptr::write_bytes(st, 0, local + 3);
         for s in shards {
             for blk in s.ev[p].slices(EV_BLOCK) {
@@ -3652,11 +3803,11 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
         let mut place = |r: &ERec| {
             let l = ev_bin(r);
             let f = st.add(l + 1);
-            let e = ((r as *const ERec as *const u8).add(4) as *const u64).read_unaligned(); // ts | pay << 32
-            *ev.add(*f as usize) = e as u32;
+            *ev.add(*f as usize) = r.ts;
             *f += 1;
-            if e >> 32 != 0 {
-                pl.push([l as u32, e as u32, (e >> 32) as u32]);
+            if r.lw & HAS_PAY != 0 && r.ts != 0 {
+                // SAFETY: a purchase has its pay record right before it, in the same block
+                pl.push([l as u32, r.ts, (*(r as *const ERec).sub(1)).ts]);
             }
         };
         for s in shards {
@@ -4844,12 +4995,25 @@ mod tests {
     type Flat = (Vec<(u32, u32, u32)>, Vec<(u64, i64, bool)>);
     fn flat(st: &mut Shard) -> Flat {
         st.ev.iter_mut().for_each(Stream::finish);
-        st.lg.iter_mut().for_each(Stream::finish);
-        let mut ev: Vec<_> = st.ev.iter().flat_map(|s| s.slices(EV_BLOCK)).flatten().map(|r| (r.person, r.ts, r.pay)).collect();
+        st.lg.iter_mut().for_each(Log::finish);
+        // an event as (partition << 17 | number in it, ts, pay): a purchase's pay is the record before it; the pay
+        // records themselves (the one before a purchase, and the fillers with ts 0) are left out
+        let mut ev = Vec::new();
+        for (p, s) in st.ev.iter().enumerate() {
+            let recs: Vec<ERec> = s.slices(EV_BLOCK).flatten().copied().collect();
+            for (i, r) in recs.iter().enumerate() {
+                let pays_next = recs.get(i + 1).is_some_and(|n| n.lw & HAS_PAY != 0);
+                if r.ts != 0 && !pays_next {
+                    let pay = if r.lw & HAS_PAY != 0 { recs[i - 1].ts } else { 0 };
+                    ev.push(((p as u32) << 17 | (r.lw & !HAS_PAY), r.ts, pay));
+                }
+            }
+        }
         // the ingest_ts as the record holds it; a far one as its exact value, from the shard's far list
-        let mut lg: Vec<_> = st.lg.iter().flat_map(|s| s.slices(LG_BLOCK)).flatten().filter(|r| r.ing != ING_FAR).map(|r| (r.key, r.ing as i64, r.loc != 0)).collect();
+        let recs: Vec<LRec> = st.lg.iter().flat_map(|s| s.blocks()).flat_map(|(k, p)| k.iter().zip(p).map(|(&k, &p)| LRec::of(k, p))).collect();
+        let mut lg: Vec<_> = recs.iter().filter(|r| r.ing != ING_FAR).map(|r| (r.key, r.ing as i64, r.loc != 0)).collect();
         lg.extend(st.far.iter().map(|&(key, loc, ingest)| (key, ingest, loc != 0)));
-        assert_eq!(st.far.len(), st.lg.iter().flat_map(|s| s.slices(LG_BLOCK)).flatten().filter(|r| r.ing == ING_FAR).count());
+        assert_eq!(st.far.len(), recs.iter().filter(|r| r.ing == ING_FAR).count());
         ev.sort();
         lg.sort();
         (ev, lg)
@@ -4984,34 +5148,36 @@ mod tests {
     fn streams_keep_every_record_where_push_said() {
         let mut r = Rng(17);
         let mut arena = Arena::new();
-        let mut s12: Vec<Stream<ERec>> = (0..23).map(|_| Stream::new()).collect();
-        let mut s24: Vec<Stream<LRec>> = (0..23).map(|_| Stream::new()).collect();
-        let mut want12: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); 23];
+        let mut s12: Vec<Stream<ERec, EV_LINES>> = (0..23).map(|_| Stream::new()).collect();
+        let mut larena = Arena::new();
+        let mut s24: Vec<Log> = (0..23).map(|_| Log::new()).collect();
+        let mut want12: Vec<Vec<(u32, u32)>> = vec![Vec::new(); 23];
         let mut want24: Vec<Vec<(u64, u32, u32)>> = vec![Vec::new(); 23];
         let mut at: Vec<(*mut ERec, u32)> = Vec::new();
         for i in 0..400_000u32 {
             let b = r.below(23);
             if r.below(2) == 0 {
-                let rec = ERec { person: i, ts: r.next() as u32, pay: b as u32 };
+                let rec = ERec { ts: r.next() as u32, lw: i };
                 at.push((s12[b].push(&mut arena, EV_BLOCK, rec), i));
-                want12[b].push((rec.person, rec.ts, rec.pay));
+                want12[b].push((rec.lw, rec.ts));
             } else {
                 let rec = LRec { key: r.next(), ing: i, loc: b as u32 };
-                s24[b].push(&mut arena, LG_BLOCK, rec);
+                s24[b].push(&mut larena, rec.key, LRec::pay(rec.ing, rec.loc));
                 want24[b].push((rec.key, rec.ing, rec.loc));
             }
         }
         sfence();
         s12.iter_mut().for_each(Stream::finish);
-        s24.iter_mut().for_each(Stream::finish);
+        s24.iter_mut().for_each(Log::finish);
         for b in 0..23 {
-            let got: Vec<_> = s12[b].slices(EV_BLOCK).flatten().map(|r| (r.person, r.ts, r.pay)).collect();
+            let got: Vec<_> = s12[b].slices(EV_BLOCK).flatten().map(|r| (r.lw, r.ts)).collect();
             assert_eq!(got, want12[b]);
             assert_eq!(s12[b].len(EV_BLOCK), want12[b].len());
-            let got: Vec<_> = s24[b].slices(LG_BLOCK).flatten().map(|r| (r.key, r.ing, r.loc)).collect();
+            let got: Vec<_> = s24[b].blocks().flat_map(|(k, p)| k.iter().zip(p).map(|(&k, &p)| LRec::of(k, p))).map(|r| (r.key, r.ing, r.loc)).collect();
+            assert_eq!(s24[b].len(), want24[b].len());
             assert_eq!(got, want24[b]);
         }
-        assert!(at.iter().all(|&(p, i)| unsafe { (*p).person } == i));
+        assert!(at.iter().all(|&(p, i)| unsafe { (*p).lw } == i));
     }
 
     #[test]

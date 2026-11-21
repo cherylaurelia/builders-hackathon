@@ -191,15 +191,22 @@ fn pack16(v: u128, len: usize) -> u64 {
 /// each half of a 256-bit register, so the pair costs little more than one `pack16`.
 #[inline(always)]
 unsafe fn pack2(pa: *const u8, la: usize, pb: *const u8, lb: usize) -> (u64, u64) {
-    // an ID of more than 10 bytes does not pack: taken as an empty one it comes out 0
-    let (la, lb) = (if la > 10 { 0 } else { la }, if lb > 10 { 0 } else { lb });
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
         use std::arch::x86_64::*;
-        // the first `len` bytes of an ID's 16: KEEP read from 16 - len is `len` ones, then zeros
-        static KEEP: [u8; 32] = [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        debug_assert!(la <= 128 && lb <= 128);
+        // the first `len` bytes of an ID's 16 (all 16 from `len` = 16 on): KEEP read from 128 - len
+        static KEEP: [u8; 144] = {
+            let mut k = [0u8; 144];
+            let mut i = 0;
+            while i < 128 {
+                k[i] = 255;
+                i += 1;
+            }
+            k
+        };
         let two = |pa: *const u8, pb: *const u8| _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128(pa as *const __m128i)), _mm_loadu_si128(pb as *const __m128i), 1);
-        let keep = two(KEEP.as_ptr().add(16 - la), KEEP.as_ptr().add(16 - lb));
+        let keep = two(KEEP.as_ptr().add(128 - la), KEEP.as_ptr().add(128 - lb));
         let c = _mm256_and_si256(two(pa, pb), keep);
         // classes and offsets as in `pack16`
         const LO: [u8; 16] = [13, 15, 15, 15, 15, 15, 15, 15, 15, 15, 14, 2, 2, 2, 2, 6];
@@ -207,10 +214,13 @@ unsafe fn pack2(pa: *const u8, la: usize, pb: *const u8, lb: usize) -> (u64, u64
         const OFF: [u8; 16] = [0, 0, 0, 47, 54, 54, 59, 59, 0, 0, 0, 0, 0, 0, 0, 0];
         let tbl = |t: &[u8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr() as *const __m128i));
         let hi = _mm256_and_si256(_mm256_srli_epi16(c, 4), _mm256_set1_epi8(0x0F));
-        let class = _mm256_and_si256(_mm256_shuffle_epi8(tbl(&LO), c), _mm256_shuffle_epi8(tbl(&HI), hi));
-        // a kept byte without a class is outside the alphabet
+        // no class from the 11th byte on: an ID of more than 10 bytes does not pack
+        const TEN: [u8; 16] = [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0];
+        let class = _mm256_and_si256(_mm256_and_si256(_mm256_shuffle_epi8(tbl(&LO), c), _mm256_shuffle_epi8(tbl(&HI), hi)), tbl(&TEN));
+        // a kept byte without a class is outside the alphabet, or past the 10th
         if _mm256_testz_si256(_mm256_cmpeq_epi8(class, _mm256_setzero_si256()), keep) == 0 {
-            // one of them holds such a byte: each on its own
+            // one of them does not pack: each on its own (one of more than 10 bytes as an empty one: 0)
+            let (la, lb) = (if la > 10 { 0 } else { la }, if lb > 10 { 0 } else { lb });
             return (pack16(load16(pa, la), la), pack16(load16(pb, lb), lb));
         }
         let us = _mm256_cmpeq_epi8(c, _mm256_set1_epi8(b'_' as i8));
@@ -226,7 +236,10 @@ unsafe fn pack2(pa: *const u8, la: usize, pb: *const u8, lb: usize) -> (u64, u64
         return (_mm256_extract_epi64(k, 0) as u64, _mm256_extract_epi64(k, 2) as u64);
     }
     #[allow(unreachable_code)]
-    (pack16(load16(pa, la), la), pack16(load16(pb, lb), lb))
+    {
+        let (la, lb) = (if la > 10 { 0 } else { la }, if lb > 10 { 0 } else { lb });
+        (pack16(load16(pa, la), la), pack16(load16(pb, lb), lb))
+    }
 }
 
 /// The IDs that do not pack (longer than 10 bytes, or a byte outside [0-9A-Z_a-z]): each gets a number, exact on

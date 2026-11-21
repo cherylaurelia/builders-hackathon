@@ -1832,14 +1832,7 @@ struct Shard {
 unsafe impl Send for Shard {}
 unsafe impl Sync for Shard {}
 
-struct UserRow {
-    name: u64,
-    revenue: i64,
-    sessions: u32,
-    events: u32,
-    day: i32,
-    top: u16, // NO_CAT when there is no purchase
-}
+/// `Cols::top` of a row without a purchase.
 const NO_CAT: u16 = u16::MAX;
 
 struct Ctx {
@@ -2230,11 +2223,12 @@ fn main() {
                     }
                     tx.send((std::mem::take(&mut w.cred), std::mem::take(&mut w.rev), std::mem::take(&mut w.assist))).unwrap_or_else(|_| die("campaign merger gone"));
                     // thread 0 writes even with no rows: the table needs at least one file
-                    if t == 0 || !w.rows.is_empty() {
-                        write_users(&ud.join(format!("part-{t}.parquet")), &w.rows, cat_names, &cx.names)
+                    w.cols.seal();
+                    if t == 0 || w.cols.n > 0 {
+                        write_users(&ud.join(format!("part-{t}.parquet")), &w.cols, cat_names, cx.day0, cx.ndays)
                             .unwrap_or_else(|e| die(&format!("write user_daily: {e}")));
                     }
-                    n_rows.fetch_add(w.rows.len(), Relaxed);
+                    n_rows.fetch_add(w.cols.n, Relaxed);
                     w
                 })
             })
@@ -2945,7 +2939,8 @@ struct Sess {
 
 /// One sessions thread: its results, and scratch reused across partitions.
 struct Work {
-    rows: Vec<UserRow>,
+    cols: Cols,
+    tmp: Vec<u8>,
     cred: Vec<Cred>,
     rev: Vec<i64>, // revenue of the credited sessions, per cell of `cred`
     assist: Vec<u32>,
@@ -2978,7 +2973,8 @@ impl Work {
         let cells = (cx.ncamp + 1) * cx.ndays;
         let local = (1usize << cx.pshift) + 1;
         Work {
-            rows: huge_vec(rows_cap),
+            cols: Cols::new(rows_cap),
+            tmp: Vec::with_capacity(64),
             cred: vec![Cred::default(); cells],
             rev: filled(cells, 0),
             assist: filled(cells + 4, 0), // + cells for the unused steps of the vector window
@@ -3196,6 +3192,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
         if *st.add(local + 1) == 0 {
             return;
         }
+        w.cols.reserve(*st.add(local + 1) as usize); // a row has at least one event that is not dropped
         if w.ev.len() < run as usize {
             w.ev.resize(run as usize, 0);
         }
@@ -3294,7 +3291,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
 fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
     let width = cx.ndays;
     let organic = cx.ncamp;
-    let Work { rows, cred, rev, assist, stamp, iv, seen, sctr, sessions, day_groups, cats, touched, small, bins, bits, bin_sess, purch, sess_day, days, dcats, .. } = w;
+    let Work { cols, tmp, cred, rev, assist, stamp, iv, seen, sctr, sessions, day_groups, cats, touched, small, bins, bits, bin_sess, purch, sess_day, days, dcats, .. } = w;
 
     // sessions + user_daily rows: the events go into their 30-minute bins, and the bins in order are the sessions
     // through raw pointers taken once (the vectors' fields would be reloaded from memory after every store), with
@@ -3368,9 +3365,12 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
         if !dcats.is_empty() {
             cats.extend(dcats.iter().filter(|c| c.0 == g as u32).map(|c| (c.1, c.2)));
         }
-        let day = (cx.day0 + x.d as i64) as i32;
-        rows.push(finish_row(UserRow { name, day, sessions: x.sessions, events: x.events, revenue: x.revenue, top: NO_CAT }, cats, &cx.cat_rank));
+        let top = top_category(cats, &cx.cat_rank);
+        // SAFETY: `partition_work` reserved a row per event of the partition, and every row has an event of its own
+        unsafe { cols.put(x.d as u8, x.sessions as u8, x.events, x.revenue, top) };
     }
+    cols.runs.push(days.len() as u8);
+    put_name(&mut cols.names, &cx.names, name, tmp);
 
     let cts = |c: &Ck| (c.k >> 32) as i64;
     let ccamp = |c: &Ck| (c.k & 0xffff_ffff) as usize;
@@ -3534,13 +3534,15 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
     }
 }
 
-fn finish_row(mut r: UserRow, cats: &mut Vec<(u16, i64)>, rank: &[u32]) -> UserRow {
-    r.top = cats
+/// The category of `cats` (category, price sum) with the largest sum, the byte-wise smallest name on a tie; NO_CAT
+/// when there is none. Empties `cats`.
+fn top_category(cats: &mut Vec<(u16, i64)>, rank: &[u32]) -> u16 {
+    let top = cats
         .iter()
         .max_by(|a, b| a.1.cmp(&b.1).then(rank[b.0 as usize].cmp(&rank[a.0 as usize])))
         .map_or(NO_CAT, |c| c.0);
     cats.clear();
-    r
+    top
 }
 
 // ---------------------------------------------------------------- Parquet
@@ -3641,20 +3643,18 @@ struct ColSpec {
     ty: i32,
     optional: bool,
     converted: Option<i32>,
-    dict: bool, // dictionary encoded when the file has rows
-    delta: bool, // DELTA_BINARY_PACKED
 }
 
 const fn col(name: &'static str, ty: i32, converted: Option<i32>) -> ColSpec {
-    ColSpec { name, ty, optional: false, converted, dict: false, delta: false }
+    ColSpec { name, ty, optional: false, converted }
 }
 
 const USER_COLS: [ColSpec; 6] = [
-    ColSpec { dict: true, ..col("user_id", T_BYTES, Some(CT_UTF8)) },
-    ColSpec { delta: true, ..col("day", T_INT32, Some(CT_DATE)) },
-    ColSpec { delta: true, ..col("sessions", T_INT32, None) },
-    ColSpec { delta: true, ..col("events", T_INT32, None) },
-    ColSpec { delta: true, ..col("revenue_cents", T_INT64, None) },
+    col("user_id", T_BYTES, Some(CT_UTF8)),
+    col("day", T_INT32, Some(CT_DATE)),
+    col("sessions", T_INT32, None),
+    col("events", T_INT32, None),
+    col("revenue_cents", T_INT64, None),
     ColSpec { optional: true, ..col("top_category", T_BYTES, Some(CT_UTF8)) },
 ];
 
@@ -3668,18 +3668,18 @@ const CAMP_COLS: [ColSpec; 7] = [
     col("assisted_sessions", T_INT64, None),
 ];
 
-/// Rows per data page: a page body stays cache-sized and one buffer is reused for every page.
-const PAGE_ROWS: usize = 16384;
-/// Room reserved in front of a page body for its Thrift page header, which is written backwards from here.
-const HDR_ROOM: usize = 48;
+/// One column of a file, as pieces of bytes that are written in order and never copied: an optional dictionary
+/// page (its number of entries and its PLAIN body), then one data page: PLAIN values, or with a dictionary the
+/// RLE_DICTIONARY body (bit width, then RLE/bit-packed indices); for an optional column the definition levels come
+/// first, as a length-prefixed RLE/bit-packed run.
+struct Chunk<'a> {
+    dict: Option<(usize, Vec<&'a [u8]>)>,
+    body: Vec<&'a [u8]>,
+}
 
-/// `fill` is called with this `lo` for the dictionary page of a dictionary-encoded column.
-const DICT_PAGE: usize = usize::MAX;
-
-/// A Thrift PageHeader into `page[at..HDR_ROOM]`, written backwards from `HDR_ROOM`; returns `at`.
-/// `dict`: a dictionary page of `nvals` entries; else a data page of `nvals` values in encoding `enc`.
-fn page_header(page: &mut [u8], dict: bool, nvals: usize, enc: i32) -> usize {
-    let size = (page.len() - HDR_ROOM) as i32;
+/// Appends to `out` the Thrift PageHeader of a page body of `size` bytes: a dictionary page of `nvals` entries when
+/// `dict`, else a data page of `nvals` values in encoding `enc`.
+fn page_header(out: &mut Vec<u8>, dict: bool, nvals: usize, enc: i32, size: i32) {
     let mut h = Thrift::new();
     h.begin();
     h.i32(1, if dict { 2 } else { 0 }); // DICTIONARY_PAGE, DATA_PAGE
@@ -3698,57 +3698,39 @@ fn page_header(page: &mut [u8], dict: bool, nvals: usize, enc: i32) -> usize {
     }
     h.end();
     h.end();
-    assert!(h.b.len() <= HDR_ROOM);
-    let at = HDR_ROOM - h.b.len();
-    page[at..HDR_ROOM].copy_from_slice(&h.b);
-    at
+    out.extend_from_slice(&h.b);
 }
 
-/// Writes `path` with one row group of `n` rows. `fill(i, lo, hi, buf)` appends the body of the data page of column i
-/// holding rows lo..hi to `buf` (PLAIN, or RLE_DICTIONARY for a dictionary column: bit width, then RLE/bit-packed
-/// indices); for the optional column the definition levels come first, as a length-prefixed RLE/bit-packed run.
-/// A dictionary column (`dict`, when n > 0) first gets `fill(i, DICT_PAGE, 0, buf)`: the PLAIN dictionary page, whose
-/// number of entries `fill` returns.
-fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(usize, usize, usize, &mut Vec<u8>) -> usize) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(path)?;
-    // the whole file is built in memory and written by one call: a write(2) per page cost 10 ms a file when eight
-    // threads wrote at once (journal and page-cache locks), the one big call does not
-    let mut out: Vec<u8> = huge_vec(n * 12 + (1 << 20));
-    out.extend_from_slice(b"PAR1");
+/// Writes `path` with one row group of `n` rows, one `Chunk` per column of `cols`. The file goes out in one
+/// writev(2) straight from the chunks' pieces: a write(2) per page cost 10 ms a file when eight threads wrote at
+/// once (journal and page-cache locks), one call does not, and nothing is copied into a file-sized buffer first.
+fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, chunks: &[Chunk]) -> std::io::Result<()> {
+    use std::io::{IoSlice, Write};
+    assert_eq!(cols.len(), chunks.len());
+    let size = |v: &[&[u8]]| i32::try_from(v.iter().map(|p| p.len()).sum::<usize>()).map_err(|_| std::io::Error::other("page over 2 GiB"));
+    i32::try_from(n).map_err(|_| std::io::Error::other("over 2^31 rows in a file"))?;
+    let mut heads: Vec<u8> = Vec::new(); // every page header
+    let mut spans = Vec::with_capacity(cols.len()); // per column: where its dictionary and data page headers are in `heads`
+    let mut metas = Vec::with_capacity(cols.len()); // per column: (offset, size, dictionary page offset, data page offset)
     let mut off = 4i64;
-    let mut page = Vec::new();
-    let mut chunks = Vec::with_capacity(cols.len()); // (offset, size, dictionary page offset, first data page offset)
-    for (i, c) in cols.iter().enumerate() {
-        let (start, use_dict) = (off, c.dict && n > 0);
-        let (mut dict_off, mut data_off) = (None, off);
-        if use_dict {
-            page.clear();
-            page.resize(HDR_ROOM, 0);
-            let entries = fill(i, DICT_PAGE, 0, &mut page);
-            i32::try_from(page.len() - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
-            let at = page_header(&mut page, true, entries, 0);
-            out.extend_from_slice(&page[at..]);
+    for c in chunks {
+        let start = off;
+        let (mut dict_off, mut dspan) = (None, 0..0);
+        if let Some((entries, body)) = &c.dict {
+            let len = size(body)?;
+            let a = heads.len();
+            page_header(&mut heads, true, *entries, 0, len);
+            dspan = a..heads.len();
             dict_off = Some(off);
-            off += (page.len() - at) as i64;
-            data_off = off;
+            off += (heads.len() - a) as i64 + len as i64;
         }
-        let mut lo = 0;
-        loop {
-            let hi = (lo + PAGE_ROWS).min(n);
-            page.clear();
-            page.resize(HDR_ROOM, 0);
-            fill(i, lo, hi, &mut page);
-            i32::try_from(page.len() - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
-            let at = page_header(&mut page, false, hi - lo, if use_dict { 8 } else if c.delta { 5 } else { 0 }); // RLE_DICTIONARY, DELTA_BINARY_PACKED, PLAIN
-            out.extend_from_slice(&page[at..]);
-            off += (page.len() - at) as i64;
-            lo = hi;
-            if lo >= n {
-                break;
-            }
-        }
-        chunks.push((start, off - start, dict_off, data_off));
+        let data_off = off;
+        let len = size(&c.body)?;
+        let a = heads.len();
+        page_header(&mut heads, false, n, if c.dict.is_some() { 8 } else { 0 }, len); // RLE_DICTIONARY, PLAIN
+        off += (heads.len() - a) as i64 + len as i64;
+        spans.push((dspan, a..heads.len()));
+        metas.push((start, off - start, dict_off, data_off));
     }
     let mut t = Thrift::new();
     t.begin();
@@ -3776,7 +3758,7 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
     t.list(4, Thrift::STRUCT, 1);
     t.begin();
     t.list(1, Thrift::STRUCT, cols.len());
-    for (c, &(o, size, dict_off, data_off)) in cols.iter().zip(&chunks) {
+    for (c, &(o, size, dict_off, data_off)) in cols.iter().zip(&metas) {
         t.begin();
         t.i64(2, o); // file_offset
         t.sub(3); // ColumnMetaData
@@ -3786,10 +3768,6 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
             t.elem_i32(0); // PLAIN: the dictionary page
             t.elem_i32(3); // RLE
             t.elem_i32(8); // RLE_DICTIONARY
-        } else if c.delta {
-            t.list(2, Thrift::I32, 2);
-            t.elem_i32(5); // DELTA_BINARY_PACKED
-            t.elem_i32(3); // RLE
         } else {
             t.list(2, Thrift::I32, 2);
             t.elem_i32(0); // PLAIN
@@ -3816,34 +3794,35 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
     let len = t.b.len() as u32;
     t.b.extend_from_slice(&len.to_le_bytes());
     t.b.extend_from_slice(b"PAR1");
-    out.extend_from_slice(&t.b);
-    f.write_all(&out)
-}
 
-fn plain_bytes<'a>(buf: &mut Vec<u8>, vals: impl Iterator<Item = &'a [u8]>) {
-    for v in vals {
-        buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
-        buf.extend_from_slice(v);
-    }
-}
-
-fn plain_i64(buf: &mut Vec<u8>, vals: impl Iterator<Item = i64>) {
-    for v in vals {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-}
-
-
-fn page_slices<'a>(segs: &[&'a [UserRow]], lo: usize, hi: usize, out: &mut Vec<&'a [UserRow]>) {
-    out.clear();
-    let mut base = 0;
-    for &s in segs {
-        let (a, b) = (base, base + s.len());
-        if b > lo && a < hi {
-            out.push(&s[lo.max(a) - a..hi.min(b) - a]);
+    let mut io: Vec<IoSlice> = vec![IoSlice::new(b"PAR1")];
+    for (c, (d, h)) in chunks.iter().zip(&spans) {
+        if let Some((_, body)) = &c.dict {
+            io.push(IoSlice::new(&heads[d.clone()]));
+            io.extend(body.iter().filter(|p| !p.is_empty()).map(|p| IoSlice::new(p)));
         }
-        base = b;
+        io.push(IoSlice::new(&heads[h.clone()]));
+        io.extend(c.body.iter().filter(|p| !p.is_empty()).map(|p| IoSlice::new(p)));
     }
+    io.push(IoSlice::new(&t.b));
+    let mut f = std::fs::File::create(path)?;
+    let mut left = &mut io[..];
+    while !left.is_empty() {
+        match f.write_vectored(left) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(k) => IoSlice::advance_slices(&mut left, k),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Appends `v` as a PLAIN byte array: 4-byte length, then the bytes.
+#[inline]
+fn put_bytes(b: &mut Vec<u8>, v: &[u8]) {
+    b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+    b.extend_from_slice(v);
 }
 
 /// Appends the ID of key `k` as a PLAIN byte array: 4-byte length, then the bytes.
@@ -3866,182 +3845,173 @@ fn put_name(b: &mut Vec<u8>, names: &Interner, k: u64, tmp: &mut Vec<u8>) {
     b.extend_from_slice(tmp);
 }
 
-/// DELTA_BINARY_PACKED body of `v`: blocks of 128 deltas in four miniblocks of 32, each miniblock at the bit width
-/// its largest value (delta minus the block's smallest delta) needs.
-fn put_delta(b: &mut Vec<u8>, v: &[i64]) {
-    fn uleb(b: &mut Vec<u8>, mut x: u64) {
-        while x >= 0x80 {
-            b.push(x as u8 | 0x80);
-            x >>= 7;
-        }
-        b.push(x as u8);
-    }
-    let zz = |x: i64| ((x << 1) ^ (x >> 63)) as u64;
-    uleb(b, 128);
-    uleb(b, 4);
-    uleb(b, v.len() as u64);
-    uleb(b, zz(v.first().copied().unwrap_or(0)));
-    let mut i = 1;
-    while i < v.len() {
-        let m = (v.len() - i).min(128);
-        let mut d = [0i64; 128];
-        let mut min = i64::MAX;
-        for j in 0..m {
-            d[j] = v[i + j].wrapping_sub(v[i + j - 1]);
-            min = min.min(d[j]);
-        }
-        uleb(b, zz(min));
-        // a miniblock past the last delta is absent; the last one is padded with zeros (the smallest residual)
-        let mut r = [0u64; 128];
-        for j in 0..m {
-            r[j] = d[j].wrapping_sub(min) as u64;
-        }
-        let mut w = [0u8; 4];
-        for k in 0..m.div_ceil(32) {
-            w[k] = (64 - r[k * 32..k * 32 + 32].iter().fold(0u64, |a, &x| a | x).leading_zeros()) as u8;
-        }
-        b.extend_from_slice(&w);
-        for k in 0..m.div_ceil(32) {
-            let w = w[k] as u32;
-            if w == 0 {
-                continue;
-            }
-            let (mut acc, mut nb) = (0u128, 0u32);
-            for &x in &r[k * 32..k * 32 + 32] {
-                acc |= (x as u128) << nb;
-                nb += w;
-                if nb >= 64 {
-                    b.extend_from_slice(&(acc as u64).to_le_bytes());
-                    acc >>= 64;
-                    nb -= 64;
-                }
-            }
-            if nb > 0 {
-                b.extend_from_slice(&acc.to_le_bytes()[..nb.div_ceil(8) as usize]);
-            }
-        }
-        i += m;
-    }
-}
-
-/// One run of the RLE/bit-packed hybrid: `run` copies of the `vb`-byte value `idx`.
-fn put_run(b: &mut Vec<u8>, run: usize, idx: u32, vb: usize) {
-    let mut v = (run as u64) << 1;
+fn put_varint(b: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
         b.push(v as u8 | 0x80);
         v >>= 7;
     }
     b.push(v as u8);
+}
+
+/// One run of the RLE/bit-packed hybrid: `run` copies of the `vb`-byte value `idx`.
+fn put_run(b: &mut Vec<u8>, run: usize, idx: u32, vb: usize) {
+    put_varint(b, (run as u64) << 1);
     b.extend_from_slice(&idx.to_le_bytes()[..vb]);
 }
 
-fn write_users(path: &Path, rows: &[UserRow], cat_names: &[Bytes], names: &Interner) -> std::io::Result<()> {
-    let segs: &[&[UserRow]] = &[rows];
-    let mut tmp = Vec::with_capacity(64);
-    let n: usize = segs.iter().map(|s| s.len()).sum();
-    let mut part: Vec<&[UserRow]> = Vec::new();
-    let mut run: Vec<u8> = Vec::new();
-    let mut vals: Vec<i64> = Vec::new();
-    // user_id is dictionary encoded: one entry per run of equal IDs (a person's days are consecutive rows), and
-    // the data pages are runs of that entry's index
-    let (mut entries, mut idx, mut last): (usize, u32, Option<u64>) = (0, u32::MAX, None);
-    // sessions and events stay far below 2^31: main() refuses inputs with that many events
-    write_parquet(path, &USER_COLS, n, |c, lo, hi, b| {
-        if c == 0 && lo == DICT_PAGE {
-            let mut prev: Option<u64> = None;
-            for r in segs.iter().flat_map(|s| s.iter()) {
-                if prev != Some(r.name) {
-                    put_name(b, names, r.name, &mut tmp);
-                    entries += 1;
-                    prev = Some(r.name);
-                }
-            }
-            (idx, last) = (u32::MAX, None);
-            return entries;
+/// The start of an RLE_DICTIONARY page body whose indices are one byte each: bit width 8, then the header of one
+/// bit-packed run of ceil(n / 8) groups of eight. The `n` index bytes follow, padded with zeros to whole groups.
+fn bytes_run(n: usize) -> Vec<u8> {
+    let mut b = vec![8];
+    put_varint(&mut b, (n.div_ceil(8) as u64) << 1 | 1);
+    b
+}
+
+/// The bytes of a slice of plain integers: a PLAIN page body where the target is little-endian.
+fn le_bytes<T: Copy>(v: &[T]) -> &[u8] {
+    const { assert!(cfg!(target_endian = "little")) };
+    // SAFETY: integers have no padding and any byte pattern is a valid u8
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+/// The `user_daily` rows of one thread, a column each, in the form `write_users` puts in the file: the rows of a
+/// person are consecutive.
+struct Cols {
+    n: usize,         // rows; the row vectors below hold at least n (their len is set by `seal`)
+    names: Vec<u8>,   // the dictionary page of user_id: every person's name once, as PLAIN byte arrays, in row order
+    runs: Vec<u8>,    // rows of each person
+    day: Vec<u8>,     // day - day0
+    sess: Vec<u8>,    // at most 49 start in a day (30-minute bins)
+    events: Vec<u32>,
+    rev: Vec<i64>,
+    top: Vec<u16>, // category, NO_CAT without a purchase
+}
+
+impl Cols {
+    /// Room for `cap` rows at once (a person has ~3.4 rows and a name of up to 13 bytes with its length).
+    fn new(cap: usize) -> Cols {
+        Cols {
+            n: 0,
+            names: huge_vec(cap * 4),
+            runs: huge_vec(cap / 3),
+            day: huge_vec(cap + 8),
+            sess: huge_vec(cap + 8),
+            events: huge_vec(cap),
+            rev: huge_vec(cap),
+            top: huge_vec(cap),
         }
-        page_slices(segs, lo, hi, &mut part);
-        match c {
-            0 => {
-                let w = (usize::BITS - (entries.max(2) - 1).leading_zeros()) as usize;
-                b.push(w as u8);
-                let mut count = 0;
-                for r in part.iter().flat_map(|s| s.iter()) {
-                    if last == Some(r.name) {
-                        count += 1;
-                    } else {
-                        if count > 0 {
-                            put_run(b, count, idx, w.div_ceil(8));
-                        }
-                        idx = idx.wrapping_add(1);
-                        last = Some(r.name);
-                        count = 1;
-                    }
-                }
-                if count > 0 {
-                    put_run(b, count, idx, w.div_ceil(8));
-                }
-            }
-            1..=4 => {
-                vals.clear();
-                vals.extend(part.iter().flat_map(|s| s.iter()).map(|r| match c {
-                    1 => r.day as i64,
-                    2 => r.sessions as i64,
-                    3 => r.events as i64,
-                    _ => r.revenue,
-                }));
-                put_delta(b, &vals);
-            }
-            _ => {
-                // definition levels: one bit-packed run of ceil(rows / 8) groups of 8 bits (1 = present)
-                let groups = (hi - lo).div_ceil(8);
-                run.clear();
-                let mut v = ((groups as u64) << 1) | 1;
-                while v >= 0x80 {
-                    run.push(v as u8 | 0x80);
-                    v >>= 7;
-                }
-                run.push(v as u8);
-                let (mut cur, mut k) = (0u8, 0);
-                for r in part.iter().flat_map(|s| s.iter()) {
-                    cur |= ((r.top != NO_CAT) as u8) << k;
-                    k += 1;
-                    if k == 8 {
-                        run.push(cur);
-                        (cur, k) = (0, 0);
-                    }
-                }
-                if k > 0 {
-                    run.push(cur);
-                }
-                b.extend_from_slice(&((run.len()) as u32).to_le_bytes());
-                b.extend_from_slice(&run);
-                for r in part.iter().flat_map(|s| s.iter()) {
-                    if r.top != NO_CAT {
-                        let v = cat_names[r.top as usize];
-                        b.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                        b.extend_from_slice(v);
-                    }
-                }
-            }
+    }
+
+    /// Room for `more` rows past the n so far.
+    fn reserve(&mut self, more: usize) {
+        // SAFETY: n rows of each vector are written (`put`), and n <= capacity
+        unsafe {
+            self.day.set_len(self.n);
+            self.sess.set_len(self.n);
+            self.events.set_len(self.n);
+            self.rev.set_len(self.n);
+            self.top.set_len(self.n);
         }
-        0
-    })
+        self.day.reserve(more + 8); // + the padding of `seal`
+        self.sess.reserve(more + 8);
+        self.events.reserve(more);
+        self.rev.reserve(more);
+        self.top.reserve(more);
+    }
+
+    /// One more row. SAFETY: the caller has reserved room for it (`reserve`).
+    #[inline(always)]
+    unsafe fn put(&mut self, day: u8, sess: u8, events: u32, rev: i64, top: u16) {
+        let n = self.n;
+        *self.day.as_mut_ptr().add(n) = day;
+        *self.sess.as_mut_ptr().add(n) = sess;
+        *self.events.as_mut_ptr().add(n) = events;
+        *self.rev.as_mut_ptr().add(n) = rev;
+        *self.top.as_mut_ptr().add(n) = top;
+        self.n = n + 1;
+    }
+
+    /// After the last row: the lengths, and the one-byte columns padded with zeros to whole groups of eight rows.
+    fn seal(&mut self) {
+        self.reserve(0);
+        let n8 = self.n.div_ceil(8) * 8;
+        self.day.resize(n8, 0);
+        self.sess.resize(n8, 0);
+    }
+}
+
+/// `user_daily` from the sealed columns of one thread. user_id is dictionary encoded with one entry per person and
+/// runs of that entry's index (a person's days are consecutive rows); day and sessions are dictionary encoded with
+/// one-byte indices (the window's days; the numbers 0..=255), so their column in memory is the page body;
+/// events and revenue_cents are PLAIN straight from memory; top_category is the index of the category in a
+/// dictionary of all of them, under a bitmap of the rows that have one.
+fn write_users(path: &Path, c: &Cols, cat_names: &[Bytes], day0: i64, ndays: usize) -> std::io::Result<()> {
+    let n = c.n;
+    if n == 0 {
+        let chunks: Vec<Chunk> = USER_COLS.iter().map(|_| Chunk { dict: None, body: Vec::new() }).collect();
+        return write_parquet(path, &USER_COLS, 0, &chunks);
+    }
+    let n8 = n.div_ceil(8) * 8;
+    // user_id: per person, a run of its rows
+    let entries = c.runs.len();
+    let w = (usize::BITS - (entries.max(2) - 1).leading_zeros()) as usize;
+    let vb = w.div_ceil(8);
+    let mut runs: Vec<u8> = Vec::with_capacity(1 + entries * (2 + vb) + 8);
+    runs.push(w as u8);
+    for (idx, &k) in c.runs.iter().enumerate() {
+        put_run(&mut runs, k as usize, idx as u32, vb);
+    }
+    // day, sessions
+    let day_dict: Vec<u8> = (0..ndays as i64).flat_map(|d| ((day0 + d) as i32).to_le_bytes()).collect();
+    let num_dict: Vec<u8> = (0..256i32).flat_map(|v| v.to_le_bytes()).collect();
+    let run8 = bytes_run(n);
+    // top_category: the bitmap of the rows that have one (definition levels: one bit-packed run of ceil(n / 8)
+    // groups of 8 bits), then the indices of those rows
+    let mut cat_dict = Vec::new();
+    cat_names.iter().for_each(|v| put_bytes(&mut cat_dict, v));
+    let mut defs: Vec<u8> = Vec::with_capacity(16 + n8 / 8);
+    defs.extend_from_slice(&[0; 4]);
+    put_varint(&mut defs, (n8 as u64 / 8) << 1 | 1);
+    let mut idx: Vec<u8> = vec![0; n8 + 8];
+    let mut k = 0;
+    for ch in c.top[..n].chunks(8) {
+        let mut m = 0u8;
+        for (i, &t) in ch.iter().enumerate() {
+            let has = t != NO_CAT;
+            m |= (has as u8) << i;
+            idx[k] = t as u8;
+            k += has as usize;
+        }
+        defs.push(m);
+    }
+    let dl = (defs.len() - 4) as u32;
+    defs[..4].copy_from_slice(&dl.to_le_bytes());
+    let k8 = k.div_ceil(8) * 8;
+    idx[k..k8].fill(0);
+    let top_run = if k == 0 { vec![8] } else { bytes_run(k) };
+    let chunks = [
+        Chunk { dict: Some((entries, vec![&c.names])), body: vec![&runs] },
+        Chunk { dict: Some((ndays, vec![&day_dict])), body: vec![&run8, &c.day[..n8]] },
+        Chunk { dict: Some((256, vec![&num_dict])), body: vec![&run8, &c.sess[..n8]] },
+        Chunk { dict: None, body: vec![le_bytes(&c.events[..n])] },
+        Chunk { dict: None, body: vec![le_bytes(&c.rev[..n])] },
+        Chunk { dict: Some((cat_names.len(), vec![&cat_dict])), body: vec![&defs, &top_run, &idx[..k8]] },
+    ];
+    write_parquet(path, &USER_COLS, n, &chunks)
 }
 
 fn write_camps(path: &Path, rows: &[CampRow]) -> std::io::Result<()> {
-    write_parquet(path, &CAMP_COLS, rows.len(), |c, lo, hi, b| {
-        let rows = &rows[lo..hi];
-        match c {
-            0 => plain_bytes(b, rows.iter().map(|r| r.0)),
-            1 => plain_bytes(b, rows.iter().map(|r| r.1)),
-            2 => rows.iter().for_each(|r| b.extend_from_slice(&r.2.to_le_bytes())),
-            3 => plain_i64(b, rows.iter().map(|r| r.3)),
-            4 => plain_i64(b, rows.iter().map(|r| r.4)),
-            5 => plain_i64(b, rows.iter().map(|r| r.5)),
-            _ => plain_i64(b, rows.iter().map(|r| r.6)),
+    let mut cols: [Vec<u8>; 7] = Default::default();
+    for r in rows {
+        put_bytes(&mut cols[0], r.0);
+        put_bytes(&mut cols[1], r.1);
+        cols[2].extend_from_slice(&r.2.to_le_bytes());
+        for (c, v) in cols[3..].iter_mut().zip([r.3, r.4, r.5, r.6]) {
+            c.extend_from_slice(&v.to_le_bytes());
         }
-        0
-    })
+    }
+    let chunks: Vec<Chunk> = cols.iter().map(|c| Chunk { dict: None, body: vec![&c[..]] }).collect();
+    write_parquet(path, &CAMP_COLS, rows.len(), &chunks)
 }
 
 #[cfg(test)]

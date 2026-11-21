@@ -11,7 +11,6 @@
 //!   4. write Parquet
 
 use memmap2::Mmap;
-use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
@@ -684,13 +683,6 @@ fn die(msg: &str) -> ! {
     std::process::exit(1)
 }
 
-/// `n` empty vectors, each with room for about `total / (threads * n)` items (+25% for uneven shares).
-fn sized<T>(n: usize, total: usize, threads: usize) -> Vec<Vec<T>> {
-    // a multiple of 5 keeps a Vec<UEvent> buffer a whole number of PEvents (to_pevents); doubling preserves it
-    let each = (total / (threads * n).max(1) * 5 / 4 + 16).next_multiple_of(5);
-    (0..n).map(|_| Vec::with_capacity(each)).collect()
-}
-
 /// Runs `work(state, i)` for i in 0..n across `threads` threads; returns each thread's state.
 fn par<S: Send>(threads: usize, n: usize, init: impl Fn() -> S + Sync, work: impl Fn(&mut S, usize) + Sync) -> Vec<S> {
     let next = AtomicUsize::new(0);
@@ -846,23 +838,122 @@ struct Ctx {
     cat_rank: Vec<u32>,
 }
 
+// ---------------------------------------------------------------- buckets
+
+/// `n` append-only lists in one block of `n * cap` items, so the kernel backs them with a few huge pages instead
+/// of a page fault per 4 KiB per list. A list that outgrows its share continues in `more`.
+struct Buckets<T> {
+    base: *mut T,
+    cap: usize,
+    len: Vec<usize>,
+    more: Vec<Vec<T>>,
+}
+unsafe impl<T: Send> Send for Buckets<T> {}
+unsafe impl<T: Sync> Sync for Buckets<T> {}
+
+impl<T: Copy> Buckets<T> {
+    fn new(n: usize, cap: usize) -> Buckets<T> {
+        let bytes = n * cap * std::mem::size_of::<T>();
+        let mut base = std::ptr::null_mut();
+        if n * cap > 0 {
+            let p = unsafe { libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
+            if p == libc::MAP_FAILED {
+                die("mmap of a bucket block failed");
+            }
+            base = p as *mut T;
+        }
+        Buckets { base, cap, len: vec![0; n], more: (0..n).map(|_| Vec::new()).collect() }
+    }
+    /// Lists of about `total / (threads * n)` items each (+25% for uneven shares).
+    fn sized(n: usize, total: usize, threads: usize) -> Buckets<T> {
+        Buckets::new(n, total / (threads * n).max(1) * 5 / 4 + 16)
+    }
+    #[inline(always)]
+    fn push(&mut self, b: usize, x: T) {
+        let l = self.len[b];
+        if l < self.cap {
+            unsafe { self.base.add(b * self.cap + l).write(x) };
+            self.len[b] = l + 1;
+        } else {
+            self.more[b].push(x);
+        }
+    }
+    fn len_of(&self, b: usize) -> usize {
+        self.len[b] + self.more[b].len()
+    }
+    /// List `b` as two slices, in order.
+    #[inline(always)]
+    fn parts(&self, b: usize) -> [&[T]; 2] {
+        let a = if self.len[b] == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(self.base.add(b * self.cap), self.len[b]) } };
+        [a, &self.more[b]]
+    }
+    #[inline(always)]
+    fn get(&self, b: usize, i: usize) -> &T {
+        let [a, m] = self.parts(b);
+        if i < a.len() {
+            &a[i]
+        } else {
+            &m[i - a.len()]
+        }
+    }
+    fn iter(&self, b: usize) -> impl Iterator<Item = &T> {
+        let [a, m] = self.parts(b);
+        a.iter().chain(m.iter())
+    }
+}
+
 // ---------------------------------------------------------------- person table
 
 const NONE: u32 = u32::MAX;
 const GRAB: usize = 4096;
 
-/// h: 0 empty, 1 being filled, else the published hash (always >= 2).
-#[repr(C, align(32))]
-struct Slot {
-    h: AtomicU64,
-    key: UnsafeCell<SStr>,
-    parent: AtomicU32, // union-find parent; after `finalize` the person (root slot index)
-    best: AtomicU32,   // on a root: slot of the smallest ID of its person
+fn map_zeroed(bytes: usize) -> *mut u8 {
+    let p = unsafe { libc::mmap(std::ptr::null_mut(), bytes.max(4096), libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
+    if p == libc::MAP_FAILED {
+        die("mmap of the person table failed");
+    }
+    p as *mut u8
 }
 
-/// Lock-free open-addressing table of IDs. Person = slot index of the union-find root.
+impl SStr {
+    /// A second 32 bit hash of the ID, independent of `hash`.
+    #[inline(always)]
+    fn hash2(&self) -> u32 {
+        if self.0[15] != SStr::LONG {
+            let lo = u64::from_le_bytes(self.0[..8].try_into().unwrap());
+            let hi = u64::from_le_bytes(self.0[8..].try_into().unwrap());
+            (mum(mum(hi ^ 0xA0761D6478BD642F, lo ^ 0xE7037ED1A0B428DB), 0x8EBC6AF09C88C6E3) >> 32) as u32
+        } else {
+            let mut h = 0xD6E8FEB86659FD93u64;
+            for &c in self.get() {
+                h = (h ^ c as u64).wrapping_mul(0x100000001B3).rotate_left(23);
+            }
+            (mum(h, 0x8EBC6AF09C88C6E3) >> 32) as u32
+        }
+    }
+}
+
+#[inline(always)]
+fn mum(a: u64, b: u64) -> u64 {
+    let p = (a as u128) * (b as u128);
+    (p as u64) ^ ((p >> 64) as u64)
+}
+
+/// The part of a table slot every lookup reads: `h` is 0 (empty), 1 (being filled) or the ID's hash (>= 2);
+/// `w` is a second 32 bit hash of the ID << 32 | union-find parent, after `finalize` the person (root slot index).
+/// An ID is identified by the 96 bits of both hashes: a collision of two different IDs has probability ~1e-16.
+#[repr(C, align(16))]
+struct Slot {
+    h: AtomicU64,
+    w: AtomicU64,
+}
+
+/// Lock-free open-addressing table of IDs. Person = slot index of the union-find root. The ID bytes and the
+/// smallest ID of a person live in arrays of their own that lookups never touch.
 struct Table {
     slots: *mut Slot,
+    keys: *mut SStr,
+    best: *mut AtomicU32, // on a root: 1 + slot of the smallest ID of its person; 0 = the root's own
     cap: usize,
     shift: u32,
     used: AtomicUsize,
@@ -875,17 +966,10 @@ unsafe impl Send for Table {}
 impl Table {
     fn new(cap: usize) -> Table {
         assert!(cap.is_power_of_two() && cap >= 1024 && cap < (1 << 31));
-        let bytes = cap * std::mem::size_of::<Slot>();
-        let p = unsafe { libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
-        if p == libc::MAP_FAILED {
-            die("mmap of the person table failed");
-        }
-        #[cfg(target_os = "linux")]
-        unsafe {
-            libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
-        }
         Table {
-            slots: p as *mut Slot,
+            slots: map_zeroed(cap * 16) as *mut Slot,
+            keys: map_zeroed(cap * 16) as *mut SStr,
+            best: map_zeroed(cap * 4) as *mut AtomicU32,
             cap,
             shift: 64 - cap.trailing_zeros(),
             used: AtomicUsize::new(0),
@@ -893,10 +977,26 @@ impl Table {
             overflow: AtomicBool::new(false),
         }
     }
+    /// Gives the memory back; the table is leaked (it lives to the end of the run) so `P1` can borrow it for good.
+    fn release(&self) {
+        unsafe {
+            libc::munmap(self.slots as *mut libc::c_void, self.cap * 16);
+            libc::munmap(self.keys as *mut libc::c_void, self.cap * 16);
+            libc::munmap(self.best as *mut libc::c_void, self.cap * 4);
+        }
+    }
     #[inline(always)]
     fn slot(&self, i: usize) -> &Slot {
         debug_assert!(i < self.cap);
         unsafe { &*self.slots.add(i) }
+    }
+    #[inline(always)]
+    fn key(&self, i: u32) -> SStr {
+        unsafe { *self.keys.add(i as usize) }
+    }
+    #[inline(always)]
+    fn best_of(&self, i: u32) -> &AtomicU32 {
+        unsafe { &*self.best.add(i as usize) }
     }
     #[inline(always)]
     fn prefetch(&self, h: u64) {
@@ -915,10 +1015,11 @@ impl Table {
         *credits = GRAB;
         true
     }
-    /// The slot of `key` (hash `h`, already >= 2), inserting it as a new person when absent.
-    /// NONE when the table is out of room (the caller must give up: see `overflow`).
+    /// The slot of `key` (hash `h`, already >= 2), inserting it as a new person when absent; with LOG a new slot
+    /// is also appended to `log`. NONE when the table is out of room (the caller must give up: see `overflow`).
     #[inline]
-    fn slot_of(&self, key: SStr, h: u64, credits: &mut usize) -> u32 {
+    fn slot_of<const LOG: bool>(&self, key: SStr, h: u64, credits: &mut usize, log: &mut Vec<u32>) -> u32 {
+        let h2 = key.hash2() as u64;
         let mask = self.cap - 1;
         let mut i = (h >> self.shift) as usize;
         loop {
@@ -931,10 +1032,12 @@ impl Table {
                 match s.h.compare_exchange(0, 1, Acquire, Acquire) {
                     Ok(_) => {
                         *credits -= 1;
-                        unsafe { *s.key.get() = key };
-                        s.parent.store(i as u32, Relaxed);
-                        s.best.store(i as u32, Relaxed);
+                        unsafe { self.keys.add(i).write(key) };
+                        s.w.store(h2 << 32 | i as u64, Relaxed);
                         s.h.store(h, Release);
+                        if LOG {
+                            log.push(i as u32);
+                        }
                         return i as u32;
                     }
                     Err(cur) => sh = cur,
@@ -944,25 +1047,40 @@ impl Table {
                 std::hint::spin_loop();
                 sh = s.h.load(Acquire);
             }
-            if sh == h && unsafe { *s.key.get() } == key {
+            if sh == h && s.w.load(Relaxed) >> 32 == h2 {
                 return i as u32;
             }
             i = (i + 1) & mask;
         }
     }
-    #[inline]
+    #[inline(always)]
+    fn parent(&self, i: u32) -> u32 {
+        self.slot(i as usize).w.load(Acquire) as u32
+    }
+    /// The person of slot `i`: its parent once the unions are done.
+    #[inline(always)]
     fn pid(&self, i: u32) -> u32 {
-        self.slot(i as usize).parent.load(Acquire)
+        self.parent(i)
+    }
+    /// parent[x] = new if it is still `old`.
+    #[inline]
+    fn set_parent(&self, x: u32, old: u32, new: u32) -> bool {
+        let w = &self.slot(x as usize).w;
+        let cur = w.load(Acquire);
+        if cur as u32 != old {
+            return false;
+        }
+        w.compare_exchange(cur, (cur & !0xFFFF_FFFF) | new as u64, Release, Relaxed).is_ok()
     }
     fn find(&self, mut x: u32) -> u32 {
         loop {
-            let p = self.slot(x as usize).parent.load(Acquire);
+            let p = self.parent(x);
             if p == x {
                 return x;
             }
-            let gp = self.slot(p as usize).parent.load(Acquire);
+            let gp = self.parent(p);
             if gp != p {
-                let _ = self.slot(x as usize).parent.compare_exchange_weak(p, gp, Release, Relaxed);
+                self.set_parent(x, p, gp);
             }
             x = gp;
         }
@@ -974,48 +1092,48 @@ impl Table {
                 return;
             }
             let (lo, hi) = (ra.min(rb), ra.max(rb));
-            if self.slot(hi as usize).parent.compare_exchange(hi, lo, Release, Relaxed).is_ok() {
+            if self.set_parent(hi, hi, lo) {
                 return;
             }
         }
     }
-    /// Once all unions are done: point every slot of [lo, hi) at its root and pick each root's smallest ID.
-    fn finalize(&self, lo: usize, hi: usize) {
-        for i in lo..hi.min(self.cap) {
-            let s = self.slot(i);
-            if s.h.load(Relaxed) < 2 {
-                continue;
-            }
-            let r = self.find(i as u32);
-            s.parent.store(r, Relaxed);
-            if r as usize == i && s.best.load(Relaxed) == i as u32 {
-                continue; // alone, or not yet joined by a smaller one: members compare themselves below
-            }
-            let mine = unsafe { *s.key.get() };
-            let rs = self.slot(r as usize);
+    /// Once all unions are done: point each slot of `log` at its root and pick each root's smallest ID.
+    fn finalize(&self, log: &[u32]) {
+        for &i in log {
+            let r = self.find(i);
+            let w = &self.slot(i as usize).w;
+            w.store((w.load(Relaxed) & !0xFFFF_FFFF) | r as u64, Relaxed);
+            let mine = self.key(i);
+            let rb = self.best_of(r);
             loop {
-                let cur = rs.best.load(Acquire);
-                if cur == i as u32 || unsafe { *self.slot(cur as usize).key.get() }.get() <= mine.get() {
+                let cur = rb.load(Acquire);
+                if cur == i + 1 {
                     break;
                 }
-                if rs.best.compare_exchange(cur, i as u32, AcqRel, Acquire).is_ok() {
+                let curkey = if cur == 0 { self.key(r) } else { self.key(cur - 1) };
+                if curkey.get() <= mine.get() {
+                    break;
+                }
+                if rb.compare_exchange(cur, i + 1, AcqRel, Acquire).is_ok() {
                     break;
                 }
             }
         }
     }
+    #[inline(always)]
+    fn prefetch_name(&self, pid: u32) {
+        prefetch(unsafe { self.best.add(pid as usize) });
+    }
+    #[inline(always)]
+    fn prefetch_key(&self, pid: u32) {
+        let b = self.best_of(pid).load(Relaxed);
+        prefetch(unsafe { self.keys.add(if b == 0 { pid } else { b - 1 } as usize) });
+    }
     fn name(&self, pid: u32) -> SStr {
-        let b = self.slot(pid as usize).best.load(Relaxed);
-        unsafe { *self.slot(b as usize).key.get() }
+        let b = self.best_of(pid).load(Relaxed);
+        self.key(if b == 0 { pid } else { b - 1 })
     }
 }
-impl Table {
-    /// Gives the memory back; the table is leaked (it lives to the end of the run) so `P1` can borrow it for good.
-    fn release(&self) {
-        unsafe { libc::munmap(self.slots as *mut libc::c_void, self.cap * std::mem::size_of::<Slot>()) };
-    }
-}
-
 
 // ---------------------------------------------------------------- parsing
 
@@ -1038,13 +1156,14 @@ const BATCH: usize = 16;
 struct LinkSt {
     pend: Vec<(SStr, u64, SStr, u64)>,
     credits: usize,
+    log: Vec<u32>, // slots this thread created
 }
 
 fn flush_links(tbl: &Table, st: &mut LinkSt) {
     let mut pend = std::mem::take(&mut st.pend);
     for &(a, ha, b, hb) in &pend {
-        let ia = tbl.slot_of(a, ha, &mut st.credits);
-        let ib = tbl.slot_of(b, hb, &mut st.credits);
+        let ia = tbl.slot_of::<true>(a, ha, &mut st.credits, &mut st.log);
+        let ib = tbl.slot_of::<true>(b, hb, &mut st.credits, &mut st.log);
         if ia != NONE && ib != NONE {
             tbl.union(ia, ib);
         }
@@ -1056,10 +1175,10 @@ fn flush_links(tbl: &Table, st: &mut LinkSt) {
 /// Every ID of a link line goes into the table; the two IDs of a line are unioned.
 fn build_links(tbl: &Table, files: &[Bytes], threads: usize) {
     let ch = chunks(files);
-    par(
+    let sts = par(
         threads,
         ch.len(),
-        || LinkSt { pend: Vec::with_capacity(BATCH), credits: 0 },
+        || LinkSt { pend: Vec::with_capacity(BATCH), credits: 0, log: Vec::new() },
         |st, i| {
             let (f, s, e) = ch[i];
             let end = f.as_ptr() as usize + f.len();
@@ -1079,8 +1198,13 @@ fn build_links(tbl: &Table, files: &[Bytes], threads: usize) {
             flush_links(tbl, st);
         },
     );
-    const PART: usize = 1 << 16;
-    par(threads, tbl.cap.div_ceil(PART), || (), |_, i| tbl.finalize(i * PART, (i + 1) * PART));
+    const PART: usize = 1 << 15;
+    let logs: Vec<Vec<u32>> = sts.into_iter().map(|s| s.log).collect();
+    let tasks: Vec<(usize, usize, usize)> = logs.iter().enumerate().flat_map(|(l, v)| (0..v.len()).step_by(PART).map(move |a| (l, a, (a + PART).min(v.len())))).collect();
+    par(threads, tasks.len(), || (), |_, i| {
+        let (l, a, b) = tasks[i];
+        tbl.finalize(&logs[l][a..b]);
+    });
 }
 
 // ---------------------------------------------------------------- phase 1: parse
@@ -1108,16 +1232,17 @@ struct PendC {
 struct P1<'a> {
     tbl: &'a Table,
     base: i64,
-    eb: Vec<Vec<R1>>,
-    ck: Vec<Vec<CRec>>,
+    eb: Buckets<R1>,
+    ck: Buckets<CRec>,
     pe: Vec<PendE>,
     pc: Vec<PendC>,
     credits: usize,
+    nolog: Vec<u32>,
 }
 
 impl P1<'_> {
-    fn new<'a>(tbl: &'a Table, base: i64, eb: Vec<Vec<R1>>, ck: Vec<Vec<CRec>>) -> P1<'a> {
-        P1 { tbl, base, eb, ck, pe: Vec::with_capacity(BATCH), pc: Vec::with_capacity(BATCH), credits: 0 }
+    fn new<'a>(tbl: &'a Table, base: i64, eb: Buckets<R1>, ck: Buckets<CRec>) -> P1<'a> {
+        P1 { tbl, base, eb, ck, pe: Vec::with_capacity(BATCH), pc: Vec::with_capacity(BATCH), credits: 0, nolog: Vec::new() }
     }
 
     /// A valid, non-late event: its person is looked up in a batch (the slots are prefetched meanwhile), then it
@@ -1137,7 +1262,7 @@ impl P1<'_> {
     /// Any other parsed event: it still takes part in dedup.
     #[inline(always)]
     fn reject(&mut self, eh: u64, eid: SStr, ingest: i64) {
-        self.eb[(eh >> (64 - EBITS)) as usize].push(R1 { eid, ingest, ts: 0, pid: 0, pk: 0, cat: 0 });
+        self.eb.push((eh >> (64 - EBITS)) as usize, R1 { eid, ingest, ts: 0, pid: 0, pk: 0, cat: 0 });
     }
 
     #[inline(always)]
@@ -1154,12 +1279,12 @@ impl P1<'_> {
     fn flush_events(&mut self) {
         let mut pe = std::mem::take(&mut self.pe);
         for p in pe.drain(..) {
-            let i = self.tbl.slot_of(p.uid, p.uh, &mut self.credits);
+            let i = self.tbl.slot_of::<false>(p.uid, p.uh, &mut self.credits, &mut self.nolog);
             if i == NONE {
                 continue; // table full: the whole attempt is thrown away
             }
             let pid = self.tbl.pid(i);
-            self.eb[(p.eh >> (64 - EBITS)) as usize].push(R1 { eid: p.eid, ingest: p.ingest, ts: p.ts, pid, pk: p.pk, cat: p.cat });
+            self.eb.push((p.eh >> (64 - EBITS)) as usize, R1 { eid: p.eid, ingest: p.ingest, ts: p.ts, pid, pk: p.pk, cat: p.cat });
         }
         self.pe = pe;
     }
@@ -1167,12 +1292,12 @@ impl P1<'_> {
     fn flush_clicks(&mut self) {
         let mut pc = std::mem::take(&mut self.pc);
         for p in pc.drain(..) {
-            let i = self.tbl.slot_of(p.uid, p.uh, &mut self.credits);
+            let i = self.tbl.slot_of::<false>(p.uid, p.uh, &mut self.credits, &mut self.nolog);
             if i == NONE {
                 continue;
             }
             let pid = self.tbl.pid(i);
-            self.ck[(pid as usize) & (NB - 1)].push(CRec { pid, ts: p.ts, camp: p.camp, cid: p.cid });
+            self.ck.push((pid as usize) & (NB - 1), CRec { pid, ts: p.ts, camp: p.camp, cid: p.cid });
         }
         self.pc = pc;
     }
@@ -1198,7 +1323,7 @@ fn parse_clicks(ctx: &Ctx, st: &mut P1, f: Bytes, s: usize, e: usize) {
 // ---------------------------------------------------------------- phase 2: dedup
 
 struct P2 {
-    out: Vec<Vec<Rec>>,
+    out: Buckets<Rec>,
     tab: Vec<u64>,
     hs: Vec<u64>,
     dead: Vec<bool>,
@@ -1212,7 +1337,7 @@ fn dedup_bucket(p1: &[P1<'_>], b: usize, st: &mut P2) {
     let mut n = 0;
     for t in p1 {
         st.offs.push(n);
-        n += t.eb[b].len();
+        n += t.eb.len_of(b);
     }
     if n == 0 {
         return;
@@ -1225,7 +1350,7 @@ fn dedup_bucket(p1: &[P1<'_>], b: usize, st: &mut P2) {
     st.dead.resize(n, false);
     st.hs.clear();
     for t in p1 {
-        st.hs.extend(t.eb[b].iter().map(|r| r.eid.hash()));
+        st.hs.extend(t.eb.iter(b).map(|r| r.eid.hash()));
     }
     const AHEAD: usize = 8;
     for g in 0..n.min(AHEAD) {
@@ -1233,8 +1358,7 @@ fn dedup_bucket(p1: &[P1<'_>], b: usize, st: &mut P2) {
     }
     let mut g = 0;
     for (t, th) in p1.iter().enumerate() {
-        let v = &th.eb[b];
-        for (i, r) in v.iter().enumerate() {
+        for (i, r) in th.eb.iter(b).enumerate() {
             if g + AHEAD < n {
                 prefetch(&st.tab[st.hs[g + AHEAD] as usize & mask]);
             }
@@ -1251,7 +1375,7 @@ fn dedup_bucket(p1: &[P1<'_>], b: usize, st: &mut P2) {
                 if x >> 40 == tag {
                     let wl = (x & ((1 << 40) - 1)) - 1;
                     let (wt, wi) = ((wl >> 32) as usize, (wl & 0xFFFF_FFFF) as usize);
-                    let w = &p1[wt].eb[b][wi];
+                    let w = p1[wt].eb.get(b, wi);
                     if w.eid == r.eid {
                         if r.ingest < w.ingest {
                             st.dead[st.offs[wt] + wi] = true;
@@ -1269,9 +1393,9 @@ fn dedup_bucket(p1: &[P1<'_>], b: usize, st: &mut P2) {
     }
     g = 0;
     for th in p1 {
-        for r in &th.eb[b] {
+        for r in th.eb.iter(b) {
             if !st.dead[g] && r.pk & KEEP != 0 {
-                st.out[r.pid as usize & (NB - 1)].push(Rec { pid: r.pid, ts: r.ts, pk: r.pk, cat: r.cat });
+                st.out.push(r.pid as usize & (NB - 1), Rec { pid: r.pid, ts: r.ts, pk: r.pk, cat: r.cat });
             }
             g += 1;
         }
@@ -1290,6 +1414,7 @@ struct Agg {
     cnt_c: Vec<u32>,
     evs: Vec<EvS>,
     cks: Vec<CkS>,
+    plist: Vec<(u32, u32, u32, u32, u32)>,
     sessions: Vec<Sess>,
     day_groups: Vec<(usize, usize)>,
     cats: Vec<(u16, i64)>,
@@ -1304,18 +1429,18 @@ struct Sess {
 }
 
 /// Person bucket `b`: counting sort of its events and clicks by person, then each person on its own.
-fn bucket_work(ctx: &Ctx, tbl: &Table, ev_src: &[&Vec<Vec<Rec>>], ck_src: &[&Vec<Vec<CRec>>], b: usize, agg: &mut Agg) {
+fn bucket_work(ctx: &Ctx, tbl: &Table, ev_src: &[&Buckets<Rec>], ck_src: &[&Buckets<CRec>], b: usize, agg: &mut Agg) {
     let nloc = (tbl.cap >> 8) + 1;
-    let n_e: usize = ev_src.iter().map(|t| t[b].len()).sum();
+    let n_e: usize = ev_src.iter().map(|t| t.len_of(b)).sum();
     if n_e == 0 {
         return;
     }
-    let n_c: usize = ck_src.iter().map(|t| t[b].len()).sum();
+    let n_c: usize = ck_src.iter().map(|t| t.len_of(b)).sum();
 
     agg.cnt_e.clear();
     agg.cnt_e.resize(nloc, 0);
     for t in ev_src {
-        for r in &t[b] {
+        for r in t.iter(b) {
             agg.cnt_e[(r.pid >> 8) as usize] += 1;
         }
     }
@@ -1329,7 +1454,7 @@ fn bucket_work(ctx: &Ctx, tbl: &Table, ev_src: &[&Vec<Vec<Rec>>], ck_src: &[&Vec
     evs.clear();
     evs.resize(n_e, EvS::default());
     for t in ev_src {
-        for r in &t[b] {
+        for r in t.iter(b) {
             let c = &mut agg.cnt_e[(r.pid >> 8) as usize];
             evs[*c as usize] = EvS { ts: r.ts, pk: r.pk, cat: r.cat };
             *c += 1;
@@ -1339,7 +1464,7 @@ fn bucket_work(ctx: &Ctx, tbl: &Table, ev_src: &[&Vec<Vec<Rec>>], ck_src: &[&Vec
     agg.cnt_c.clear();
     agg.cnt_c.resize(nloc, 0);
     for t in ck_src {
-        for r in &t[b] {
+        for r in t.iter(b) {
             agg.cnt_c[(r.pid >> 8) as usize] += 1;
         }
     }
@@ -1353,7 +1478,7 @@ fn bucket_work(ctx: &Ctx, tbl: &Table, ev_src: &[&Vec<Vec<Rec>>], ck_src: &[&Vec
     cks.clear();
     cks.resize(n_c, CkS { ts: 0, camp: 0, cid: Packed(0) });
     for t in ck_src {
-        for r in &t[b] {
+        for r in t.iter(b) {
             let c = &mut agg.cnt_c[(r.pid >> 8) as usize];
             cks[*c as usize] = CkS { ts: r.ts, camp: r.camp, cid: r.cid };
             *c += 1;
@@ -1361,26 +1486,36 @@ fn bucket_work(ctx: &Ctx, tbl: &Table, ev_src: &[&Vec<Vec<Rec>>], ck_src: &[&Vec
     }
 
     // cnt[li] is now the end of person li's run; its start is the end of li - 1
+    let mut plist = std::mem::take(&mut agg.plist);
+    plist.clear();
     let (mut e0, mut c0) = (0usize, 0usize);
     for li in 0..nloc {
         let (e1, c1) = (agg.cnt_e[li] as usize, agg.cnt_c[li] as usize);
-        let (es, cs) = (e0, c0);
+        if e1 != e0 {
+            plist.push((((li << 8) | b) as u32, e0 as u32, e1 as u32, c0 as u32, c1 as u32));
+        }
         e0 = e1;
         c0 = c1;
-        if e1 == es {
-            continue;
+    }
+    for j in 0..plist.len() {
+        if j + 12 < plist.len() {
+            tbl.prefetch_name(plist[j + 12].0);
         }
-        let pid = ((li << 8) | b) as u32;
-        let ev = &mut evs[es..e1];
+        if j + 6 < plist.len() {
+            tbl.prefetch_key(plist[j + 6].0);
+        }
+        let (pid, es, e1, cs, c1) = plist[j];
+        let ev = &mut evs[es as usize..e1 as usize];
         if ev.len() > 1 {
             ev.sort_unstable_by_key(|e| e.ts);
         }
-        let ck = &mut cks[cs..c1];
+        let ck = &mut cks[cs as usize..c1 as usize];
         if ck.len() > 1 {
             ck.sort_unstable_by_key(|c| c.ts);
         }
         person_work(ctx, pid, tbl.name(pid), ev, ck, agg);
     }
+    agg.plist = plist;
     agg.evs = evs;
     agg.cks = cks;
 }
@@ -1741,11 +1876,12 @@ fn main() {
         .iter()
         .sum()
     };
-    // distinct IDs: every link line adds at most two, usually one; events and clicks about one in 12 lines
-    let mut cap = (link_lines + ev_est * 4 / 5 / 10 + ck_est / 20 + 1024).next_power_of_two();
+    // distinct IDs: about one in 13 event lines (a retry with 4x the room follows if the table fills up)
+    let _ = (link_lines, ck_est);
+    let mut cap = (ev_est * 4 / 5 / 8 + 1024).next_power_of_two();
 
     // 0 + 1. links, then events and clicks: every ID resolves to its person while its line is parsed
-    let (tbl, mut p1) = loop {
+    let (tbl, p1) = loop {
         let tbl: &'static Table = Box::leak(Box::new(Table::new(cap)));
         build_links(tbl, &link_files, threads);
         lap(&format!("links joined ({link_lines} lines, table {cap} slots)"));
@@ -1753,7 +1889,7 @@ fn main() {
         let p1 = par(
             threads,
             ne + ck_chunks.len(),
-            || P1::new(tbl, ctx.base, sized::<R1>(EBK, ev_est, threads), sized::<CRec>(NB, ck_est, threads)),
+            || P1::new(tbl, ctx.base, Buckets::sized(EBK, ev_est, threads), Buckets::sized(NB, ck_est, threads)),
             |st, i| {
                 if i < ne {
                     let (f, s, e) = ev_chunks[i];
@@ -1776,21 +1912,19 @@ fn main() {
     lap(&format!("events and clicks parsed, {} persons known", tbl.used.load(Relaxed)));
 
     // 2. dedup per event_id bucket
+    let n_r1: usize = p1.iter().map(|t| (0..EBK).map(|b| t.eb.len_of(b)).sum::<usize>()).sum();
     let p2 = par(
         threads,
         EBK,
-        || P2 { out: (0..NB).map(|_| Vec::new()).collect(), tab: Vec::new(), hs: Vec::new(), dead: Vec::new(), offs: Vec::new() },
+        || P2 { out: Buckets::sized(NB, n_r1, threads), tab: Vec::new(), hs: Vec::new(), dead: Vec::new(), offs: Vec::new() },
         |st, b| dedup_bucket(&p1, b, st),
     );
-    for t in p1.iter_mut() {
-        t.eb = Vec::new();
-    }
     lap("deduplicated");
 
     // 3. per person bucket
     let width = ctx.ndays;
-    let ev_src: Vec<&Vec<Vec<Rec>>> = p2.iter().map(|s| &s.out).collect();
-    let ck_src: Vec<&Vec<Vec<CRec>>> = p1.iter().map(|s| &s.ck).collect();
+    let ev_src: Vec<&Buckets<Rec>> = p2.iter().map(|s| &s.out).collect();
+    let ck_src: Vec<&Buckets<CRec>> = p1.iter().map(|s| &s.ck).collect();
     let results = par(
         threads,
         NB,
@@ -1804,6 +1938,7 @@ fn main() {
             cnt_c: Vec::new(),
             evs: Vec::new(),
             cks: Vec::new(),
+            plist: Vec::new(),
             sessions: Vec::new(),
             day_groups: Vec::new(),
             cats: Vec::new(),
@@ -2431,12 +2566,12 @@ mod tests {
     }
 
     fn fresh(t: &Table) -> P1<'_> {
-        P1::new(t, ctx().base, (0..EBK).map(|_| Vec::new()).collect(), (0..NB).map(|_| Vec::new()).collect())
+        P1::new(t, ctx().base, Buckets::new(EBK, 64), Buckets::new(NB, 64))
     }
 
     type Flat = Vec<(Vec<u8>, i64, u32, u32, u32, u32)>;
     fn flat(st: &P1) -> Flat {
-        st.eb.iter().flatten().map(|r| (r.eid.get().to_vec(), r.ingest, r.ts, r.pid, r.pk, r.cat)).collect()
+        (0..EBK).flat_map(|b| st.eb.iter(b)).map(|r| (r.eid.get().to_vec(), r.ingest, r.ts, r.pid, r.pk, r.cat)).collect()
     }
 
     #[test]

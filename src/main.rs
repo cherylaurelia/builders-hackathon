@@ -1087,7 +1087,9 @@ fn read_ahead(queue: Vec<(&'static InFile, usize, usize)>, threads: usize) {
     }
     let queue = std::sync::Arc::new(queue);
     let next = std::sync::Arc::new(AtomicUsize::new(0));
-    for _ in 0..threads.div_ceil(2) {
+    // two threads: the kernel takes each 128 KiB hint at once, so more only crowd the parse threads (box, cold, 20M:
+    // 1 thread 0.41 s, 2 threads 0.40 s, 3 threads 0.45 s, 4 threads 0.49 s, 16 sendfile threads 0.48 s)
+    for _ in 0..threads.div_ceil(4) {
         let (queue, next) = (queue.clone(), next.clone());
         // never joined: these only start reads, and the end of the process ends them. A thread that cannot start,
         // or a hint the kernel refuses, costs speed only: every byte is still read by `read_span`.

@@ -1278,8 +1278,9 @@ fn main() {
     }
     write_outputs(&out, &user_parts, &camp_rows, &cat_names, threads);
     lap(&format!("written: {} user rows, {} campaign rows", user_parts.iter().map(|p| p.len()).sum::<usize>(), camp_rows.len()));
-    // everything is on disk: no destructors, the memory is released in parallel
-    fast_exit(threads)
+    // everything is on disk: no destructors. TEMPORARY: the parallel zap in fast_exit crashes (SIGSEGV, ~1 in 1500 small runs), so exit plainly.
+    let _ = threads;
+    std::process::exit(0)
 }
 
 /// Per user_id bucket: every linked ID -> (its person's name, hash(name)). All stages run on `threads` threads.

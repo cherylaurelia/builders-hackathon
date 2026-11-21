@@ -1822,20 +1822,21 @@ fn main() {
 /// key, any other ID in a byte-string map.
 struct IdMap {
     slots: Vec<(u64, u16)>, // key 0 = empty
+    shift: u32,             // a key's home: (key * golden ratio) >> shift
     other: BytesMap<u16>,
 }
 
 impl IdMap {
     fn new(ids: &[(Bytes, u16)]) -> IdMap {
         let cap = (ids.len() * 2).next_power_of_two().max(16);
-        let mut m = IdMap { slots: vec![(0, 0); cap], other: BytesMap::default() };
+        let mut m = IdMap { slots: vec![(0, 0); cap], shift: 64 - cap.trailing_zeros(), other: BytesMap::default() };
         for &(id, v) in ids {
             match pack(id) {
                 0 => {
                     m.other.insert(id, v);
                 }
                 k => {
-                    let mut i = mix(k) as usize & (cap - 1);
+                    let mut i = m.home(k);
                     while m.slots[i].0 != 0 {
                         i = (i + 1) & (cap - 1);
                     }
@@ -1846,10 +1847,16 @@ impl IdMap {
         m
     }
 
+    /// One multiply; the high bits of the product depend on every bit of the key.
+    #[inline(always)]
+    fn home(&self, k: u64) -> usize {
+        (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
+    }
+
     #[inline(always)]
     fn packed(&self, k: u64) -> Option<u16> {
         let mask = self.slots.len() - 1;
-        let mut i = mix(k) as usize & mask;
+        let mut i = self.home(k);
         loop {
             // SAFETY: i <= mask
             let (key, v) = unsafe { *self.slots.get_unchecked(i) };

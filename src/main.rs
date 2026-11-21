@@ -1736,7 +1736,8 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
 
 // ---------------------------------------------------------------- records
 
-/// A valid, non-late event in its person partition. `person` = `DROPPED` once dedup finds an earlier copy.
+/// A valid, non-late event in its person partition. `ts` and `pay` are 0 once dedup finds an earlier copy: no
+/// event of the window has ts 0 (the window starts 7 days after `Ctx::base`).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ERec {
@@ -1744,7 +1745,6 @@ struct ERec {
     ts: u32,  // ms after `Ctx::base`
     pay: u32, // 0, or category << 24 | price_cents for a purchase
 }
-const DROPPED: u32 = u32::MAX;
 
 /// One parsed event line in its event-key bucket, 16 bytes: `loc` is its `ERec` (`loc_of`), 0 for an invalid or
 /// late event (it still takes part in dedup); `ing` is its ingest_ts (`Ctx::ing`).
@@ -2718,40 +2718,53 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
             if n >= u32::MAX as usize {
                 die("too many events in one event-key bucket");
             }
-            // 8 slots a record, 32 slots a word: "seen" in the low half, "again" in the high half
+            // 8 slots a record, 64 slots a word: the words of "seen" bits, then as many of "again" bits
             let sbits = (n * 8).next_power_of_two().trailing_zeros().clamp(6, 64 - qb);
-            let shift = 64 - sbits;
+            let words = 1usize << (sbits - 6);
             seen.clear();
-            seen.resize(1 << (sbits - 5), 0);
-            let wp = seen.as_mut_ptr();
-            let slot = |key: u64| ((spread(key) << qb) >> shift) as usize;
-            // SAFETY (both passes): a slot is below 2^sbits, so its word is one of the 2^(sbits - 5)
+            seen.resize(2 * words, 0);
+            // A record's slot is the sbits bits of its hash below the qb bits of its bucket, and those are b for
+            // every record here: the hash shifted down to the slot still has b in front, which a base as many
+            // words back takes away. So one shift gives the bit (its low 6 bits) and the word (the rest).
+            let s0 = 64 - qb - sbits;
+            let wb = seen.as_mut_ptr().wrapping_sub(b << (sbits - 6));
+            // SAFETY (both passes): hash >> s0 is b << sbits | slot, so the word is one of the first `words` of
+            // `seen`, and the one `words` further one of the rest
+            let first = |r: &LRec| unsafe {
+                let x = spread(r.key) >> s0;
+                let w = wb.wrapping_add((x >> 6) as usize);
+                let (v, t) = (*w, 1u64 << (x & 63));
+                *w = v | t;
+                *w.add(words) |= v & t;
+            };
             for s in shards {
                 for blk in s.lg[b].slices(LG_BLOCK) {
-                    for r in blk {
-                        let x = slot(r.key);
-                        unsafe {
-                            let w = wp.add(x >> 5);
-                            let (v, t) = (*w, 1u64 << (x & 31));
-                            *w = v | t | (v & t) << 32;
-                        }
+                    let mut pairs = blk.chunks_exact(2);
+                    for p in &mut pairs {
+                        first(&p[0]);
+                        first(&p[1]);
                     }
+                    pairs.remainder().iter().for_each(first);
                 }
             }
             cand.clear();
             cand.reserve(n);
             let cp = cand.as_mut_ptr();
             let mut c = 0;
+            // SAFETY: c < n, the room reserved: every record is written, and kept when its slot says "again"
+            let mut second = |r: &LRec| unsafe {
+                let x = spread(r.key) >> s0;
+                *cp.add(c) = *r;
+                c += (*wb.wrapping_add((x >> 6) as usize).add(words) >> (x & 63) & 1) as usize;
+            };
             for s in shards {
                 for blk in s.lg[b].slices(LG_BLOCK) {
-                    for r in blk {
-                        let x = slot(r.key);
-                        // SAFETY: c < n, the room reserved: every record is written, and kept when its slot says "again"
-                        unsafe {
-                            *cp.add(c) = *r;
-                            c += (*wp.add(x >> 5) >> (32 + (x & 31)) & 1) as usize;
-                        }
+                    let mut pairs = blk.chunks_exact(2);
+                    for p in &mut pairs {
+                        second(&p[0]);
+                        second(&p[1]);
                     }
+                    pairs.remainder().iter().for_each(&mut second);
                 }
             }
             // SAFETY: the first c entries are written
@@ -2789,7 +2802,8 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
                         };
                         if lost.loc != 0 {
                             // SAFETY: the address of an ERec in a live arena; no other thread touches this record now
-                            unsafe { (*rec_at(abase, lost.loc)).person = DROPPED };
+                            // dropped: ts and pay 0, an event of bin 0 that is not a purchase (person_work)
+                            unsafe { ((rec_at(abase, lost.loc) as *mut u8).add(4) as *mut u64).write_unaligned(0) };
                         }
                         break;
                     }
@@ -2830,6 +2844,16 @@ struct Bin {
 }
 const FREE_BIN: Bin = Bin { min: u32::MAX, max: 0, cnt: 0, sess: 0 };
 
+/// A session of the person at hand.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Ses {
+    start: u32, // ms after `Ctx::base`
+    d: u32,     // day of the window
+    row: u32,   // its row, counted from the person's first
+    rev: i64,   // revenue
+}
+
 /// A session of a person with more than 64 clicks (`credit_big`).
 struct Sess {
     start: i64, // ms after `Ctx::base`
@@ -2857,18 +2881,17 @@ struct Work {
     bins: Vec<Bin>, // the bins of the person at hand (all free between people)
     bits: Vec<u64>, // which bins are taken
     purch: Vec<(u32, u32)>, // (bin, pay) of the person's purchases
-    // the sessions of the person at hand: start (ms after `Ctx::base`), day of the window, row, revenue
-    ss: Vec<u32>,
-    sd: Vec<u32>,
-    sr: Vec<u32>,
-    srev: Vec<i64>,
+    // the sessions of the person at hand
+    ses: Vec<Ses>,
     dcats: Vec<(u32, u16, i64)>, // (row, category, price sum)
     best: Vec<i64>,              // price sum of a row's top category
     eq: [u64; 64],               // per click of the person at hand, the clicks of the same campaign
     // people with more than 64 clicks
     cks: Vec<Ck>,
     sessions: Vec<Sess>,
-    day_groups: Vec<(usize, usize)>, // (d, first session index)
+    sbit: Vec<u64>, // the 30-minute bins a session of the person starts in
+    spre: Vec<u32>, // per word of `sbit`, the bits of the words before it
+    sday: Vec<u32>, // per day, and past the last: the person's sessions that start before it
     stamp: Vec<bool>,
     iv: Vec<(i64, i64)>,
     seen: Vec<u32>,
@@ -2898,16 +2921,15 @@ impl Work {
             bins: vec![FREE_BIN; nbins],
             bits: vec![0; nbins / 64 + 1],
             purch: Vec::new(),
-            ss: vec![0; nbins + 1],
-            sd: vec![0; nbins + 1],
-            sr: vec![0; nbins + 1],
-            srev: vec![0; nbins + 1],
+            ses: vec![Ses { start: 0, d: 0, row: 0, rev: 0 }; nbins + 1],
             dcats: Vec::new(),
             best: vec![0; nbins + 1],
             eq: [0; 64],
             cks: Vec::new(),
             sessions: Vec::new(),
-            day_groups: Vec::new(),
+            sbit: vec![0; nbins / 64 + 1],
+            spre: vec![0; nbins / 64 + 1],
+            sday: vec![0; cx.ndays + 2],
             stamp: vec![false; cx.ncamp + 1],
             iv: vec![(0, 0); cx.ncamp + 1],
             seen: filled(cx.ncamp + 1, 0),
@@ -3020,20 +3042,68 @@ unsafe fn same_campaign(camp: *const u32, nc: usize, eq: &mut [u64; 64]) {
     }
 }
 
+/// The counts of a counting sort into offsets: `st[l + 2]` counts bin l, for l in 0..=local (`local` a multiple of
+/// 8), and `st[l + 1]` becomes the number of entries in the bins before l. Returns that number for all bins, and
+/// how many of the bins 0..local are not empty: those are listed in `act` (unless it is null; room for `local`).
+unsafe fn offsets(st: *mut u32, local: usize, act: *mut u32) -> (u32, usize) {
+    #[allow(unused_assignments)]
+    let mut run = 0u32;
+    let mut na = 0;
+    let mut l = 0;
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        // eight bins a step: the running sums inside the vector by shifts, then the sum of the bins before
+        let high = _mm256_setr_epi32(0, 0, 0, 0, -1, -1, -1, -1);
+        let (three, seven) = (_mm256_set1_epi32(3), _mm256_set1_epi32(7));
+        let mut before = _mm256_setzero_si256();
+        while l < local {
+            let c = _mm256_loadu_si256(st.add(l + 2) as *const __m256i);
+            let x = _mm256_add_epi32(c, _mm256_slli_si256(c, 4));
+            let x = _mm256_add_epi32(x, _mm256_slli_si256(x, 8)); // sums within each half
+            let x = _mm256_add_epi32(x, _mm256_and_si256(_mm256_permutevar8x32_epi32(x, three), high));
+            _mm256_storeu_si256(st.add(l + 1) as *mut __m256i, _mm256_add_epi32(before, _mm256_sub_epi32(x, c)));
+            before = _mm256_add_epi32(before, _mm256_permutevar8x32_epi32(x, seven));
+            if !act.is_null() {
+                let mut m = !(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(c, _mm256_setzero_si256()))) as u32) & 0xff;
+                while m != 0 {
+                    *act.add(na) = (l as u32) + m.trailing_zeros();
+                    na += 1;
+                    m &= m - 1;
+                }
+            }
+            l += 8;
+        }
+        run = _mm256_cvtsi256_si32(before) as u32;
+    }
+    while l <= local {
+        let c = *st.add(l + 2);
+        *st.add(l + 1) = run;
+        run += c;
+        if !act.is_null() && c != 0 && l != local {
+            *act.add(na) = l as u32;
+            na += 1;
+        }
+        l += 1;
+    }
+    (run, na)
+}
+
 /// rules.md "Events" 5-7 and "Clicks" 4-7 for person partition `p`: the people whose slot number starts with p.
+#[inline(never)]
 fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     let local = 1usize << cx.pshift;
     let lmask = (local - 1) as u32;
 
-    // events: counting sort by person (the low bits of the slot number), with no branch and no bounds check. A
-    // dropped copy goes to person `local`, a bin past the real ones whose events are never read. `start[l + 2]`
-    // counts person l; then `start[l + 1]` is where l's events begin, and moves to their end as they are placed, so
-    // afterwards person l has `start[l]..start[l + 1]`.
+    // events: counting sort by person (the low bits of the slot number), with no branch and no bounds check; a
+    // dropped copy stays with its person (person_work leaves it out). `start[l + 2]` counts person l; then
+    // `start[l + 1]` is where l's events begin, and moves to their end as they are placed, so afterwards person l
+    // has `start[l]..start[l + 1]`. An event goes as its ts and pay in one word, ts low.
     let st = w.start.as_mut_ptr();
     let lm = lmask as usize;
     // SAFETY: start and cstart hold local + 3 entries, and every index below is at most local + 2
     unsafe {
-        let ev_bin = |r: &ERec| if r.person == DROPPED { local } else { r.person as usize & lm };
+        let ev_bin = |r: &ERec| r.person as usize & lm;
         std::ptr::write_bytes(st, 0, local + 3);
         for s in shards {
             for blk in s.ev[p].slices(EV_BLOCK) {
@@ -3042,18 +3112,8 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
                 }
             }
         }
-        // the people with events, listed as the counts turn into offsets (no branch: every person is written to
-        // the list, and stays when it has events)
-        let act = w.act.as_mut_ptr();
-        let mut na = 0;
-        let mut run = 0;
-        for l in 0..=local {
-            let c = *st.add(l + 2);
-            *st.add(l + 1) = run;
-            run += c;
-            *act.add(na) = l as u32;
-            na += (c != 0 && l != local) as usize;
-        }
+        // the counts turn into offsets, and the people with events are listed
+        let (run, na) = offsets(st, local, w.act.as_mut_ptr());
         if na == 0 {
             return;
         }
@@ -3066,7 +3126,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
             for blk in s.ev[p].slices(EV_BLOCK) {
                 for r in blk {
                     let f = st.add(ev_bin(r) + 1);
-                    *ev.add(*f as usize) = (r.ts as u64) << 32 | r.pay as u64;
+                    *ev.add(*f as usize) = ((r as *const ERec as *const u8).add(4) as *const u64).read_unaligned();
                     *f += 1;
                 }
             }
@@ -3086,12 +3146,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
                 }
             }
         }
-        let mut run = 0;
-        for l in 0..=local {
-            let c = *ct.add(l + 2);
-            *ct.add(l + 1) = run;
-            run += c;
-        }
+        let (run, _) = offsets(ct, local, std::ptr::null_mut());
         // 8 entries past the last click: the vector loads of the last person's clicks read them
         let room = run as usize + 8;
         if w.cts.len() < room {
@@ -3125,101 +3180,115 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     w.ev = ev;
 }
 
-/// One person: `evs` = their surviving events as `ts << 32 | pay`; their `nc` valid clicks are the entries from
-/// `ca` of `w.cts`, `w.ccamp` and `w.ccid`, in any order.
-fn person_work(cx: &Ctx, name: u64, evs: &[u64], ca: usize, nc: usize, w: &mut Work) {
-    let width = cx.ndays;
-    let organic = cx.ncamp;
-    let nbins = w.bins.len();
-    let day0 = cx.day0 as i32;
-    let doff = w.doff;
-
-    // The events go into their 30-minute bins through raw pointers taken once (the vectors' fields would be
-    // reloaded from memory after every store), with no bounds checks (an event's ts is below we - base, so its bin
-    // is below bins.len()), and every event is written to the purchase list, which only keeps the ones with a
-    // price. `wm` = the words of `bits` with a bin taken.
-    w.purch.clear();
-    w.purch.reserve(evs.len());
-    w.rows.reserve(nbins + 1); // a row per session at most, and one being written
-    let (bp, wp, pp) = (w.bins.as_mut_ptr(), w.bits.as_mut_ptr(), w.purch.as_mut_ptr());
+/// A person's events into their 30-minute bins: returns (the purchases written to `pp`, the words of the bitmap
+/// at `wp` with a bin taken). `e` = ts | pay << 32. On its own, with nothing else to keep in registers.
+///
+/// SAFETY: every ts / GAP is a bin of `bp` and a bit of `wp`, in one of its first 64 words; `pp` has room for
+/// `evs.len()` entries.
+#[inline(never)]
+unsafe fn bin_events(evs: &[u64], bp: *mut Bin, wp: *mut u64, pp: *mut (u32, u32)) -> (usize, u64) {
     let mut np = 0;
     let mut wm = 0u64;
     for &e in evs {
-        let ts = (e >> 32) as u32;
+        let (ts, pay) = (e as u32, (e >> 32) as u32);
         let b = (ts / GAP as u32) as usize;
-        debug_assert!(b < nbins && b >> 6 < w.bits.len() && b >> 6 < 64);
-        // SAFETY: b < bins.len() and b / 64 < bits.len() (above), np < evs.len() <= purch's capacity
-        unsafe {
-            let bin = &mut *bp.add(b);
-            bin.cnt += 1;
-            bin.min = bin.min.min(ts);
-            bin.max = bin.max.max(ts);
-            *wp.add(b >> 6) |= 1 << (b & 63);
-            *pp.add(np) = (b as u32, e as u32);
-        }
+        let bin = &mut *bp.add(b);
+        bin.cnt += 1;
+        bin.min = bin.min.min(ts);
+        bin.max = bin.max.max(ts);
+        *wp.add(b >> 6) |= 1 << (b & 63);
         wm |= 1 << (b >> 6);
-        np += (e as u32 != 0) as usize;
+        // every event is written to the purchase list, which only keeps the ones with a price
+        *pp.add(np) = (b as u32, pay);
+        np += (pay != 0) as usize;
     }
+    (np, wm)
+}
 
-    // The taken bins in order are the sessions, and the sessions in order the rows (one per day with a session
-    // start), with no data-dependent branch: the next session and the next row are written at every bin, and kept
-    // (the count moves past them) when the bin starts one.
-    let row0 = w.rows.len();
-    let (rp, ssp, sdp, srp, svp) = (w.rows.as_mut_ptr(), w.ss.as_mut_ptr(), w.sd.as_mut_ptr(), w.sr.as_mut_ptr(), w.srev.as_mut_ptr());
-    let mut nr = row0;
-    let mut ns = 0usize;
+/// The taken bins in order are the sessions, and the sessions in order the rows (one per day with a session
+/// start), with no data-dependent branch: the next session and the next row are written at every bin, and kept
+/// (the count moves past them) when the bin starts one. Frees the bins and the bitmap; returns (sessions written
+/// from `sp`, rows written from `rp`).
+///
+/// SAFETY: `wm` = the words of `wp` that are not zero; `sp` has room for a session per taken bin + 1 and `rp` for
+/// as many rows; `doff` + a bin's min is not negative.
+#[inline(never)]
+unsafe fn scan_bins(bp: *mut Bin, wp: *mut u64, mut wm: u64, sp: *mut Ses, rp: *mut UserRow, name: u64, day0: i32, doff: i64) -> (usize, usize) {
+    let (mut ns, mut nr) = (0usize, 0usize);
     let mut prev_max = i64::MIN / 2;
     let mut prev_d = u32::MAX;
-    // SAFETY: a bin index is below nbins; ns and nr - row0 count taken bins that start a session, so ns <= nbins
-    // (the session arrays hold nbins + 1) and nr <= row0 + nbins (the rows have room for nbins + 1 more); the
-    // first bin starts a session and a row, so ns - 1 and nr - 1 are entries written here
-    unsafe {
-        while wm != 0 {
-            let wi = wm.trailing_zeros() as usize;
-            wm &= wm - 1;
-            let mut m = *wp.add(wi);
-            *wp.add(wi) = 0;
-            loop {
-                let b = wi * 64 + m.trailing_zeros() as usize;
-                m &= m - 1;
-                let bin = *bp.add(b);
-                let mn = bin.min;
-                let new = (mn as i64 - prev_max > GAP) as usize;
-                prev_max = bin.max as i64;
-                // an event's ts is at or after the window start, which is at or after the midnight of day 0
-                let d = ((mn as i64 + doff) as u32) / DAY as u32;
-                let new_row = new & (d != prev_d) as usize;
-                prev_d = if new != 0 { d } else { prev_d };
-                *ssp.add(ns) = mn;
-                *sdp.add(ns) = d;
-                *svp.add(ns) = 0;
-                ns += new;
-                rp.add(nr).write(UserRow { name, revenue: 0, sessions: 0, events: 0, day: day0 + d as i32, top: NO_CAT });
-                nr += new_row;
-                let r = &mut *rp.add(nr - 1);
-                r.sessions += new as u32;
-                r.events += bin.cnt;
-                *srp.add(ns - 1) = (nr - 1) as u32;
-                *bp.add(b) = Bin { sess: (ns - 1) as u32, ..FREE_BIN };
-                if m == 0 {
-                    break;
-                }
+    while wm != 0 {
+        let wi = wm.trailing_zeros() as usize;
+        wm &= wm - 1;
+        let mut m = *wp.add(wi);
+        *wp.add(wi) = 0;
+        loop {
+            let b = wi * 64 + m.trailing_zeros() as usize;
+            m &= m - 1;
+            let bin = *bp.add(b);
+            let mn = bin.min;
+            let new = (mn as i64 - prev_max > GAP) as usize;
+            prev_max = bin.max as i64;
+            // an event's ts is at or after the window start, which is at or after the midnight of day 0
+            let d = ((mn as i64 + doff) as u32) / DAY as u32;
+            let new_row = new & (d != prev_d) as usize;
+            prev_d = if new != 0 { d } else { prev_d };
+            sp.add(ns).write(Ses { start: mn, d, row: 0, rev: 0 });
+            ns += new;
+            rp.add(nr).write(UserRow { name, revenue: 0, sessions: 0, events: 0, day: day0 + d as i32, top: NO_CAT });
+            nr += new_row;
+            // the first bin starts a session and a row, so ns - 1 and nr - 1 are entries written here
+            let r = &mut *rp.add(nr - 1);
+            r.sessions += new as u32;
+            r.events += bin.cnt;
+            (*sp.add(ns - 1)).row = (nr - 1) as u32;
+            *bp.add(b) = Bin { sess: (ns - 1) as u32, ..FREE_BIN };
+            if m == 0 {
+                break;
             }
         }
-        w.rows.set_len(nr);
     }
+    (ns, nr)
+}
+
+/// One person: `evs` = their events as `ts | pay << 32`, a dropped copy as 0; their `nc` valid clicks are the
+/// entries from `ca` of `w.cts`, `w.ccamp` and `w.ccid`, in any order.
+#[inline(never)]
+fn person_work(cx: &Ctx, name: u64, evs: &[u64], ca: usize, nc: usize, w: &mut Work) {
+    let nbins = w.bins.len();
+    w.purch.clear();
+    w.purch.reserve(evs.len());
+    w.rows.reserve(nbins + 1); // a row per session at most, and one being written
+    let row0 = w.rows.len();
+    debug_assert!(evs.iter().all(|&e| ((e as u32 / GAP as u32) as usize) < nbins) && nbins <= 64 * 64 && w.bits.len() * 64 >= nbins);
+    // SAFETY: an event's ts is below we - base, so its bin is below bins.len(), a bit of bits, which has at most
+    // 64 words (the window is under 2^32 ms); purch has room for every event. The sessions (at most one per
+    // taken bin, and `ses` holds nbins + 1) and the rows (room for nbins + 1 past row0) are written in order.
+    let (np, ns) = unsafe {
+        let (bp, wp) = (w.bins.as_mut_ptr(), w.bits.as_mut_ptr());
+        let (np, mut wm) = bin_events(evs, bp, wp, w.purch.as_mut_ptr());
+        // the dropped copies are in bin 0 (ts 0), which no event of the window is in (it starts 7 days after
+        // `Ctx::base`): out of the bitmap, and out of `wm` when its word is left empty
+        *bp = FREE_BIN;
+        let w0 = *wp & !1;
+        *wp = w0;
+        wm &= !((w0 == 0) as u64);
+        let (ns, nr) = scan_bins(bp, wp, wm, w.ses.as_mut_ptr(), w.rows.as_mut_ptr().add(row0), name, cx.day0 as i32, w.doff);
+        w.rows.set_len(row0 + nr);
+        w.purch.set_len(np);
+        (np, ns)
+    };
 
     // purchases: into their session and row; then each row's top category
     if np != 0 {
-        // SAFETY: the first np entries are written
-        unsafe { w.purch.set_len(np) };
-        let Work { rows, purch, bins, sr, srev, dcats, best, .. } = w;
+        let Work { rows, purch, bins, ses, dcats, best, .. } = w;
+        let rows = &mut rows[row0..];
         dcats.clear();
         for &(b, pay) in purch.iter() {
-            let si = bins[b as usize].sess as usize;
+            let s = &mut ses[bins[b as usize].sess as usize];
             let (price, cat) = ((pay & 0xff_ffff) as i64, (pay >> 24) as u16);
-            srev[si] += price;
-            let g = sr[si];
+            s.rev += price;
+            let g = s.row;
             rows[g as usize].revenue += price;
             match dcats.iter_mut().find(|c| c.0 == g && c.1 == cat) {
                 Some(c) => c.2 += price,
@@ -3229,7 +3298,7 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], ca: usize, nc: usize, w: &mut W
         // the highest sum; a tie goes to the category that sorts first
         let rank = &cx.cat_rank;
         for &(g, cat, sum) in dcats.iter() {
-            let (r, top) = (&mut rows[g as usize], &mut best[g as usize - row0]);
+            let (r, top) = (&mut rows[g as usize], &mut best[g as usize]);
             if r.top == NO_CAT || sum > *top || (sum == *top && rank[cat as usize] < rank[r.top as usize]) {
                 r.top = cat;
                 *top = sum;
@@ -3239,39 +3308,50 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], ca: usize, nc: usize, w: &mut W
     }
 
     // credit and assists
-    if nc > 64 {
-        return credit_big(cx, ca, nc, ns, w);
-    }
-    let Work { cred, rev, assist, ss, sd, srev, cts, ccamp, ccid, eq, .. } = w;
-    let mut credit = |camp: usize, d: usize, revenue: i64| {
-        // SAFETY: camp <= ncamp and d < ndays: a cell of the (ncamp + 1) * ndays
-        let a = unsafe { cred.get_unchecked_mut(camp * width + d) };
-        a.sessions += 1;
-        a.purchasing += (revenue != 0) as u32;
-        if revenue != 0 {
-            // apart from the counts: most sessions buy nothing, and the cells every session touches stay half as big
-            rev[camp * width + d] += revenue;
-        }
-    };
     if nc == 0 {
-        for s in 0..ns {
-            credit(organic, sd[s] as usize, srev[s]);
+        let Work { cred, rev, ses, .. } = w;
+        let (width, organic) = (cx.ndays, cx.ncamp);
+        for s in &ses[..ns] {
+            credit(cred, rev, organic * width + s.d as usize, s.rev);
         }
-        return;
+    } else if nc <= 64 {
+        credit_clicks(cx, ca, nc, ns, w);
+    } else {
+        credit_big(cx, ca, nc, ns, w);
     }
-    // Up to 64 clicks, in the order they were read: per session, vector passes find the clicks of its 7-day window
-    // [start - 7d, start] and the latest of them, which takes the credit; the assists go to one click of each
-    // campaign in the window.
-    debug_assert!(ca + nc + 8 <= cts.len());
+}
+
+/// A session credited to the campaign and day of cell `at`.
+#[inline(always)]
+fn credit(cred: &mut [Cred], rev: &mut [i64], at: usize, revenue: i64) {
+    let a = &mut cred[at];
+    a.sessions += 1;
+    a.purchasing += (revenue != 0) as u32;
+    if revenue != 0 {
+        // apart from the counts: most sessions buy nothing, and the cells every session touches stay half as big
+        rev[at] += revenue;
+    }
+}
+
+/// Credit and assists of the `ns` sessions of a person with 1 to 64 clicks (`nc`, from `ca`), in the order they
+/// were read: per session, vector passes find the clicks of its 7-day window [start - 7d, start] and the latest of
+/// them, which takes the credit; the assists go to one click of each campaign in the window.
+#[inline(never)]
+fn credit_clicks(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
+    let (width, organic) = (cx.ndays, cx.ncamp);
+    let Work { cred, rev, assist, ses, cts, ccamp, ccid, eq, .. } = w;
+    assert!(ca + nc + 8 <= cts.len() && cts.len() == ccamp.len() && nc <= 64);
     // SAFETY: the click arrays hold 8 entries past the partition's last click (partition_work)
     let (tp, cp, ip) = unsafe { (cts.as_ptr().add(ca), ccamp.as_ptr().add(ca), ccid.as_ptr().add(ca)) };
     unsafe { same_campaign(cp, nc, eq) };
     let adummy = assist.len() - 4; // absorbs the increments of the unused steps
-    for s in 0..ns {
-        let d = sd[s] as usize;
-        // SAFETY: as above; a bit of m or e is below nc, the index of one of the person's clicks
+    let ap = assist.as_mut_ptr();
+    for s in &ses[..ns] {
+        let d = s.d as usize;
+        // SAFETY: as above; a bit of m or e is below nc, the index of one of the person's clicks; a campaign is
+        // below ncamp and d below ndays, a cell of `assist`
         unsafe {
-            let (m, e) = click_window(tp, nc, ss[s]);
+            let (m, e) = click_window(tp, nc, s.start);
             let mut best = (e.trailing_zeros() & 63) as usize;
             if e & e.wrapping_sub(1) != 0 {
                 // a tie in ts -> smallest click_id
@@ -3291,7 +3371,7 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], ca: usize, nc: usize, w: &mut W
                 ($n:expr) => {
                     let j = (c.trailing_zeros() & 63) as usize;
                     let at = if c != 0 { *cp.add(j) as usize * width + d } else { adummy + $n };
-                    *assist.get_unchecked_mut(at) += 1;
+                    *ap.add(at) += 1;
                     c &= !*eq.get_unchecked(j);
                 };
             }
@@ -3301,7 +3381,7 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], ca: usize, nc: usize, w: &mut W
             while c != 0 {
                 bump!(3);
             }
-            credit(camp, d, srev[s]);
+            credit(cred, rev, camp * width + d, s.rev);
         }
     }
 }
@@ -3312,20 +3392,13 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], ca: usize, nc: usize, w: &mut W
 fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
     let width = cx.ndays;
     let organic = cx.ncamp;
-    let Work { cred, rev, assist, stamp, iv, seen, sctr, sessions, day_groups, touched, cks, ss, sd, srev, cts, ccamp, ccid, .. } = w;
+    let Work { cred, rev, assist, stamp, iv, seen, sctr, sessions, touched, cks, ses, cts, ccamp, ccid, sbit, spre, sday, .. } = w;
     cks.clear();
     cks.extend((ca..ca + nc).map(|i| Ck { k: (cts[i] as u64) << 32 | ccamp[i] as u64, cid: ccid[i] }));
     cks.sort_unstable_by_key(|c| c.k);
     let cs: &[Ck] = cks;
     sessions.clear();
-    day_groups.clear();
-    for s in 0..ns {
-        let d = sd[s] as usize;
-        if day_groups.last().map_or(true, |g| g.0 != d) {
-            day_groups.push((d, s));
-        }
-        sessions.push(Sess { start: ss[s] as i64, d, purchased: srev[s] != 0, revenue: srev[s] });
-    }
+    sessions.extend(ses[..ns].iter().map(|s| Sess { start: s.start as i64, d: s.d as usize, purchased: s.rev != 0, revenue: s.rev }));
 
     let cts = |c: &Ck| (c.k >> 32) as i64;
     let ccamp = |c: &Ck| (c.k & 0xffff_ffff) as usize;
@@ -3393,19 +3466,43 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
             }
             credit(camp, s);
         }
-        // assists: a click at t assists sessions starting in [t, t + 7d]; merge per campaign
-        let flush = |assist: &mut [u32], k: usize, lo: i64, hi: i64, sessions: &[Sess], day_groups: &[(usize, usize)]| {
-            let a = sessions.partition_point(|s| s.start < lo);
-            let b = sessions.partition_point(|s| s.start <= hi);
+        // assists: a click at t assists sessions starting in [t, t + 7d]; merge per campaign. The sessions of an
+        // interval without a search: at most one session starts in a 30-minute bin (two starts are more than 30
+        // minutes apart), so the sessions before a time are the ones before its bin (the bits of `sbit` before it:
+        // `spre` of its word and a count within the word), plus the one of its bin when that starts before it; and
+        // the sessions of a day are the ones between `sday` of it and of the next.
+        sbit.fill(0);
+        for s in &ses[..ns] {
+            let b = (s.start / GAP as u32) as usize;
+            sbit[b >> 6] |= 1 << (b & 63);
+        }
+        let mut acc = 0;
+        for (x, w) in spre.iter_mut().zip(sbit.iter()) {
+            *x = acc;
+            acc += w.count_ones();
+        }
+        let nb = sbit.len() * 64;
+        let (sbit, spre): (&[u64], &[u32]) = (sbit, spre);
+        // the sessions that start before bin b
+        let before = |b: usize| if b >= nb { ns } else { (spre[b >> 6] + (sbit[b >> 6] & ((1u64 << (b & 63)) - 1)).count_ones()) as usize };
+        let mut j = 0;
+        for (d, x) in sday.iter_mut().enumerate() {
+            while j < ns && (ses[j].d as usize) < d {
+                j += 1;
+            }
+            *x = j as u32;
+        }
+        let (ses, sday): (&[Ses], &[u32]) = (&ses[..ns], sday);
+        let flush = |assist: &mut [u32], k: usize, lo: i64, hi: i64| {
+            let mut a = before((lo / GAP) as usize);
+            a += (a < ns && (ses[a].start as i64) < lo) as usize;
+            let mut b = before((hi / GAP) as usize);
+            b += (b < ns && ses[b].start as i64 <= hi) as usize;
             if a >= b {
                 return;
             }
-            for (g, &(d, first)) in day_groups.iter().enumerate() {
-                let end = day_groups.get(g + 1).map(|x| x.1).unwrap_or(sessions.len());
-                let n = end.min(b) as i64 - first.max(a) as i64;
-                if n > 0 {
-                    assist[k * width + d] += n as u32;
-                }
+            for d in ses[a].d as usize..=ses[b - 1].d as usize {
+                assist[k * width + d] += (sday[d + 1] as usize).min(b) as u32 - (sday[d] as usize).max(a) as u32;
             }
         };
         touched.clear();
@@ -3420,13 +3517,13 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
                 iv[k].1 = t + WEEK;
             } else {
                 let (lo, hi) = iv[k];
-                flush(assist, k, lo, hi, sessions, day_groups);
+                flush(assist, k, lo, hi);
                 iv[k] = (t, t + WEEK);
             }
         }
         for &k in touched.iter() {
             let (lo, hi) = iv[k];
-            flush(assist, k, lo, hi, sessions, day_groups);
+            flush(assist, k, lo, hi);
             stamp[k] = false;
         }
     }

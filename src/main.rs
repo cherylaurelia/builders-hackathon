@@ -267,19 +267,7 @@ impl Interner {
         }
     }
 
-    /// `key` of the `len` bytes at `p` (16 bytes must be readable).
-    #[inline(always)]
-    unsafe fn key_at(&self, p: *const u8, len: usize) -> u64 {
-        if len <= 10 {
-            let k = pack16(load16(p, len), len);
-            if k != 0 {
-                return k;
-            }
-        }
-        self.intern(std::slice::from_raw_parts(p, len))
-    }
-
-    /// `key_at` given `pack2`'s answer for the ID (0 = it does not pack).
+    /// The key of the `len` bytes at `p`, given `pack2`'s answer for them (0 = they do not pack).
     #[inline(always)]
     unsafe fn key_or(&self, packed: u64, p: *const u8, len: usize) -> u64 {
         if packed != 0 {

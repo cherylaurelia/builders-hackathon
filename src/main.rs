@@ -774,14 +774,17 @@ struct RawClick {
 const KEEP: u32 = 1 << 26;
 
 /// An event line on its way to dedup, in its event_id bucket. `pk` = price | kind << 24 | KEEP.
+/// The event_id is identified by 89 bits: its hash `eh`, 16 bits of a second hash in the top half of `ch`, and
+/// 9 more (those pick the bucket); `ch` = category | second hash << 16. A collision of two different
+/// event_ids has probability ~1e-14.
 #[derive(Clone, Copy)]
 struct R1 {
-    eid: SStr,
+    eh: u64,
     ingest: i64,
     ts: u32, // ms after ws - 7 days
     pid: u32,
     pk: u32,
-    cat: u32,
+    ch: u32,
 }
 
 /// A surviving event in its person bucket.
@@ -1280,8 +1283,9 @@ fn build_links(tbl: &Table, files: &[Bytes], threads: usize) {
 // ---------------------------------------------------------------- phase 1: parse
 
 struct PendE {
-    eid: SStr,
     eh: u64,
+    eb: u32, // the event_id's bucket
+    eh2: u32, // 16 bits of its second hash
     uid: SStr,
     uh: u64,
     ingest: i64,
@@ -1323,7 +1327,8 @@ impl P1<'_> {
         let uh = uh | 2;
         self.tbl.prefetch(uh);
         let pk = price | (kind as u32) << 24 | KEEP;
-        self.pe.push(PendE { eid, eh, uid, uh, ingest, ts: (ts - self.base) as u32, pk, cat: cat as u32 });
+        let h2 = eid.hash2();
+        self.pe.push(PendE { eh, eb: h2 >> (32 - EBITS), eh2: h2 & 0xFFFF, uid, uh, ingest, ts: (ts - self.base) as u32, pk, cat: cat as u32 });
         if self.pe.len() == BATCH {
             self.flush_events();
         }
@@ -1332,7 +1337,8 @@ impl P1<'_> {
     /// Any other parsed event: it still takes part in dedup.
     #[inline(always)]
     fn reject(&mut self, eh: u64, eid: SStr, ingest: i64) {
-        self.eb.push((eh >> (64 - EBITS)) as usize, R1 { eid, ingest, ts: 0, pid: 0, pk: 0, cat: 0 });
+        let h2 = eid.hash2();
+        self.eb.push((h2 >> (32 - EBITS)) as usize, R1 { eh, ingest, ts: 0, pid: 0, pk: 0, ch: (h2 & 0xFFFF) << 16 });
     }
 
     #[inline(always)]
@@ -1354,7 +1360,7 @@ impl P1<'_> {
                 continue; // table full: the whole attempt is thrown away
             }
             let pid = self.tbl.pid(i);
-            self.eb.push((p.eh >> (64 - EBITS)) as usize, R1 { eid: p.eid, ingest: p.ingest, ts: p.ts, pid, pk: p.pk, cat: p.cat });
+            self.eb.push(p.eb as usize, R1 { eh: p.eh, ingest: p.ingest, ts: p.ts, pid, pk: p.pk, ch: p.cat | p.eh2 << 16 });
         }
         self.pe = pe;
     }
@@ -1401,7 +1407,7 @@ struct P2 {
 }
 
 /// Dedups event_id bucket `b` across all parse threads (rules, Events step 2: the smallest ingest_ts wins).
-/// A slot holds a 24 bit tag of the ID's hash and the location (thread << 32 | index) + 1 of the copy that leads.
+/// A slot holds a 24 bit tag of the event_id's hash and the location (thread << 32 | index) + 1 of the copy that leads.
 fn dedup_bucket(p1: &[P1<'_>], b: usize, st: &mut P2) {
     st.offs.clear();
     let mut n = 0;
@@ -1420,7 +1426,7 @@ fn dedup_bucket(p1: &[P1<'_>], b: usize, st: &mut P2) {
     st.dead.resize(n, false);
     st.hs.clear();
     for t in p1 {
-        st.hs.extend(t.eb.iter(b).map(|r| r.eid.hash()));
+        st.hs.extend(t.eb.iter(b).map(|r| r.eh));
     }
     const AHEAD: usize = 8;
     for g in 0..n.min(AHEAD) {
@@ -1433,7 +1439,7 @@ fn dedup_bucket(p1: &[P1<'_>], b: usize, st: &mut P2) {
                 prefetch(&st.tab[st.hs[g + AHEAD] as usize & mask]);
             }
             let h = st.hs[g];
-            let tag = (h >> 31) & 0xFF_FFFF;
+            let tag = h >> 40;
             let loc = ((t as u64) << 32 | i as u64) + 1;
             let mut s = h as usize & mask;
             loop {
@@ -1446,7 +1452,7 @@ fn dedup_bucket(p1: &[P1<'_>], b: usize, st: &mut P2) {
                     let wl = (x & ((1 << 40) - 1)) - 1;
                     let (wt, wi) = ((wl >> 32) as usize, (wl & 0xFFFF_FFFF) as usize);
                     let w = p1[wt].eb.get(b, wi);
-                    if w.eid == r.eid {
+                    if w.eh == r.eh && w.ch >> 16 == r.ch >> 16 {
                         if r.ingest < w.ingest {
                             st.dead[st.offs[wt] + wi] = true;
                             st.tab[s] = tag << 40 | loc;
@@ -1465,7 +1471,7 @@ fn dedup_bucket(p1: &[P1<'_>], b: usize, st: &mut P2) {
     for th in p1 {
         for r in th.eb.iter(b) {
             if !st.dead[g] && r.pk & KEEP != 0 {
-                st.out.push(r.pid as usize & (NB - 1), Rec { pid: r.pid, ts: r.ts, pk: r.pk, cat: r.cat });
+                st.out.push(r.pid as usize & (NB - 1), Rec { pid: r.pid, ts: r.ts, pk: r.pk, cat: r.ch & 0xFFFF });
             }
             g += 1;
         }
@@ -2640,9 +2646,9 @@ mod tests {
         P1::new(t, ctx().base, Buckets::new(EBK, 64), Buckets::new(NB, 64))
     }
 
-    type Flat = Vec<(Vec<u8>, i64, u32, u32, u32, u32)>;
+    type Flat = Vec<(u64, i64, u32, u32, u32, u32)>;
     fn flat(st: &P1) -> Flat {
-        (0..EBK).flat_map(|b| st.eb.iter(b)).map(|r| (r.eid.get().to_vec(), r.ingest, r.ts, r.pid, r.pk, r.cat)).collect()
+        (0..EBK).flat_map(|b| st.eb.iter(b)).map(|r| (r.eh, r.ingest, r.ts, r.pid, r.pk, r.ch)).collect()
     }
 
     #[test]

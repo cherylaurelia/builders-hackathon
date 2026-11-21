@@ -284,6 +284,7 @@ impl Arena {
 
     #[inline]
     fn alloc(&mut self, bytes: usize) -> *mut u8 {
+        debug_assert!(bytes % 64 == 0); // blocks stay 64-byte aligned (see `Stream`)
         if self.cur + bytes > self.end {
             let n = bytes.max(Self::CHUNK);
             self.cur = map_anon(n) as usize;
@@ -295,16 +296,32 @@ impl Arena {
     }
 }
 
+/// Bytes a stream writes at a time: three cache lines, a whole number of records of every size here (12, 24).
+const GROUP: usize = 192;
+
 /// An append-only list of `T` in blocks of `per` records; a record never moves.
+///
+/// Records reach memory a group at a time: a thread appends to some 800 streams at once, and a record stored
+/// directly first reads its cache line from memory (read for ownership) and crowds the cache. A stream keeps the
+/// records of its current group (block offset a multiple of GROUP: blocks are 64-byte aligned, whole groups
+/// long) and writes the full group with non-temporal stores, three whole lines that are never read. A record's
+/// address is known when it is pushed; until its group is full or `finish` runs, its bytes are only in the stage.
+/// The caller fences (`sfence`) before others read, and calls `finish` once the pushing is over.
 struct Stream<T> {
     cur: *mut T,
     end: *mut T,
     blocks: Vec<*mut T>,
+    n: usize,                    // records of the current group, in `stage`
+    stage: [u64; GROUP / 8],     // 8-byte aligned, as every record here
+    _t: std::marker::PhantomData<T>,
 }
 
 impl<T> Stream<T> {
+    const K: usize = GROUP / std::mem::size_of::<T>();
+
     fn new() -> Stream<T> {
-        Stream { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), blocks: Vec::new() }
+        const { assert!(GROUP % std::mem::size_of::<T>() == 0 && std::mem::align_of::<T>() <= 8 && !std::mem::needs_drop::<T>()) };
+        Stream { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), blocks: Vec::new(), n: 0, stage: [0; GROUP / 8], _t: std::marker::PhantomData }
     }
 
     #[inline(always)]
@@ -313,10 +330,16 @@ impl<T> Stream<T> {
             self.grow(arena, per);
         }
         let p = self.cur;
-        // SAFETY: cur < end, inside the block `grow` took from the arena
+        // SAFETY: cur < end, inside the block `grow` took from the arena; n < K slots of the stage
         unsafe {
-            p.write(v);
+            (self.stage.as_mut_ptr() as *mut T).add(self.n).write(v);
             self.cur = p.add(1);
+        }
+        self.n += 1;
+        if self.n == Self::K {
+            // SAFETY: the group [cur - K, cur) is GROUP bytes at a 64-byte aligned address of the block
+            unsafe { stream_group((self.cur as *mut u8).sub(GROUP), self.stage.as_ptr() as *const u8) };
+            self.n = 0;
         }
         p
     }
@@ -324,10 +347,19 @@ impl<T> Stream<T> {
     #[cold]
     #[inline(never)]
     fn grow(&mut self, arena: &mut Arena, per: usize) {
+        debug_assert!(self.n == 0 && per % Self::K == 0);
         let p = arena.alloc(per * std::mem::size_of::<T>()) as *mut T;
+        debug_assert!(p as usize % 64 == 0);
         self.blocks.push(p);
         self.cur = p;
         self.end = unsafe { p.add(per) };
+    }
+
+    /// Writes the records still staged (a group not yet full) to memory with plain stores.
+    fn finish(&mut self) {
+        // SAFETY: the n staged records belong at [cur - n, cur)
+        unsafe { std::ptr::copy_nonoverlapping(self.stage.as_ptr() as *const T, self.cur.sub(self.n), self.n) };
+        self.n = 0;
     }
 
     fn len(&self, per: usize) -> usize {
@@ -343,6 +375,30 @@ impl<T> Stream<T> {
             let len = if i + 1 == n { (unsafe { self.cur.offset_from(b) }) as usize } else { per };
             unsafe { std::slice::from_raw_parts(b, len) }
         })
+    }
+}
+
+/// Copies a GROUP of bytes to `dst` (64-byte aligned) with non-temporal stores where available.
+#[inline(always)]
+unsafe fn stream_group(dst: *mut u8, src: *const u8) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        for i in 0..GROUP / 32 {
+            _mm256_stream_si256(dst.add(32 * i) as *mut __m256i, _mm256_loadu_si256(src.add(32 * i) as *const __m256i));
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    std::ptr::copy_nonoverlapping(src, dst, GROUP);
+}
+
+/// Orders this thread's non-temporal stores before its later stores.
+#[inline(always)]
+fn sfence() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_sfence()
     }
 }
 
@@ -1087,7 +1143,9 @@ fn read_ahead(queue: Vec<(&'static InFile, usize, usize)>, threads: usize) {
     }
     let queue = std::sync::Arc::new(queue);
     let next = std::sync::Arc::new(AtomicUsize::new(0));
-    for _ in 0..threads.div_ceil(2) {
+    // two threads: the kernel takes each 128 KiB hint at once, so more only crowd the parse threads (box, cold, 20M:
+    // 1 thread 0.41 s, 2 threads 0.40 s, 3 threads 0.45 s, 4 threads 0.49 s, 16 sendfile threads 0.48 s)
+    for _ in 0..threads.div_ceil(4) {
         let (queue, next) = (queue.clone(), next.clone());
         // never joined: these only start reads, and the end of the process ends them. A thread that cannot start,
         // or a hint the kernel refuses, costs speed only: every byte is still read by `read_span`.
@@ -1558,7 +1616,7 @@ fn main() {
 
     // 2. events and clicks, from the one queue
     let (np, nq) = (1usize << pbits, 1usize << qbits);
-    let shards = par(
+    let mut shards = par(
         threads,
         work.len(),
         || Shard::new(np, nq),
@@ -1578,6 +1636,12 @@ fn main() {
             st.buf = buf;
         },
     );
+    // the records of groups not yet full, written by this thread (each parse thread fenced its own before the join)
+    for s in &mut shards {
+        s.ev.iter_mut().for_each(Stream::finish);
+        s.ck.iter_mut().for_each(Stream::finish);
+        s.lg.iter_mut().for_each(Stream::finish);
+    }
     let n_ev: usize = shards.iter().flat_map(|s| s.ev.iter()).map(|s| s.len(EV_BLOCK)).sum();
     let n_ck: usize = shards.iter().flat_map(|s| s.ck.iter()).map(|s| s.len(CK_BLOCK)).sum();
     lap(&format!("parsed: {n_ev} valid events, {n_ck} valid clicks"));
@@ -1953,6 +2017,7 @@ unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
         },
     );
     st.flush(cx, true);
+    sfence();
 }
 
 /// rules.md "Clicks" 1, 3 for one line given as its 4 fields: the generic path of `fast_click`.
@@ -1997,6 +2062,7 @@ unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
         },
     );
     st.flush(cx, false);
+    sfence();
 }
 
 /// rules.md "Events" 2: per event-key bucket, among the copies of one event_id the smallest ingest_ts is kept and
@@ -2108,6 +2174,9 @@ struct Work {
     day_groups: Vec<(usize, usize)>, // (d, first session index)
     cats: Vec<(u16, i64)>,
     touched: Vec<usize>,
+    small: Win,
+    last: Vec<u32>,
+    lctr: u32,
 }
 
 impl Work {
@@ -2117,7 +2186,7 @@ impl Work {
         Work {
             rows: Vec::new(),
             cred: vec![Cred::default(); cells],
-            assist: vec![0; cells],
+            assist: vec![0; cells + 4], // + cells for the unused steps of the vector window
             stamp: vec![false; cx.ncamp + 1],
             iv: vec![(0, 0); cx.ncamp + 1],
             seen: vec![0; cx.ncamp + 1],
@@ -2133,8 +2202,168 @@ impl Work {
             day_groups: Vec::new(),
             cats: Vec::new(),
             touched: Vec::new(),
+            small: Win { ts: A32([0; 72]), nxt: A32([0; 72]), camp: [0; 72], cid: [0; 72] },
+            last: vec![0; cx.ncamp + 1],
+            lctr: 0,
         }
     }
+}
+
+/// Rotation `r` of eight lanes, and the lanes whose rotated-in lane (i + r) % 8 comes before them (for breaking ties).
+#[allow(dead_code)] // only the AVX2 build uses them
+const ROT: [[i32; 8]; 8] = {
+    let mut t = [[0; 8]; 8];
+    let mut r = 0;
+    while r < 8 {
+        let mut i = 0;
+        while i < 8 {
+            t[r][i] = ((i + r) % 8) as i32;
+            i += 1;
+        }
+        r += 1;
+    }
+    t
+};
+#[allow(dead_code)]
+const TIE: [[i32; 8]; 8] = {
+    let mut t = [[0; 8]; 8];
+    let mut r = 0;
+    while r < 8 {
+        let mut i = 0;
+        while i < 8 {
+            t[r][i] = if (i + r) % 8 < i { -1 } else { 0 };
+            i += 1;
+        }
+        r += 1;
+    }
+    t
+};
+
+/// `rank[i]` = slot of key i in sorted order, for 2 <= k <= 64 keys (for k <= 8 the ranks of eight lanes, the ones
+/// past k included: always a permutation of 0..8): the number of keys below it plus the equal keys before it, so no
+/// data-dependent branches and every slot is used once.
+#[inline]
+fn ranks_small(k: usize, key: impl Fn(usize) -> u32, rank: &mut [u8; 64]) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        if k <= 8 {
+            // one vector: every key against the other seven, by rotating the vector, with a fixed trip count.
+            // Lanes past k hold the largest key (and any index into `key` is clamped), so they only rank last.
+            let mut buf = [0i32; 8];
+            for i in 0..8 {
+                let kv = (key(i.min(k - 1)) ^ 0x8000_0000) as i32;
+                buf[i] = if i < k { kv } else { i32::MAX };
+            }
+            let v = _mm256_loadu_si256(buf.as_ptr() as *const __m256i);
+            let mut acc = _mm256_setzero_si256();
+            for r in 1..8 {
+                let rot = _mm256_permutevar8x32_epi32(v, _mm256_loadu_si256(ROT[r].as_ptr() as *const __m256i)); // lane i = key (i + r) % 8
+                let lt = _mm256_cmpgt_epi32(v, rot);
+                let tie = _mm256_and_si256(_mm256_cmpeq_epi32(v, rot), _mm256_loadu_si256(TIE[r].as_ptr() as *const __m256i));
+                acc = _mm256_sub_epi32(acc, _mm256_or_si256(lt, tie));
+            }
+            let mut out = [0i32; 8];
+            _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, acc);
+            for i in 0..8 {
+                rank[i] = out[i] as u8;
+            }
+            return;
+        }
+        #[repr(align(32))]
+        struct K([i32; 64]);
+        let mut kt = K([i32::MAX; 64]); // keys flipped to signed order; the padding sorts last
+        for i in 0..k {
+            kt.0[i] = (key(i) ^ 0x8000_0000) as i32;
+        }
+        let nch = k.div_ceil(8);
+        for i in 0..k {
+            let ki = _mm256_set1_epi32(kt.0[i]);
+            let mut r = 0u32;
+            for c in 0..nch {
+                let t = _mm256_load_si256(kt.0.as_ptr().add(c * 8) as *const __m256i);
+                let lt = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(ki, t))) as u32;
+                let eq = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(ki, t))) as u32;
+                let before = (1u32 << i.saturating_sub(c * 8).min(8)) - 1;
+                r += lt.count_ones() + (eq & before).count_ones();
+            }
+            rank[i] = r as u8;
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    {
+        for i in 0..k {
+            let ki = key(i);
+            rank[i] = (0..k).filter(|&j| key(j) < ki || (key(j) == ki && j < i)).count() as u8;
+        }
+        for i in k..8 {
+            rank[i] = i as u8; // the unused lanes of the vector version
+        }
+    }
+}
+
+/// Bit j set when click j (of the first 8 * nch) is in the 7-day window of a session starting at `st`:
+/// `st - ts` in 0..=WEEK, as an unsigned wrapping difference.
+#[inline(always)]
+fn win_mask(ts: &[u32; 72], nch: usize, st: u32) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let s = _mm256_set1_epi32(st as i32);
+        let w = _mm256_set1_epi32(WEEK as i32);
+        let mut m = 0u64;
+        for c in 0..nch {
+            let t = _mm256_loadu_si256(ts.as_ptr().add(c * 8) as *const __m256i);
+            let d = _mm256_sub_epi32(s, t);
+            let ok = _mm256_cmpeq_epi32(_mm256_min_epu32(d, w), d);
+            m |= (_mm256_movemask_ps(_mm256_castsi256_ps(ok)) as u32 as u64) << (c * 8);
+        }
+        return m;
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut m = 0u64;
+        for j in 0..nch * 8 {
+            m |= ((st.wrapping_sub(ts[j]) <= WEEK as u32) as u64) << j;
+        }
+        m
+    }
+}
+
+/// Bit j set when `nxt[j] >= hi` (the next click of j's campaign is not before `hi`), for the first 8 * nch.
+#[inline(always)]
+fn nxt_mask(nxt: &[u32; 72], nch: usize, hi: u32) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let h = _mm256_set1_epi32(hi as i32 - 1);
+        let mut m = 0u64;
+        for c in 0..nch {
+            let t = _mm256_loadu_si256(nxt.as_ptr().add(c * 8) as *const __m256i);
+            m |= (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(t, h))) as u32 as u64) << (c * 8);
+        }
+        return m;
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut m = 0u64;
+        for j in 0..nch * 8 {
+            m |= ((nxt[j] >= hi) as u64) << j;
+        }
+        m
+    }
+}
+
+#[repr(align(32))]
+struct A32([u32; 72]);
+
+/// The clicks of a person with up to 64 of them, sorted by ts, as arrays for the vector window.
+struct Win {
+    ts: A32,
+    nxt: A32, // index of the next click of the same campaign, else the click count
+    camp: [u32; 72],
+    cid: [u64; 72],
 }
 
 /// Sorts `ts << 32 | pay` values by ts.
@@ -2255,6 +2484,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
 
     let mut ev = std::mem::take(&mut w.ev);
     let mut ck = std::mem::take(&mut w.ck);
+    let mut sorted = [0u64; 72]; // the events of a person with up to 64 of them, by ts
     for l in 0..local {
         let (a, b) = (w.start[l] as usize, w.start[l + 1] as usize);
         if a == b {
@@ -2262,9 +2492,50 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
         }
         let name = cx.ids.slots[(p << cx.pshift) | l].key.load(Relaxed);
         let (ca, cb) = (w.cstart[l] as usize, w.cstart[l + 1] as usize);
-        sort_events(&mut ev[a..b], &mut w.tmp);
-        ck[ca..cb].sort_unstable_by_key(|c| c.k);
-        person_work(cx, name, &ev[a..b], &ck[ca..cb], w);
+        let n = b - a;
+        let evs: &[u64] = if n > 64 {
+            sort_events(&mut ev[a..b], &mut w.tmp);
+            &ev[a..b]
+        } else if n == 1 {
+            &ev[a..b]
+        } else {
+            let mut rank = [0u8; 64];
+            ranks_small(n, |i| (ev[a + i] >> 32) as u32, &mut rank);
+            for i in 0..n.max(8) {
+                sorted[rank[i] as usize] = ev[a + i.min(n - 1)]; // lanes past n land past the end
+            }
+            &sorted[..n]
+        };
+        // the clicks: sorted in place, or (up to 64) as the arrays of the vector window
+        let nc = cb - ca;
+        if nc > 64 {
+            ck[ca..cb].sort_unstable_by_key(|c| c.k);
+        } else if nc > 0 {
+            let mut rank = [0u8; 64];
+            if nc > 1 {
+                ranks_small(nc, |i| (ck[ca + i].k >> 32) as u32, &mut rank);
+            }
+            let sm = &mut w.small;
+            for i in 0..if nc > 1 { nc.max(8) } else { 1 } {
+                let (r, c) = (rank[i] as usize, &ck[ca + i.min(nc - 1)]); // lanes past nc land past the end
+                sm.ts.0[r] = (c.k >> 32) as u32;
+                sm.camp[r] = c.k as u32;
+                sm.cid[r] = c.cid;
+            }
+            // nxt: scanning back, `last` holds the stamp of this person and the index of the later click
+            if w.lctr >= 1 << 26 {
+                w.last.fill(0);
+                w.lctr = 0;
+            }
+            w.lctr += 1;
+            let stamp = w.lctr << 6;
+            for j in (0..nc).rev() {
+                let v = w.last[sm.camp[j] as usize];
+                sm.nxt.0[j] = if v >> 6 << 6 == stamp { v & 63 } else { nc as u32 };
+                w.last[sm.camp[j] as usize] = stamp | j as u32;
+            }
+        }
+        person_work(cx, name, evs, &ck[ca..cb], w);
     }
     w.ev = ev;
     w.ck = ck;
@@ -2274,7 +2545,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
 fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
     let width = cx.ndays;
     let organic = cx.ncamp;
-    let Work { rows, cred, assist, stamp, iv, seen, sctr, sessions, day_groups, cats, touched, .. } = w;
+    let Work { rows, cred, assist, stamp, iv, seen, sctr, sessions, day_groups, cats, touched, small, .. } = w;
 
     // sessions + user_daily rows
     sessions.clear();
@@ -2342,8 +2613,51 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
         for s in sessions.iter() {
             credit(organic, s);
         }
-    } else if nc * ns <= 16384 {
-        // few clicks or few sessions: per session, look at the clicks of its 7-day window [start - 7d, start]
+    } else if nc <= 64 {
+        // up to 64 clicks (sorted into `small`): per session, one vector pass finds the clicks of its 7-day window
+        // [start - 7d, start] (a contiguous run); the credit goes to the last, the assists to the last click of each
+        // campaign in the run
+        let nch = nc.div_ceil(8);
+        let valid = if nc == 64 { !0u64 } else { (1u64 << nc) - 1 };
+        let adummy = assist.len() - 4; // absorbs the increments of the unused steps
+        for s in sessions.iter() {
+            let m = win_mask(&small.ts.0, nch, s.start as u32) & valid;
+            let nz = m != 0;
+            let jh = (63 - (m | 1).leading_zeros()) as usize; // the last click of the window
+            let mut camp = if nz { small.camp[jh] as usize } else { organic };
+            if nz && jh > 0 && small.ts.0[jh - 1] == small.ts.0[jh] {
+                // credit: tie in ts -> smallest click_id
+                let t = small.ts.0[jh];
+                let mut best = jh;
+                let mut j = jh;
+                while j > 0 && small.ts.0[j - 1] == t {
+                    j -= 1;
+                    if cx.names.less(small.cid[j], small.cid[best]) {
+                        best = j;
+                    }
+                }
+                camp = small.camp[best] as usize;
+            }
+            // assists: the last click of each campaign in the window; three fixed steps, the rest in a loop
+            let mut c = m & nxt_mask(&small.nxt.0, nch, jh as u32 + 1);
+            macro_rules! bump {
+                ($n:expr) => {
+                    let j = (c.trailing_zeros() & 63) as usize;
+                    let at = if c != 0 { small.camp[j] as usize * width + s.d } else { adummy + $n };
+                    assist[at] += 1;
+                    c &= c.wrapping_sub(1);
+                };
+            }
+            bump!(0);
+            bump!(1);
+            bump!(2);
+            while c != 0 {
+                bump!(3);
+            }
+            credit(camp, s);
+        }
+    } else if nc * ns <= 2048 {
+        // few sessions: per session, look at the clicks of its 7-day window [start - 7d, start]
         // (a contiguous run of cs) for the credit and for the distinct assisting campaigns
         let (mut lo, mut hi) = (0, 0);
         for s in sessions.iter() {
@@ -3001,12 +3315,132 @@ mod tests {
 
     /// (events as (person, ts, pay), dedup records as (key, ingest, has a record)), each sorted
     type Flat = (Vec<(u32, u32, u32)>, Vec<(u64, i64, bool)>);
-    fn flat(st: &Shard) -> Flat {
+    fn flat(st: &mut Shard) -> Flat {
+        st.ev.iter_mut().for_each(Stream::finish);
+        st.lg.iter_mut().for_each(Stream::finish);
         let mut ev: Vec<_> = st.ev.iter().flat_map(|s| s.slices(EV_BLOCK)).flatten().map(|r| (r.person, r.ts, r.pay)).collect();
         let mut lg: Vec<_> = st.lg.iter().flat_map(|s| s.slices(LG_BLOCK)).flatten().map(|r| (r.key, r.ingest, r.loc != 0)).collect();
         ev.sort();
         lg.sort();
         (ev, lg)
+    }
+
+    /// `fast_split` (with the masks `scan_lines` computes) agrees with `split` on random lines made of the bytes
+    /// that matter (from arena/c2's tests).
+    fn fast_split_vs_split<const N: usize>(seed: u64) {
+        let mut r = Rng(seed);
+        let atoms = ["a", ",", "\"", "\"\"", "xy", "\r", " ", "\"ab\"", "1234567"];
+        for _ in 0..200_000 {
+            let mut line = String::new();
+            for _ in 0..r.below(40) {
+                line += r.pick(&atoms);
+            }
+            line.truncate(126);
+            let mut buf = line.clone().into_bytes();
+            buf.push(b'\n');
+            buf.resize(buf.len() + 200, b'z');
+            let want = split::<N>(Box::leak(line.clone().into_bytes().into_boxed_slice())).map(|f| f.map(|x| x.to_vec()));
+            let got = unsafe {
+                let p = buf.as_ptr();
+                let [c0, q0, n0] = masks64(p);
+                let [c1, q1, n1] = masks64(p.add(64));
+                let e = (n0 as u128 | (n1 as u128) << 64).trailing_zeros() as usize;
+                assert_eq!(e, line.len());
+                let lm = (1u128 << e) - 1;
+                fast_split::<N>(p, e, (c0 as u128 | (c1 as u128) << 64) & lm, (q0 as u128 | (q1 as u128) << 64) & lm)
+            }
+            .map(|f| f.map(|(s, l)| buf[s..s + l].to_vec()));
+            assert_eq!(got, want, "line {line:?}");
+        }
+    }
+
+    #[test]
+    fn fast_split_matches_split() {
+        fast_split_vs_split::<2>(1);
+        fast_split_vs_split::<4>(2);
+        fast_split_vs_split::<7>(3);
+    }
+
+    #[test]
+    fn prices() {
+        assert_eq!(parse_price(b"0250"), Some(250));
+        assert_eq!(parse_price(b"000000000000000000000250"), Some(250));
+        assert_eq!(parse_price(b"10000000"), Some(10_000_000));
+        assert_eq!(parse_price(b"10000001"), None);
+        assert_eq!(parse_price(b"0"), None);
+        assert_eq!(parse_price(b"12.5"), None);
+        assert_eq!(parse_price(b""), None);
+        assert_eq!(parse_price(b"99999999999999999999999"), None);
+    }
+
+    /// `ts_at` and `ts_memo` agree with `parse_ts` on arena/c2's timestamp mix: F1/F2 with random fields near a
+    /// window holding February 29, 13-digit F3, digit strings of any length, and a stray byte now and then.
+    #[test]
+    fn timestamps_match_general_parser() {
+        let mut r = Rng(7);
+        let mut days = [NO_DAY; 32];
+        for _ in 0..300_000 {
+            let mut s: Vec<u8> = match r.below(4) {
+                0 => format!("2028-0{}-{:02}T{:02}:{:02}:{:02}Z", 2 + r.below(2), r.below(32), r.below(25), r.below(61), r.below(61)).into_bytes(),
+                1 => format!(
+                    "2028-0{}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
+                    2 + r.below(2),
+                    r.below(32),
+                    r.below(25),
+                    r.below(61),
+                    r.below(61),
+                    if r.below(2) == 0 { '+' } else { '-' },
+                    r.below(25),
+                    r.below(61)
+                )
+                .into_bytes(),
+                2 => format!("18{:011}", r.next() % 100_000_000_000).into_bytes(),
+                _ => (0..r.below(22)).map(|_| b'0' + r.below(10) as u8).collect(),
+            };
+            if r.below(8) == 0 && !s.is_empty() {
+                let i = r.below(s.len());
+                s[i] = b"xZT:-+ 0"[r.below(8)];
+            }
+            let mut buf = s.clone();
+            buf.extend_from_slice(&[b'7'; 32]);
+            let want = parse_ts(&s);
+            assert_eq!(unsafe { ts_at(buf.as_ptr(), s.len()) }, want, "{:?}", String::from_utf8_lossy(&s));
+            assert_eq!(unsafe { ts_memo(buf.as_ptr(), s.len(), &mut days) }, want, "memo {:?}", String::from_utf8_lossy(&s));
+        }
+    }
+
+    #[test]
+    fn streams_keep_every_record_where_push_said() {
+        let mut r = Rng(17);
+        let mut arena = Arena { cur: 0, end: 0 };
+        let mut s12: Vec<Stream<ERec>> = (0..23).map(|_| Stream::new()).collect();
+        let mut s24: Vec<Stream<LRec>> = (0..23).map(|_| Stream::new()).collect();
+        let mut want12: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); 23];
+        let mut want24: Vec<Vec<(u64, i64, u64)>> = vec![Vec::new(); 23];
+        let mut at: Vec<(*mut ERec, u32)> = Vec::new();
+        for i in 0..400_000u32 {
+            let b = r.below(23);
+            if r.below(2) == 0 {
+                let rec = ERec { person: i, ts: r.next() as u32, pay: b as u32 };
+                at.push((s12[b].push(&mut arena, EV_BLOCK, rec), i));
+                want12[b].push((rec.person, rec.ts, rec.pay));
+            } else {
+                let rec = LRec { key: r.next(), ingest: i as i64, loc: b as u64 };
+                s24[b].push(&mut arena, LG_BLOCK, rec);
+                want24[b].push((rec.key, rec.ingest, rec.loc));
+            }
+        }
+        sfence();
+        s12.iter_mut().for_each(Stream::finish);
+        s24.iter_mut().for_each(Stream::finish);
+        for b in 0..23 {
+            let got: Vec<_> = s12[b].slices(EV_BLOCK).flatten().map(|r| (r.person, r.ts, r.pay)).collect();
+            assert_eq!(got, want12[b]);
+            assert_eq!(s12[b].len(EV_BLOCK), want12[b].len());
+            let got: Vec<_> = s24[b].slices(LG_BLOCK).flatten().map(|r| (r.key, r.ingest, r.loc)).collect();
+            assert_eq!(got, want24[b]);
+        }
+        assert!(at.iter().all(|&(p, i)| unsafe { (*p).person } == i));
     }
 
     #[test]
@@ -3039,7 +3473,7 @@ mod tests {
                 for_records::<7>(file, w[0], w[1], |f| event_fields(&c, f, &mut b));
                 b.flush(&c, true);
             }
-            let (fa, fb) = (flat(&a), flat(&b));
+            let (fa, fb) = (flat(&mut a), flat(&mut b));
             kept += fb.0.len();
             assert!(fa == fb, "round {round}: fast parse differs\n{}", std::str::from_utf8(file).unwrap());
         }

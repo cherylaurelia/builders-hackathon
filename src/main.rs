@@ -3432,18 +3432,30 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
     let Work { rows, cred, rev, assist, stamp, iv, seen, sctr, sessions, day_groups, cats, touched, small, bins, bits, bin_sess, purch, sess_day, days, dcats, .. } = w;
 
     // sessions + user_daily rows: the events go into their 30-minute bins, and the bins in order are the sessions
+    // through raw pointers taken once (the vectors' fields would be reloaded from memory after every store), with
+    // no bounds checks (an event's ts is below we - base, so its bin is below bins.len()), and every event written
+    // to the purchase list, which only keeps the ones with a price
+    purch.clear();
+    purch.reserve(evs.len());
+    let (bp, wp, pp) = (bins.as_mut_ptr(), bits.as_mut_ptr(), purch.as_mut_ptr());
+    let mut np = 0;
     for &e in evs {
         let ts = (e >> 32) as u32;
         let b = (ts / GAP as u32) as usize;
-        let bin = &mut bins[b];
-        bin.cnt += 1;
-        bin.min = bin.min.min(ts);
-        bin.max = bin.max.max(ts);
-        bits[b >> 6] |= 1 << (b & 63);
-        if e as u32 != 0 {
-            purch.push((b as u32, e as u32));
+        debug_assert!(b < bins.len() && b >> 6 < bits.len());
+        // SAFETY: b < bins.len() and b / 64 < bits.len() (above), np < evs.len() <= purch's capacity
+        unsafe {
+            let bin = &mut *bp.add(b);
+            bin.cnt += 1;
+            bin.min = bin.min.min(ts);
+            bin.max = bin.max.max(ts);
+            *wp.add(b >> 6) |= 1 << (b & 63);
+            *pp.add(np) = (b as u32, e as u32);
         }
+        np += (e as u32 != 0) as usize;
     }
+    // SAFETY: the first np entries are written
+    unsafe { purch.set_len(np) };
     sessions.clear();
     day_groups.clear();
     sess_day.clear();

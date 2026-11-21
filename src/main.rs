@@ -710,8 +710,7 @@ fn die(msg: &str) -> ! {
 
 /// `n` empty vectors, each with room for about `total / (threads * n)` items (+25% for uneven shares).
 fn sized<T>(n: usize, total: usize, threads: usize) -> Vec<Vec<T>> {
-    // a multiple of 5 keeps a Vec<UEvent> buffer a whole number of PEvents (to_pevents); doubling preserves it
-    let each = (total / (threads * n).max(1) * 5 / 4 + 16).next_multiple_of(5);
+    let each = total / (threads * n).max(1) * 5 / 4 + 16;
     (0..n).map(|_| Vec::with_capacity(each)).collect()
 }
 
@@ -796,12 +795,11 @@ impl Packed {
     }
 }
 
-/// A valid, non-late event in its user_id bucket, until dedup and person resolution.
+/// A valid, non-late event in its user_id bucket, until dedup and person resolution. Its event_id and ingest_ts
+/// live only in its dedup record.
 struct UEvent {
     uh: u64,
     uid: SStr,
-    eid: Packed,
-    ingest: i64,
     ts: i64,
     price: u32,
     cat: u16,
@@ -809,9 +807,12 @@ struct UEvent {
     dropped: AtomicBool, // a copy of an event_id whose kept copy is another one
 }
 
-/// hash(event_id) and where its line went: `LOC_BAD` set = the thread's invalid list, else a user_id bucket.
+/// The dedup record of every parsed line: hash(event_id), event_id, ingest_ts, and where its event went:
+/// `LOC_BAD` = an invalid or late line (it still wins dedup, and then nothing survives), else a user_id bucket.
 struct ERec {
     h: u64,
+    eid: Packed,
+    ingest: i64,
     loc: u64,
 }
 const LOC_BAD: u64 = 1 << 63;
@@ -822,7 +823,6 @@ const LOC_B: u32 = 40; // user_id bucket, 16 bits; the index is the low 40 bits
 struct EvParse {
     t: usize,
     ub: Vec<Vec<UEvent>>,
-    bad: Vec<(Packed, i64)>, // (event_id, ingest_ts) of invalid or late lines: they still win dedup
     eb: Vec<Vec<ERec>>,
 }
 
@@ -975,7 +975,6 @@ fn main() {
         || EvParse {
             t: tid.fetch_add(1, Relaxed),
             ub: sized::<UEvent>(UB, ev_est, threads),
-            bad: Vec::new(),
             eb: sized::<ERec>(EB, ev_est, threads),
         },
         |st, i| {
@@ -991,16 +990,14 @@ fn main() {
 
     // 3. duplicates: per event_id bucket, find hashes seen more than once (2-4% of events). Among the copies of
     //    one event_id the smallest ingest_ts is kept, so every other valid copy is marked dropped.
-    let rec = |loc: u64| -> (i64, Bytes, Option<&UEvent>) {
-        let t = &parsed[((loc >> LOC_T) & 0x7f) as usize];
-        let i = (loc & ((1 << LOC_B) - 1)) as usize;
-        if loc & LOC_BAD != 0 {
-            let (eid, ingest) = t.bad[i];
-            (ingest, eid.get(), None)
-        } else {
-            let e = &t.ub[((loc >> LOC_B) & 0xffff) as usize][i];
-            (e.ingest, e.eid.get(), Some(e))
-        }
+    // a copy is found by the address of its dedup record, which holds all dedup needs but the dropped flag
+    let rec = |at: u64| -> (i64, Bytes, Option<&UEvent>) {
+        let r = unsafe { &*(at as *const ERec) };
+        let e = (r.loc != LOC_BAD).then(|| {
+            let t = &parsed[((r.loc >> LOC_T) & 0x7f) as usize];
+            &t.ub[((r.loc >> LOC_B) & 0xffff) as usize][(r.loc & ((1 << LOC_B) - 1)) as usize]
+        });
+        (r.ingest, r.eid.get(), e)
     };
     let n_dups: usize = par(
         threads,
@@ -1021,7 +1018,7 @@ fn main() {
                     loop {
                         let (x, first) = table[s];
                         if x == 0 {
-                            table[s] = (k, r.loc);
+                            table[s] = (k, r as *const ERec as u64);
                             break;
                         }
                         if x == k {
@@ -1029,7 +1026,7 @@ fn main() {
                                 dups.push((k, first));
                                 table[s].1 = u64::MAX;
                             }
-                            dups.push((k, r.loc));
+                            dups.push((k, r as *const ERec as u64));
                             break;
                         }
                         s = (s + 1) & mask;
@@ -1045,7 +1042,7 @@ fn main() {
                     j += 1;
                 }
                 grp.clear();
-                grp.extend(dups[i..j].iter().map(|&(_, loc)| rec(loc)));
+                grp.extend(dups[i..j].iter().map(|&(_, at)| rec(at)));
                 grp.sort_unstable_by_key(|g| g.0);
                 // ordered by ingest: the first copy of each distinct event_id is its kept copy
                 for k in 0..grp.len() {
@@ -1433,30 +1430,28 @@ fn push_ahead<T>(v: &mut Vec<T>, x: T) {
 }
 
 impl EvParse {
-    /// A valid, non-late event: into its user_id bucket, plus its (hash(event_id), location) record.
+    /// A valid, non-late event: into its user_id bucket, plus its dedup record.
     #[inline(always)]
-    fn keep(&mut self, h: u64, e: UEvent) {
+    fn keep(&mut self, h: u64, eid: Packed, ingest: i64, e: UEvent) {
         let u = uid_bucket(e.uh);
         let v = &mut self.ub[u];
         let loc = ((self.t as u64) << LOC_T) | ((u as u64) << LOC_B) | v.len() as u64;
         push_ahead(v, e);
-        push_ahead(&mut self.eb[(h >> 56) as usize % EB], ERec { h, loc });
+        push_ahead(&mut self.eb[(h >> 56) as usize % EB], ERec { h, eid, ingest, loc });
     }
 
     /// Any other parsed event: it still takes part in dedup.
     #[inline(always)]
     fn reject(&mut self, h: u64, eid: Packed, ingest: i64) {
-        let loc = LOC_BAD | ((self.t as u64) << LOC_T) | self.bad.len() as u64;
-        self.bad.push((eid, ingest));
-        push_ahead(&mut self.eb[(h >> 56) as usize % EB], ERec { h, loc });
+        push_ahead(&mut self.eb[(h >> 56) as usize % EB], ERec { h, eid, ingest, loc: LOC_BAD });
     }
 
     #[inline(always)]
     fn add(&mut self, r: RawEvent) {
         if r.keep {
             let u = r.uid.get();
-            let e = UEvent { uh: hash_bytes(u), uid: SStr::new(u), eid: r.eid, ingest: r.ingest, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind, dropped: AtomicBool::new(false) };
-            self.keep(r.h, e);
+            let e = UEvent { uh: hash_bytes(u), uid: SStr::new(u), ts: r.ts, price: r.price, cat: r.cat, kind: r.kind, dropped: AtomicBool::new(false) };
+            self.keep(r.h, r.eid, r.ingest, e);
         } else {
             self.reject(r.h, r.eid, r.ingest);
         }
@@ -1571,7 +1566,7 @@ unsafe fn fast_event(ctx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, st:
         let u = std::slice::from_raw_parts(up, ul);
         (hash_bytes(u), SStr::new(u))
     };
-    st.keep(h, UEvent { uh, uid, eid, ingest, ts, price, cat, kind, dropped: AtomicBool::new(false) });
+    st.keep(h, eid, ingest, UEvent { uh, uid, ts, price, cat, kind, dropped: AtomicBool::new(false) });
 }
 
 #[inline]
@@ -2927,15 +2922,14 @@ mod tests {
     }
 
     fn fresh() -> EvParse {
-        EvParse { t: 3, ub: (0..UB).map(|_| Vec::new()).collect(), bad: Vec::new(), eb: (0..EB).map(|_| Vec::new()).collect() }
+        EvParse { t: 3, ub: (0..UB).map(|_| Vec::new()).collect(), eb: (0..EB).map(|_| Vec::new()).collect() }
     }
 
-    type Flat = (Vec<(u64, Vec<u8>, Vec<u8>, i64, i64, u32, u16, u8)>, Vec<(Vec<u8>, i64)>, Vec<(u64, u64)>);
+    type Flat = (Vec<(u64, Vec<u8>, i64, u32, u16, u8)>, Vec<(u64, Vec<u8>, i64, u64)>);
     fn flat(st: &EvParse) -> Flat {
         (
-            st.ub.iter().flatten().map(|e| (e.uh, e.uid.get().to_vec(), e.eid.get().to_vec(), e.ingest, e.ts, e.price, e.cat, e.kind)).collect(),
-            st.bad.iter().map(|(e, i)| (e.get().to_vec(), *i)).collect(),
-            st.eb.iter().flatten().map(|r| (r.h, r.loc)).collect(),
+            st.ub.iter().flatten().map(|e| (e.uh, e.uid.get().to_vec(), e.ts, e.price, e.cat, e.kind)).collect(),
+            st.eb.iter().flatten().map(|r| (r.h, r.eid.get().to_vec(), r.ingest, r.loc)).collect(),
         )
     }
 

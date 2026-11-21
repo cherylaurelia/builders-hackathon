@@ -2215,6 +2215,55 @@ fn line_match(line: &[u32; 16], tag: u32) -> (u32, u32) {
     (0..8).fold((0, 0), |(e, z), k| (e | ((line[k] == tag) as u32) << k, z | ((line[k] == 0) as u32) << k))
 }
 
+/// One record into the duplicate finder's table (`lines` = mask + 1 lines at `tp`, a record's line = fib(key) >> shift);
+/// a repeat of a tag joins (or starts) that tag's group: see `mark_duplicates`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn dup_insert(tp: *mut DLine, mask: usize, shift: u32, r: &LRec, me: u32, mem: &mut Vec<(LRec, u32)>, groups: &mut Vec<(u32, u32)>, firsts: &mut Vec<(u32, u32)>) {
+    let h = r.key.wrapping_mul(0x9E37_79B9_7F4A_7C15); // `fib` of mark_duplicates
+    let tag = (h >> 8) as u32 | 1;
+    let mut l = (h >> shift) as usize;
+    loop {
+        // SAFETY: l <= mask, a line of the table
+        let line = &mut (*tp.add(l)).0;
+        let (eq, empty) = line_match(line, tag);
+        if eq != 0 {
+            let at = 8 + eq.trailing_zeros() as usize;
+            let x = mem.len() as u32;
+            if line[at] < DUP_GRP {
+                // the tag's first repeat: a new group of the record it met (copied later) and this one
+                if groups.len() as u32 >= u32::MAX - DUP_GRP {
+                    die("too many duplicate groups in one event-key bucket");
+                }
+                firsts.push((x, line[at]));
+                mem.push((*r, x + 2));
+                mem.push((*r, 0));
+                line[at] = DUP_GRP + groups.len() as u32;
+                groups.push((x, x + 1));
+            } else {
+                let g = &mut groups[(line[at] - DUP_GRP) as usize];
+                mem[g.1 as usize].1 = x + 1;
+                mem.push((*r, 0));
+                g.1 = x;
+            }
+            return;
+        }
+        if empty != 0 {
+            let at = empty.trailing_zeros() as usize;
+            line[at] = tag;
+            line[8 + at] = me;
+            return;
+        }
+        l = (l + 1) & mask;
+    }
+}
+
+/// A record's position in `mark_duplicates`: shard << DUP_POS_T | index in that shard's stream of the bucket. With at
+/// most 127 shards a position + 1 is at most 127 << DUP_POS_T < DUP_GRP: a table slot at or above DUP_GRP holds a
+/// group number + DUP_GRP instead.
+const DUP_POS_T: u32 = 25;
+const DUP_GRP: u32 = (127 << DUP_POS_T) + 1;
+
 /// rules.md "Events" 2: per event-key bucket, among the copies of one event_id the smallest ingest_ts is kept and
 /// every other valid copy is marked dropped. Returns the number of records whose tag repeats.
 ///
@@ -2224,10 +2273,7 @@ fn line_match(line: &[u32; 16], tag: u32) -> (u32, u32) {
 /// the group starts with the record it met), chained in `mem`. All copies of a key share its tag, so they all meet
 /// in one group; a few other keys do too and are told apart by key.
 fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
-    // a record's position: shard << POS_T | index in that shard's stream of the bucket. With at most 127 shards a
-    // position + 1 is at most 127 << POS_T < GRP: a table slot at or above GRP holds a group number + GRP instead
-    const POS_T: u32 = 25;
-    const GRP: u32 = (127 << POS_T) + 1;
+    const POS_T: u32 = DUP_POS_T;
     if shards.len() > 127 || shards.iter().any(|s| s.lg.iter().any(|l| l.len(LG_BLOCK) >> POS_T != 0)) {
         die("too many events for the duplicate finder");
     }
@@ -2252,61 +2298,45 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
                 // SAFETY: i < the stream's length, so block i / LG_BLOCK holds it
                 unsafe { shards[t].lg[b].blocks[i / LG_BLOCK].add(i % LG_BLOCK) as *const LRec }
             };
+            let tp = table.as_mut_ptr();
+            // one record into the table; a repeat of a tag joins (or starts) that tag's group
+            let mut insert = |r: &LRec, me: u32| unsafe { dup_insert(tp, mask, shift, r, me, mem, groups, firsts) };
+            let line_of = |r: &LRec| unsafe { tp.add((fib(r.key) >> shift) as usize) };
+            // ahead of record i: its stream RA records on, and the table line of the record LA on
+            const RA: usize = 40;
+            const LA: usize = 8;
             for (t, s) in shards.iter().enumerate() {
                 let mut me = ((t as u32) << POS_T) + 1;
                 let blks: Vec<&[LRec]> = s.lg[b].slices(LG_BLOCK).collect();
-                for (k, blk) in blks.iter().enumerate() {
-                    for (i, r) in blk.iter().enumerate() {
-                        // the stream ~1 KB ahead, into the next block at the end of this one
+                for (k, &blk) in blks.iter().enumerate() {
+                    let n = blk.len();
+                    let p = blk.as_ptr();
+                    // all but the last RA records: the records ahead are in this block
+                    let body = n.saturating_sub(RA) & !3;
+                    for i in (0..body).step_by(4) {
+                        // SAFETY: i + 3 + RA < n
+                        unsafe {
+                            prefetch(p.add(i + RA));
+                            for j in i..i + 4 {
+                                prefetch(line_of(&*p.add(j + LA)));
+                                insert(&*p.add(j), me);
+                                me += 1;
+                            }
+                        }
+                    }
+                    // the rest: the records ahead may be in the next block
+                    let nb: &[LRec] = blks.get(k + 1).copied().unwrap_or(&[]);
+                    let after = |i: usize| if i < n { blk.get(i) } else { nb.get(i - n) };
+                    for i in body..n {
                         if i % 4 == 0 {
-                            const RA: usize = 40;
-                            match blk.get(i + RA) {
-                                Some(f) => prefetch(f),
-                                None => {
-                                    if let Some(f) = blks.get(k + 1).and_then(|n| n.get(i + RA - blk.len())) {
-                                        prefetch(f);
-                                    }
-                                }
+                            if let Some(f) = after(i + RA) {
+                                prefetch(f);
                             }
                         }
-                        if let Some(f) = blk.get(i + 8) {
-                            prefetch(&table[(fib(f.key) >> shift) as usize]);
+                        if let Some(f) = after(i + LA) {
+                            prefetch(line_of(f));
                         }
-                        let h = fib(r.key);
-                        let tag = (h >> 8) as u32 | 1;
-                        let mut l = (h >> shift) as usize;
-                        loop {
-                            let line = &mut table[l].0;
-                            let (eq, empty) = line_match(line, tag);
-                            if eq != 0 {
-                                let at = 8 + eq.trailing_zeros() as usize;
-                                let x = mem.len() as u32;
-                                if line[at] < GRP {
-                                    // the tag's first repeat: a new group of the record it met (copied below) and this one
-                                    if groups.len() as u32 >= u32::MAX - GRP {
-                                        die("too many duplicate groups in one event-key bucket");
-                                    }
-                                    firsts.push((x, line[at]));
-                                    mem.push((*r, x + 2));
-                                    mem.push((*r, 0));
-                                    line[at] = GRP + groups.len() as u32;
-                                    groups.push((x, x + 1));
-                                } else {
-                                    let g = &mut groups[(line[at] - GRP) as usize];
-                                    mem[g.1 as usize].1 = x + 1;
-                                    mem.push((*r, 0));
-                                    g.1 = x;
-                                }
-                                break;
-                            }
-                            if empty != 0 {
-                                let at = empty.trailing_zeros() as usize;
-                                line[at] = tag;
-                                line[8 + at] = me;
-                                break;
-                            }
-                            l = (l + 1) & mask;
-                        }
+                        insert(&blk[i], me);
                         me += 1;
                     }
                 }

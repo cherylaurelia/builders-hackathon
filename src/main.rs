@@ -796,7 +796,14 @@ fn special_mask(b: &[u8]) -> u64 {
 /// [commas, quotes, newlines]: bit k set when p[k] is that byte, for the 64 bytes at `p` (all must be readable).
 #[inline(always)]
 unsafe fn masks64(p: *const u8) -> [u64; 3] {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+    {
+        use std::arch::x86_64::*;
+        let v = _mm512_loadu_si512(p as *const _);
+        let m = |c: u8| _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(c as i8));
+        return [m(b','), m(b'"'), m(b'\n')];
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512bw")))]
     {
         use std::arch::x86_64::*;
         let (a, b) = (_mm256_loadu_si256(p as *const __m256i), _mm256_loadu_si256(p.add(32) as *const __m256i));
@@ -1626,7 +1633,7 @@ struct Ctx {
     ids: IdTable,
     names: Interner,
     pshift: u32, // person >> pshift = person partition
-    qshift: u32, // mix(event key) >> qshift = event-key bucket
+    qshift: u32, // (event key * golden ratio) >> qshift = event-key bucket
 }
 
 impl Shard {
@@ -1670,7 +1677,8 @@ impl Shard {
     /// Any parsed event: its dedup record. `loc` = 0 for an invalid or late one.
     #[inline(always)]
     fn log(&mut self, cx: &Ctx, ekey: u64, ingest: i64, loc: u64) {
-        let q = (mix(ekey) >> cx.qshift) as usize;
+        // any fixed function of the key will do (all copies of an event meet in one bucket): one multiply
+        let q = (ekey.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> cx.qshift) as usize;
         self.lg[q].push(&mut self.arena, LG_BLOCK, LRec { key: ekey, ingest, loc });
     }
 

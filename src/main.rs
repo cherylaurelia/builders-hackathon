@@ -382,6 +382,23 @@ impl IdTable {
         IdTable { slots: unsafe { std::slice::from_raw_parts(p, n) }, bits, count: AtomicUsize::new(0), limit: n / 4 * 3 }
     }
 
+    /// Writes to every 2 MiB of the table, on `threads` threads. A page first touched by a read (a lookup) maps
+    /// the shared zero page, and the first write there then leaves the whole 2 MiB in 4 KiB pages: every later
+    /// lookup would miss the TLB. A write first gets a huge page (where the kernel gives them).
+    fn populate(&self, threads: usize) {
+        const HUGE: usize = 2 << 20;
+        let bytes = self.slots.len() * std::mem::size_of::<Slot>();
+        par(
+            threads,
+            bytes.div_ceil(HUGE),
+            || (),
+            |_, i| {
+                // a zero stored over a zero: the slot stays empty
+                self.slots[i * HUGE / std::mem::size_of::<Slot>()].up.store(0, Relaxed);
+            },
+        );
+    }
+
     #[inline(always)]
     fn home(&self, key: u64) -> usize {
         (mix(key) >> (64 - self.bits)) as usize
@@ -942,6 +959,60 @@ unsafe fn ts_at(p: *const u8, len: usize) -> Option<i64> {
     Some((swar8(lo) * 100_000_000 + swar8(hi)) as i64)
 }
 
+/// A date already checked: its `YYYY-MM-DDT` (11 bytes) and the epoch ms of its midnight.
+#[derive(Clone, Copy)]
+struct Day {
+    a: u64, // bytes 0..8
+    b: u32, // bytes 8..11; `NO_DAY.b` matches no input
+    ms: i64,
+}
+const NO_DAY: Day = Day { a: 0, b: u32::MAX, ms: 0 };
+
+/// `ts_at` that remembers the dates it has checked (by day of month), so an F1 or F2 timestamp of a known date
+/// costs two compares and the time of day.
+#[inline(always)]
+unsafe fn ts_memo(p: *const u8, len: usize, days: &mut [Day; 32]) -> Option<i64> {
+    let at = |i: usize| *p.add(i);
+    let f1 = len == 20 && at(19) == b'Z';
+    if !f1 && !(len == 25 && (at(19) == b'+' || at(19) == b'-') && at(22) == b':') {
+        return ts_at(p, len);
+    }
+    let a = (p as *const u64).read_unaligned();
+    let b = (p.add(8) as *const u32).read_unaligned() & 0xFF_FFFF;
+    let day = &mut days[(((b & 15) * 10 + ((b >> 8) & 15)) & 31) as usize];
+    if day.a != a || day.b != b {
+        // a date not seen yet, or a bad one: the full check; a good one is remembered
+        let t = ts_at(p, len)?;
+        *day = Day { a, b, ms: civil_at(p)?.div_euclid(DAY) * DAY };
+        return Some(t);
+    }
+    // HH:MM:SS as in `civil_at`
+    let x = (p.add(11) as *const u64).read_unaligned() ^ u64::from_le_bytes(*b"00:00:00");
+    const ADD: u64 = u64::from_le_bytes([0x76, 0x76, 0x7F, 0x76, 0x76, 0x7F, 0x76, 0x76]);
+    if (x.wrapping_add(ADD) | x) & HI != 0 {
+        return None;
+    }
+    let pb = x * 10 + (x >> 8);
+    let (h, mi, sec) = (pb & 0xFF, (pb >> 24) & 0xFF, (pb >> 48) & 0xFF);
+    if (h > 23) | (mi > 59) | (sec > 59) {
+        return None;
+    }
+    let t = day.ms + (h * 3_600_000 + mi * 60_000 + sec * 1000) as i64;
+    if f1 {
+        return Some(t);
+    }
+    let (h1, h2, m1, m2) = (at(20).wrapping_sub(b'0'), at(21).wrapping_sub(b'0'), at(23).wrapping_sub(b'0'), at(24).wrapping_sub(b'0'));
+    if h1 > 9 || h2 > 9 || m1 > 9 || m2 > 9 {
+        return None;
+    }
+    let (oh, om) = ((h1 * 10 + h2) as i64, (m1 * 10 + m2) as i64);
+    if oh > 23 || om > 59 {
+        return None;
+    }
+    let off = (oh * 60 + om) * 60_000;
+    Some(if at(19) == b'+' { t - off } else { t + off })
+}
+
 // ---------------------------------------------------------------- input files
 
 fn map_file(p: &Path) -> Bytes {
@@ -1227,6 +1298,7 @@ struct Shard {
     ins: usize,
     ring: [Pend; RING],
     head: usize, // events or clicks put in the ring since the last flush
+    days: [Day; 32],
 }
 // SAFETY: the streams own their blocks; after the parse they are only read, except for `ERec::person` of distinct
 // records written by the dedup phase while nothing reads them
@@ -1250,8 +1322,8 @@ struct Ctx {
     day0: i64,
     ndays: usize,
     ncamp: usize, // organic is index ncamp
-    products: BytesMap<u16>,
-    campaigns: BytesMap<u16>,
+    products: IdMap,
+    campaigns: IdMap,
     unknown_cat: u16,
     cat_rank: Vec<u32>,
     ids: IdTable,
@@ -1271,6 +1343,7 @@ impl Shard {
             ins: 0,
             ring: [Pend::default(); RING],
             head: 0,
+            days: [NO_DAY; 32],
         }
     }
 
@@ -1375,47 +1448,6 @@ fn main() {
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
 
-    // products -> categories; "unknown" is its own category, never one of the file's
-    let mut cat_names: Vec<Bytes> = Vec::new();
-    let mut cat_idx: BytesMap<u16> = BytesMap::default();
-    let mut products: BytesMap<u16> = BytesMap::default();
-    for (p, c) in small_table(&data.join("products.csv")) {
-        let n = cat_names.len() as u16;
-        let ci = *cat_idx.entry(c).or_insert_with(|| {
-            cat_names.push(c);
-            n
-        });
-        products.insert(p, ci);
-    }
-    let unknown_cat = cat_names.len() as u16;
-    cat_names.push(b"unknown");
-    if cat_names.len() > 256 {
-        die("over 255 categories"); // ERec::pay keeps the category in 8 bits
-    }
-    let mut order: Vec<usize> = (0..cat_names.len()).collect();
-    order.sort_by(|&a, &b| cat_names[a].cmp(cat_names[b]));
-    let mut cat_rank = vec![0u32; cat_names.len()];
-    for (r, &i) in order.iter().enumerate() {
-        cat_rank[i] = r as u32;
-    }
-
-    // campaigns
-    let mut camp_ids: Vec<Bytes> = Vec::new();
-    let mut camp_channel: Vec<Bytes> = Vec::new();
-    let mut campaigns: BytesMap<u16> = BytesMap::default();
-    for (c, ch) in small_table(&data.join("campaigns.csv")) {
-        if campaigns.contains_key(c) {
-            continue;
-        }
-        if camp_ids.len() >= u16::MAX as usize {
-            die("over 65534 campaigns");
-        }
-        campaigns.insert(c, camp_ids.len() as u16);
-        camp_ids.push(c);
-        camp_channel.push(ch);
-    }
-    let ncamp = camp_ids.len();
-
     let link_files = csv_files(&data.join("links"));
     let ev_files = csv_files(&data.join("events"));
     let ck_files = csv_files(&data.join("clicks"));
@@ -1425,12 +1457,27 @@ fn main() {
     // sizes: a link line is ~21 bytes and names ~1.4 new IDs; ~1 in 40 event lines brings an unlinked ID; an event
     // line is ~75 bytes. A wrong guess costs speed, never rows: the ID table restarts the run when it fills up.
     let id_est = link_bytes / 14 + ev_bytes / 3000 + bytes(&ck_files) / 3000;
-    let id_bits = (env_num("SESS_ID_BITS").unwrap_or(0) as u32).max(usize::BITS - (id_est * 7 / 5).leading_zeros()).clamp(16, 36);
+    let id_bits = env_num("SESS_ID_BITS").map(|v| v as u32).unwrap_or(usize::BITS - (id_est * 7 / 5).leading_zeros()).clamp(16, 36);
+    // about 90,000 events per person partition and per event-key bucket: more of them slow the parse (one open
+    // block each per thread), fewer leave the later phases with work that no longer fits a core's cache
     let ev_est = ev_bytes / 72;
-    let pbits = (env_num("SESS_PBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 50_000))).clamp(4, 12.min(id_bits - 4));
-    let qbits = (env_num("SESS_QBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 50_000))).clamp(4, 12);
-    let chunk = env_num("SESS_CHUNK").filter(|&c| c >= 4096).unwrap_or(256 << 10);
+    let pbits = (env_num("SESS_PBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000))).clamp(4, 12.min(id_bits - 4));
+    let qbits = (env_num("SESS_QBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000))).clamp(4, 12);
+    let chunk = env_num("SESS_CHUNK").filter(|&c| c >= 4096).unwrap_or(512 << 10);
 
+    // 1. links, on every thread; this one reads the small tables meanwhile
+    let ids = IdTable::new(id_bits);
+    let names = Interner::new();
+    let (n_links, small) = std::thread::scope(|sc| {
+        let links = sc.spawn(|| {
+            ids.populate(threads);
+            build_links(&ids, &names, &link_files, threads)
+        });
+        let small = small_tables(&data);
+        (links.join().unwrap_or_else(|_| die("link builder panicked")), small)
+    });
+    let Small { products, campaigns, cat_names, cat_rank, unknown_cat, camp_ids, camp_channel } = small;
+    let ncamp = camp_ids.len();
     let cx = Ctx {
         ws,
         we,
@@ -1442,16 +1489,12 @@ fn main() {
         campaigns,
         unknown_cat,
         cat_rank,
-        ids: IdTable::new(id_bits),
-        names: Interner::new(),
+        ids,
+        names,
         pshift: id_bits - pbits,
         qshift: 64 - qbits,
     };
-    lap(&format!("small tables; 2^{id_bits} id slots, 2^{pbits} person partitions, 2^{qbits} event buckets"));
-
-    // 1. links
-    let n_links = build_links(&cx, &link_files, threads);
-    lap(&format!("links joined: {n_links} lines"));
+    lap(&format!("small tables, links joined: {n_links} lines; 2^{id_bits} id slots, 2^{pbits} person partitions, 2^{qbits} event buckets"));
 
     // 2. events and clicks, one queue: events first
     let mut work = Vec::new();
@@ -1561,8 +1604,133 @@ fn main() {
     fast_exit(threads)
 }
 
+/// An exact map from the IDs of a small clean file to a number: packed IDs in an open-addressing table on their
+/// key, any other ID in a byte-string map.
+struct IdMap {
+    slots: Vec<(u64, u16)>, // key 0 = empty
+    other: BytesMap<u16>,
+}
+
+impl IdMap {
+    fn new(ids: &[(Bytes, u16)]) -> IdMap {
+        let cap = (ids.len() * 2).next_power_of_two().max(16);
+        let mut m = IdMap { slots: vec![(0, 0); cap], other: BytesMap::default() };
+        for &(id, v) in ids {
+            match pack(id) {
+                0 => {
+                    m.other.insert(id, v);
+                }
+                k => {
+                    let mut i = mix(k) as usize & (cap - 1);
+                    while m.slots[i].0 != 0 {
+                        i = (i + 1) & (cap - 1);
+                    }
+                    m.slots[i] = (k, v);
+                }
+            }
+        }
+        m
+    }
+
+    #[inline(always)]
+    fn packed(&self, k: u64) -> Option<u16> {
+        let mask = self.slots.len() - 1;
+        let mut i = mix(k) as usize & mask;
+        loop {
+            // SAFETY: i <= mask
+            let (key, v) = unsafe { *self.slots.get_unchecked(i) };
+            if key == k {
+                return Some(v);
+            }
+            if key == 0 {
+                return None;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    #[inline]
+    fn get(&self, id: &[u8]) -> Option<u16> {
+        match pack(id) {
+            0 => self.other.get(id).copied(),
+            k => self.packed(k),
+        }
+    }
+
+    /// `get` of the `len` bytes at `p` (16 bytes must be readable).
+    #[inline(always)]
+    unsafe fn get_at(&self, p: *const u8, len: usize) -> Option<u16> {
+        if len <= 10 {
+            let k = pack16(load16(p, len), len);
+            if k != 0 {
+                return self.packed(k);
+            }
+        }
+        self.other.get(std::slice::from_raw_parts(p, len)).copied()
+    }
+}
+
+struct Small {
+    products: IdMap,
+    campaigns: IdMap,
+    cat_names: Vec<Bytes>,
+    cat_rank: Vec<u32>,
+    unknown_cat: u16,
+    camp_ids: Vec<Bytes>,
+    camp_channel: Vec<Bytes>,
+}
+
+/// products.csv and campaigns.csv.
+fn small_tables(data: &Path) -> Small {
+    // products -> categories; "unknown" is its own category, never one of the file's
+    let mut cat_names: Vec<Bytes> = Vec::new();
+    let mut cat_idx: BytesMap<u16> = BytesMap::default();
+    let mut products: Vec<(Bytes, u16)> = Vec::new();
+    let mut seen: BytesMap<()> = BytesMap::default();
+    for (p, c) in small_table(&data.join("products.csv")) {
+        let n = cat_names.len() as u16;
+        let ci = *cat_idx.entry(c).or_insert_with(|| {
+            cat_names.push(c);
+            n
+        });
+        products.push((p, ci));
+    }
+    // product_id is unique per rules.md; were one repeated, its last line would count
+    products.reverse();
+    products.retain(|&(p, _)| seen.insert(p, ()).is_none());
+    let unknown_cat = cat_names.len() as u16;
+    cat_names.push(b"unknown");
+    if cat_names.len() > 256 {
+        die("over 255 categories"); // ERec::pay keeps the category in 8 bits
+    }
+    let mut order: Vec<usize> = (0..cat_names.len()).collect();
+    order.sort_by(|&a, &b| cat_names[a].cmp(cat_names[b]));
+    let mut cat_rank = vec![0u32; cat_names.len()];
+    for (r, &i) in order.iter().enumerate() {
+        cat_rank[i] = r as u32;
+    }
+
+    // campaigns: a repeated campaign_id keeps its first line
+    let mut camp_ids: Vec<Bytes> = Vec::new();
+    let mut camp_channel: Vec<Bytes> = Vec::new();
+    let mut campaigns: Vec<(Bytes, u16)> = Vec::new();
+    seen.clear();
+    for (c, ch) in small_table(&data.join("campaigns.csv")) {
+        if seen.insert(c, ()).is_some() {
+            continue;
+        }
+        if camp_ids.len() >= u16::MAX as usize {
+            die("over 65534 campaigns");
+        }
+        campaigns.push((c, camp_ids.len() as u16));
+        camp_ids.push(c);
+        camp_channel.push(ch);
+    }
+    Small { products: IdMap::new(&products), campaigns: IdMap::new(&campaigns), cat_names, cat_rank, unknown_cat, camp_ids, camp_channel }
+}
+
 /// rules.md "Linked IDs": every link line joins its two IDs in the ID table. Returns the number of lines joined.
-fn build_links(cx: &Ctx, files: &[InFile], threads: usize) -> usize {
+fn build_links(ids: &IdTable, names: &Interner, files: &[InFile], threads: usize) -> usize {
     let mut work = Vec::new();
     chunks_of(0, files, 128 << 10, &mut work);
     // A. parse, add both IDs, join them
@@ -1572,8 +1740,8 @@ fn build_links(cx: &Ctx, files: &[InFile], threads: usize) -> usize {
     let parts = par(
         threads,
         work.len(),
-        || (Vec::<u8>::new(), Vec::<u32>::new(), 0usize),
-        |(buf, seen, ins), i| {
+        || (Vec::<u8>::new(), 0usize, 0usize),
+        |(buf, lines, ins), i| {
             let (_, fi, s, e) = work[i];
             let (len, start, end) = read_span(&files[fi], s, e, buf);
             // SAFETY: the fields live in `buf`, which outlives this call; nothing keeps them
@@ -1581,24 +1749,22 @@ fn build_links(cx: &Ctx, files: &[InFile], threads: usize) -> usize {
             let mut keys = [(0u64, 0u64, 0u32, 0u32); HALF];
             let mut ends = [(0u32, 0u32); HALF];
             let mut n = 0usize;
-            let mut step = |n: usize, new: Option<(u64, u64)>, seen: &mut Vec<u32>, ins: &mut usize| {
+            let mut step = |n: usize, new: Option<(u64, u64)>, ins: &mut usize| {
                 let i = n % HALF;
                 if n >= 2 * HALF {
                     let (x, y) = ends[i];
                     if x != y {
-                        cx.ids.union(&cx.names, x, y);
+                        ids.union(names, x, y);
                     }
                 }
                 if n >= HALF {
                     let (ka, kb, ha, hb) = keys[i];
                     if ka != 0 {
-                        let (x, y) = (cx.ids.slot_from(ha, ka, ins), cx.ids.slot_from(hb, kb, ins));
-                        seen.push(x);
-                        seen.push(y);
+                        let (x, y) = (ids.slot_from(ha, ka, ins), ids.slot_from(hb, kb, ins));
                         for z in [x, y] {
-                            let u = cx.ids.slots[z as usize].up.load(Relaxed);
+                            let u = ids.slots[z as usize].up.load(Relaxed);
                             if u != 0 {
-                                prefetch(&cx.ids.slots[u as usize - 1]);
+                                prefetch(&ids.slots[u as usize - 1]);
                             }
                         }
                         ends[i] = (x, y);
@@ -1607,7 +1773,7 @@ fn build_links(cx: &Ctx, files: &[InFile], threads: usize) -> usize {
                     }
                 }
                 keys[i] = match new {
-                    Some((ka, kb)) => (ka, kb, cx.ids.aim(ka), cx.ids.aim(kb)),
+                    Some((ka, kb)) => (ka, kb, ids.aim(ka), ids.aim(kb)),
                     None => (0, 0, 0, 0),
                 };
             };
@@ -1615,30 +1781,40 @@ fn build_links(cx: &Ctx, files: &[InFile], threads: usize) -> usize {
                 if a.is_empty() || b.is_empty() {
                     return;
                 }
-                step(n, Some((cx.names.key(a), cx.names.key(b))), seen, ins);
+                step(n, Some((names.key(a), names.key(b))), ins);
                 n += 1;
+                *lines += 1;
             });
             for _ in 0..2 * HALF {
-                step(n, None, seen, ins);
+                step(n, None, ins);
                 n += 1;
             }
         },
     );
-    // B. flatten: every linked ID points straight at its root
+    // B. flatten, one pass over the table: every linked ID points straight at its root
+    const SPAN: usize = 1 << 15;
+    const AHEAD: usize = 24;
+    let n = ids.slots.len();
     par(
         threads,
-        parts.len(),
+        n.div_ceil(SPAN),
         || (),
-        |_, i| {
-            for &x in &parts[i].1 {
-                let r = cx.ids.find(x);
-                if r != x {
-                    cx.ids.slots[x as usize].up.store(r + 1, Relaxed);
+        |_, t| {
+            for i in t * SPAN..((t + 1) * SPAN).min(n) {
+                if i + AHEAD < n {
+                    let u = ids.slots[i + AHEAD].up.load(Relaxed);
+                    if u != 0 {
+                        prefetch(&ids.slots[u as usize - 1]);
+                    }
+                }
+                if ids.slots[i].up.load(Relaxed) != 0 {
+                    // i hangs under something, so its root is another slot
+                    ids.slots[i].up.store(ids.find(i as u32) + 1, Relaxed);
                 }
             }
         },
     );
-    parts.iter().map(|p| p.1.len() / 2).sum()
+    parts.iter().map(|p| p.1).sum()
 }
 
 /// rules.md "Events" 1, 3, 4 for one line given as its 7 fields: the generic path of `fast_event`.
@@ -1658,7 +1834,7 @@ fn event_fields(cx: &Ctx, [eid, uid, ts, ingest, etype, pid, price]: [Bytes; 7],
         }
         let pay = match etype {
             b"view" | b"cart" => 0,
-            b"purchase" => (cx.products.get(pid).copied().unwrap_or(cx.unknown_cat) as u32) << 24 | parse_price(price)?,
+            b"purchase" => (cx.products.get(pid).unwrap_or(cx.unknown_cat) as u32) << 24 | parse_price(price)?,
             _ => return None,
         };
         Some((t, pay))
@@ -1678,10 +1854,10 @@ unsafe fn fast_event(cx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, st: 
     if el == 0 {
         return;
     }
-    let Some(ingest) = ts_at(line.add(f[3].0), f[3].1) else { return };
+    let Some(ingest) = ts_memo(line.add(f[3].0), f[3].1, &mut st.days) else { return };
     let ekey = cx.names.key_at(ep, el);
     let (ul, pl) = (f[1].1, f[5].1);
-    let ts = match ts_at(line.add(f[2].0), f[2].1) {
+    let ts = match ts_memo(line.add(f[2].0), f[2].1, &mut st.days) {
         Some(t) if ul != 0 && pl != 0 && t >= cx.ws && t < cx.we && ingest - t <= DAY => t,
         _ => return st.log(cx, ekey, ingest, 0),
     };
@@ -1691,7 +1867,7 @@ unsafe fn fast_event(cx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, st: 
         4 if w as u32 == u32::from_le_bytes(*b"view") || w as u32 == u32::from_le_bytes(*b"cart") => 0,
         8 if w == u64::from_le_bytes(*b"purchase") => {
             let Some(p) = parse_price(std::slice::from_raw_parts(line.add(f[6].0), f[6].1)) else { return st.log(cx, ekey, ingest, 0) };
-            let cat = cx.products.get(std::slice::from_raw_parts(line.add(f[5].0), pl)).copied().unwrap_or(cx.unknown_cat);
+            let cat = cx.products.get_at(line.add(f[5].0), pl).unwrap_or(cx.unknown_cat);
             (cat as u32) << 24 | p
         }
         _ => return st.log(cx, ekey, ingest, 0),
@@ -1727,7 +1903,7 @@ fn click_fields(cx: &Ctx, [cid, uid, camp, ts]: [Bytes; 4], st: &mut Shard) {
     if t < cx.base || t >= cx.we {
         return;
     }
-    let Some(&camp) = cx.campaigns.get(camp) else { return };
+    let Some(camp) = cx.campaigns.get(camp) else { return };
     st.click(cx, cx.names.key(cid), cx.names.key(uid), t, camp);
 }
 
@@ -1737,11 +1913,11 @@ unsafe fn fast_click(cx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, st: 
     if f[0].1 == 0 || f[1].1 == 0 {
         return;
     }
-    let t = match ts_at(line.add(f[3].0), f[3].1) {
+    let t = match ts_memo(line.add(f[3].0), f[3].1, &mut st.days) {
         Some(t) if t >= cx.base && t < cx.we => t,
         _ => return,
     };
-    let Some(&camp) = cx.campaigns.get(std::slice::from_raw_parts(line.add(f[2].0), f[2].1)) else { return };
+    let Some(camp) = cx.campaigns.get_at(line.add(f[2].0), f[2].1) else { return };
     st.click(cx, cx.names.key_at(line.add(f[0].0), f[0].1), cx.names.key_at(line.add(f[1].0), f[1].1), t, camp);
 }
 
@@ -1803,13 +1979,25 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
                 }
             }
             *total += cand.len();
-            // by key, then ingest_ts: the first copy of a key is the kept one
-            cand.sort_unstable();
-            for i in 1..cand.len() {
-                if cand[i].0 == cand[i - 1].0 && cand[i].2 != 0 {
-                    // SAFETY: the address of an ERec in a live arena; no other thread touches this record now
-                    unsafe { (*(cand[i].2 as *mut ERec)).person = DROPPED };
+            cand.sort_unstable_by_key(|c| c.0);
+            let mut i = 0;
+            while i < cand.len() {
+                // the copies of one key: the one with the smallest ingest_ts is kept
+                let mut j = i + 1;
+                let mut keep = i;
+                while j < cand.len() && cand[j].0 == cand[i].0 {
+                    if cand[j].1 < cand[keep].1 {
+                        keep = j;
+                    }
+                    j += 1;
                 }
+                for k in i..j {
+                    if k != keep && cand[k].2 != 0 {
+                        // SAFETY: the address of an ERec in a live arena; no other thread touches this record now
+                        unsafe { (*(cand[k].2 as *mut ERec)).person = DROPPED };
+                    }
+                }
+                i = j;
             }
         },
     )
@@ -2714,9 +2902,7 @@ mod tests {
     }
 
     fn ctx() -> Ctx {
-        let mut products = BytesMap::default();
-        products.insert(&b"p1"[..], 0u16);
-        products.insert(&b"p2"[..], 1u16);
+        let products = IdMap::new(&[(&b"p1"[..], 0u16), (&b"p2"[..], 1u16)]);
         let ws = parse_ts(b"2028-02-20T00:00:00Z").unwrap();
         Ctx {
             ws,
@@ -2726,7 +2912,7 @@ mod tests {
             ndays: 14,
             ncamp: 0,
             products,
-            campaigns: BytesMap::default(),
+            campaigns: IdMap::new(&[]),
             unknown_cat: 2,
             cat_rank: vec![0, 1, 2],
             ids: IdTable::new(16),
@@ -2786,12 +2972,19 @@ mod tests {
     #[test]
     fn ts_at_matches_parse_ts() {
         let mut r = Rng(0xfeed_beef_1357_9bdf);
+        let mut days = [NO_DAY; 32];
+        let mut hits = 0;
         for _ in 0..200_000 {
             let s = ts_value(&mut r);
             let mut buf = s.clone().into_bytes();
             buf.extend_from_slice(&[b'7'; 32]);
-            assert_eq!(unsafe { ts_at(buf.as_ptr(), s.len()) }, parse_ts(s.as_bytes()), "{s:?}");
+            let want = parse_ts(s.as_bytes());
+            assert_eq!(unsafe { ts_at(buf.as_ptr(), s.len()) }, want, "{s:?}");
+            let before = days;
+            assert_eq!(unsafe { ts_memo(buf.as_ptr(), s.len(), &mut days) }, want, "memo {s:?}");
+            hits += (want.is_some() && s.len() >= 20 && before.iter().zip(&days).all(|(x, y)| x.a == y.a && x.b == y.b)) as usize;
         }
+        assert!(hits > 20_000, "the memo was hit only {hits} times");
     }
 
     #[test]

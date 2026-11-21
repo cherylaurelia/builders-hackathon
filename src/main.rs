@@ -2102,18 +2102,29 @@ struct Work {
     cstart: Vec<u32>,
     cfill: Vec<u32>,
     ev: Vec<u64>,
-    tmp: Vec<u64>,
     ck: Vec<Ck>,
     sessions: Vec<Sess>,
     day_groups: Vec<(usize, usize)>, // (d, first session index)
-    cats: Vec<(u16, i64)>,
     touched: Vec<usize>,
+    // the person at hand, by 30-minute bin of [base, we): a bit per bin with events, their first and last ts and
+    // their number (MAX, 0, 0 for a bin without), and the session the bin's events are in
+    bin_any: Vec<u64>,
+    bin_min: Vec<u32>,
+    bin_max: Vec<u32>,
+    bin_cnt: Vec<u32>,
+    bin_sess: Vec<u32>,
+    // the person's purchases as `ts << 32 | pay`, their sums by (day, category), and the best category of a day
+    purchases: Vec<u64>,
+    cat_sum: Vec<i64>,
+    cat_hit: Vec<u32>,
+    best: Vec<(i64, u16)>,
 }
 
 impl Work {
     fn new(cx: &Ctx) -> Work {
         let cells = (cx.ncamp + 1) * cx.ndays;
         let local = (1usize << cx.pshift) + 1;
+        let bins = ((cx.we - cx.base) / GAP) as usize + 1;
         Work {
             rows: Vec::new(),
             cred: vec![Cred::default(); cells],
@@ -2127,57 +2138,21 @@ impl Work {
             cstart: vec![0; local],
             cfill: vec![0; local],
             ev: Vec::new(),
-            tmp: Vec::new(),
             ck: Vec::new(),
             sessions: Vec::new(),
             day_groups: Vec::new(),
-            cats: Vec::new(),
             touched: Vec::new(),
+            bin_any: vec![0; bins.div_ceil(64)],
+            bin_min: vec![u32::MAX; bins],
+            bin_max: vec![0; bins],
+            bin_cnt: vec![0; bins],
+            bin_sess: vec![0; bins],
+            purchases: Vec::new(),
+            cat_sum: vec![0; cx.ndays * cx.cat_rank.len()],
+            cat_hit: Vec::new(),
+            best: vec![(0, NO_CAT); cx.ndays],
         }
     }
-}
-
-/// Sorts `ts << 32 | pay` values by ts.
-fn sort_events(v: &mut [u64], tmp: &mut Vec<u64>) {
-    if v.len() < 1024 {
-        v.sort_unstable();
-        return;
-    }
-    // LSD radix on the 32 ts bits, 11 bits a pass
-    let n = v.len();
-    tmp.clear();
-    tmp.resize(n, 0);
-    let mut hist = vec![[0u32; 2048]; 3];
-    for &x in v.iter() {
-        let t = x >> 32;
-        hist[0][(t & 2047) as usize] += 1;
-        hist[1][((t >> 11) & 2047) as usize] += 1;
-        hist[2][(t >> 22) as usize] += 1;
-    }
-    for h in hist.iter_mut() {
-        let mut sum = 0;
-        for c in h.iter_mut() {
-            let k = *c;
-            *c = sum;
-            sum += k;
-        }
-    }
-    for &x in v.iter() {
-        let d = ((x >> 32) & 2047) as usize;
-        tmp[hist[0][d] as usize] = x;
-        hist[0][d] += 1;
-    }
-    for &x in tmp.iter() {
-        let d = ((x >> 43) & 2047) as usize;
-        v[hist[1][d] as usize] = x;
-        hist[1][d] += 1;
-    }
-    for &x in v.iter() {
-        let d = (x >> 54) as usize;
-        tmp[hist[2][d] as usize] = x;
-        hist[2][d] += 1;
-    }
-    v.copy_from_slice(tmp);
 }
 
 /// rules.md "Events" 5-7 and "Clicks" 4-7 for person partition `p`: the people whose slot number starts with p.
@@ -2253,7 +2228,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
         }
     }
 
-    let mut ev = std::mem::take(&mut w.ev);
+    let ev = std::mem::take(&mut w.ev);
     let mut ck = std::mem::take(&mut w.ck);
     for l in 0..local {
         let (a, b) = (w.start[l] as usize, w.start[l + 1] as usize);
@@ -2262,7 +2237,6 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
         }
         let name = cx.ids.slots[(p << cx.pshift) | l].key.load(Relaxed);
         let (ca, cb) = (w.cstart[l] as usize, w.cstart[l + 1] as usize);
-        sort_events(&mut ev[a..b], &mut w.tmp);
         ck[ca..cb].sort_unstable_by_key(|c| c.k);
         person_work(cx, name, &ev[a..b], &ck[ca..cb], w);
     }
@@ -2270,50 +2244,104 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     w.ck = ck;
 }
 
-/// One person: `evs` = their surviving events as `ts << 32 | pay` by ts, `cs` = their valid clicks by ts.
+/// One person: `evs` = their surviving events as `ts << 32 | pay` in any order, `cs` = their valid clicks by ts.
+///
+/// Sessions come from 30-minute bins instead of a sort: two events of one bin are never a session break, and
+/// between two non-empty bins next to each other in time there is a break exactly when the later bin's first event
+/// is over GAP after the earlier bin's last. Equal timestamps are in one bin, so they share a session.
 fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
     let width = cx.ndays;
     let organic = cx.ncamp;
-    let Work { rows, cred, assist, stamp, iv, seen, sctr, sessions, day_groups, cats, touched, .. } = w;
+    let ncat = cx.cat_rank.len();
+    const G: u32 = GAP as u32;
+    let Work { rows, cred, assist, stamp, iv, seen, sctr, sessions, day_groups, touched, bin_any, bin_min, bin_max, bin_cnt, bin_sess, purchases, cat_sum, cat_hit, best, .. } =
+        w;
 
     // sessions + user_daily rows
     sessions.clear();
     day_groups.clear();
-    let mut row: Option<UserRow> = None;
+    purchases.clear();
+    let row0 = rows.len();
     let mut prev = i64::MIN / 2;
-    for &e in evs {
-        let ts = (e >> 32) as i64;
-        if ts - prev > GAP {
-            let d = ((ts + cx.base).div_euclid(DAY) - cx.day0) as usize;
-            sessions.push(Sess { start: ts, d, purchased: false, revenue: 0 });
-            let day = (cx.day0 + d as i64) as i32;
-            if row.as_ref().map(|r| r.day != day).unwrap_or(true) {
-                if let Some(r) = row.take() {
-                    rows.push(finish_row(r, cats, &cx.cat_rank));
-                }
-                row = Some(UserRow { name, day, sessions: 0, events: 0, revenue: 0, top: NO_CAT });
-                day_groups.push((d, sessions.len() - 1));
+    // the events of bin `b` (first at `mn`, last at `mx`, `ct` of them), bins in time order
+    let mut bin = |b: usize, mn: u32, mx: u32, ct: u32| {
+        if mn as i64 - prev > GAP {
+            let d = ((mn as i64 + cx.base).div_euclid(DAY) - cx.day0) as usize;
+            if day_groups.last().map(|g| g.0 != d).unwrap_or(true) {
+                day_groups.push((d, sessions.len()));
+                rows.push(UserRow { name, day: (cx.day0 + d as i64) as i32, sessions: 0, events: 0, revenue: 0, top: NO_CAT });
             }
-            row.as_mut().unwrap().sessions += 1;
+            sessions.push(Sess { start: mn as i64, d, purchased: false, revenue: 0 });
+            rows.last_mut().unwrap().sessions += 1;
         }
-        prev = ts;
-        let r = row.as_mut().unwrap();
-        r.events += 1;
-        let pay = e as u32;
-        if pay != 0 {
-            let (price, cat) = ((pay & 0xff_ffff) as i64, (pay >> 24) as u16);
-            let s = sessions.last_mut().unwrap();
-            s.purchased = true;
-            s.revenue += price;
-            r.revenue += price;
-            match cats.iter_mut().find(|c| c.0 == cat) {
-                Some(c) => c.1 += price,
-                None => cats.push((cat, price)),
+        prev = mx as i64;
+        bin_sess[b] = sessions.len() as u32 - 1;
+        rows.last_mut().unwrap().events += ct;
+    };
+    if let [e] = evs {
+        let t = (e >> 32) as u32;
+        bin((t / G) as usize, t, t, 1);
+        if *e as u32 != 0 {
+            purchases.push(*e);
+        }
+    } else {
+        let (mut wlo, mut whi) = (usize::MAX, 0usize);
+        for &e in evs {
+            let t = (e >> 32) as u32;
+            let b = (t / G) as usize;
+            bin_any[b >> 6] |= 1u64 << (b & 63);
+            wlo = wlo.min(b >> 6);
+            whi = whi.max(b >> 6);
+            bin_min[b] = bin_min[b].min(t);
+            bin_max[b] = bin_max[b].max(t);
+            bin_cnt[b] += 1;
+            if e as u32 != 0 {
+                purchases.push(e);
+            }
+        }
+        for wi in wlo..=whi {
+            let mut m = std::mem::take(&mut bin_any[wi]);
+            while m != 0 {
+                let b = wi * 64 + m.trailing_zeros() as usize;
+                m &= m - 1;
+                let (mn, mx, ct) = (bin_min[b], bin_max[b], bin_cnt[b]);
+                bin_min[b] = u32::MAX;
+                bin_max[b] = 0;
+                bin_cnt[b] = 0;
+                bin(b, mn, mx, ct);
             }
         }
     }
-    if let Some(r) = row.take() {
-        rows.push(finish_row(r, cats, &cx.cat_rank));
+    if !purchases.is_empty() {
+        // a purchase is in the session of its bin
+        for &e in purchases.iter() {
+            let pay = e as u32;
+            let (price, cat) = ((pay & 0xff_ffff) as i64, (pay >> 24) as usize);
+            let s = &mut sessions[bin_sess[((e >> 32) as u32 / G) as usize] as usize];
+            s.purchased = true;
+            s.revenue += price;
+            let ix = s.d * ncat + cat;
+            if cat_sum[ix] == 0 {
+                cat_hit.push(ix as u32); // a price is at least 1, so 0 means untouched
+            }
+            cat_sum[ix] += price;
+        }
+        // top category of each day: the highest sum, a tie to the byte-wise smallest name
+        for &ix in cat_hit.iter() {
+            let (d, c) = (ix as usize / ncat, (ix as usize % ncat) as u16);
+            let v = std::mem::take(&mut cat_sum[ix as usize]);
+            let b = &mut best[d];
+            if v > b.0 || (v == b.0 && cx.cat_rank[c as usize] < cx.cat_rank[b.1 as usize]) {
+                *b = (v, c);
+            }
+        }
+        cat_hit.clear();
+        for (g, &(d, first)) in day_groups.iter().enumerate() {
+            let end = day_groups.get(g + 1).map(|x| x.1).unwrap_or(sessions.len());
+            let r = &mut rows[row0 + g];
+            r.revenue = sessions[first..end].iter().map(|s| s.revenue).sum();
+            r.top = std::mem::replace(&mut best[d], (0, NO_CAT)).1;
+        }
     }
 
     let cts = |c: &Ck| (c.k >> 32) as i64;
@@ -2422,15 +2450,6 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
             stamp[k] = false;
         }
     }
-}
-
-fn finish_row(mut r: UserRow, cats: &mut Vec<(u16, i64)>, rank: &[u32]) -> UserRow {
-    r.top = cats
-        .iter()
-        .max_by(|a, b| a.1.cmp(&b.1).then(rank[b.0 as usize].cmp(&rank[a.0 as usize])))
-        .map_or(NO_CAT, |c| c.0);
-    cats.clear();
-    r
 }
 
 // ---------------------------------------------------------------- Parquet

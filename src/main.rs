@@ -7,12 +7,13 @@
 //!
 //! Phases:
 //!   1. links  -> every link ID goes into one lock-free ID table; a lock-free union-find over its slots hangs the
-//!      larger name under the smaller, so the root of a person is their name (byte-wise smallest ID). The table
-//!      never grows: when it fills up the program restarts itself with a larger one (`restart_bigger`)
-//!   2. events + clicks -> parsed from one chunk queue. A user ID is found (or added) in the ID table; its person's
-//!      slot number is the person. A valid event is a 12-byte record in its person partition; every event also
-//!      leaves (event key, ingest_ts, record address) in its event-key bucket. Clicks go to person partitions too
-//!      (copies are identical: no dedup needed)
+//!      larger name under the smaller, so the root of a person is their name (byte-wise smallest ID); then every
+//!      ID gets its person's number written next to it. The table never grows: when it fills up the program
+//!      restarts itself with a larger one (`restart_bigger`)
+//!   2. events + clicks -> parsed from one chunk queue. A user ID is found (or added) in the ID table, a cache
+//!      line of five IDs and their people. A valid event is a 12-byte record in its person partition; every event
+//!      also leaves (event key, ingest_ts, record address) in its event-key bucket. Clicks go to person partitions
+//!      too (copies are identical: no dedup needed)
 //!   3. per event-key bucket: a cache-sized bit filter finds the keys seen twice; those few are sorted and every
 //!      copy but the earliest ingested is marked dropped in place
 //!   4. per person partition: counting sort by person, sort by ts, sessionize, credit, assist, aggregate; each
@@ -644,31 +645,68 @@ fn prefetch<T>(p: *const T) {
 
 // ---------------------------------------------------------------- the ID table
 
-/// One user ID. `up` = 0: the ID is its own person (or the root of its link tree); else 1 + the slot above it.
-/// `px` = this slot's number xor its person's, once the links are flattened: 0 for a root and for every ID added
-/// later, so a lookup turns a slot into a person with one xor and no branch.
-#[repr(C)]
-struct Slot {
-    key: AtomicU64,
-    up: AtomicU32,
-    px: AtomicU32,
+/// In `Line::up` while the links are joined: the ID hangs under another, the rest is 1 + that one's slot.
+const LINKED: u32 = 1 << 31;
+
+/// A cache line of the ID table: five user IDs, and for each what it hangs under.
+///
+/// `up` while the links are joined: 0 = the ID is its own person (or the root of its link tree), else LINKED | 1 +
+/// the slot above it. Once the links are flattened it is the ID's person (`IdTable::own` of the root's slot,
+/// never 0), and 0 only for an ID added since that nobody has looked up yet: such an ID is its own person.
+/// A lookup is one 64-byte load, one compare of its eight words with the ID, and one 4-byte load.
+#[repr(C, align(64))]
+struct Line {
+    key: [AtomicU64; 5],
+    up: [AtomicU32; 5],
+    _pad: u32,
 }
 
+/// The IDs of a batch that are not in their home lines (`IdTable::people`): where they are in the batch.
+struct Late {
+    n: usize,
+    at: [u8; BATCH],
+}
+
+/// A quarter of a `Line`: what `IdTable::slots` and a home count in, so the parse loops ask for an ID's line with
+/// `slots.as_ptr().add(home)`.
+#[repr(C)]
+struct Slot([u64; 2]);
+
 /// Every user ID seen in links, events and clicks: open addressing on the key, lock free, never resized.
-/// A slot's number is the ID's number; a person is the number of the slot of their name.
+/// An ID's slot is 8 * its line + its place in the line (0..5).
 struct IdTable {
-    slots: &'static [Slot],
-    bits: u32,
+    slots: &'static [Slot], // the lines, in quarters
+    lines: &'static [Line],
+    bits: u32, // 2^bits quarters, 2^(bits - 2) lines
+    part: u32, // 2^part lines hold the names of one person partition
+    #[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
+    wide: bool, // the CPU compares a line with one instruction (AVX-512)
     count: AtomicUsize,
     limit: usize,
 }
 
 impl IdTable {
-    fn new(bits: u32) -> IdTable {
+    /// A table of 2^(bits - 2) lines whose people fall into 2^pbits partitions (`own`).
+    fn new(bits: u32, pbits: u32) -> IdTable {
+        assert!((4..=30).contains(&bits) && pbits + 2 <= bits);
         let n = 1usize << bits;
-        let p = map_anon(n * std::mem::size_of::<Slot>()) as *const Slot;
-        // SAFETY: zeroed memory is n empty slots
-        IdTable { slots: unsafe { std::slice::from_raw_parts(p, n) }, bits, count: AtomicUsize::new(0), limit: n / 4 * 3 }
+        let p = map_anon(n * std::mem::size_of::<Slot>());
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+        let wide = wide::available();
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+        let wide = false;
+        // SAFETY: zeroed memory (page aligned) is n empty quarters, n / 4 empty lines
+        unsafe {
+            IdTable {
+                slots: std::slice::from_raw_parts(p as *const Slot, n),
+                lines: std::slice::from_raw_parts(p as *const Line, n / 4),
+                bits,
+                part: bits - 2 - pbits,
+                wide,
+                count: AtomicUsize::new(0),
+                limit: n / 4 * 3,
+            }
+        }
     }
 
     /// Writes to every 2 MiB of the table, on `threads` threads. A page first touched by a read (a lookup) maps
@@ -686,13 +724,13 @@ impl IdTable {
             |_, i| {
                 if !populate(base + i * HUGE, (bytes - i * HUGE).min(HUGE)) {
                     // a zero stored over a zero: the slot stays empty
-                    self.slots[i * HUGE / std::mem::size_of::<Slot>()].up.store(0, Relaxed);
+                    self.lines[i * HUGE / std::mem::size_of::<Line>()].up[0].store(0, Relaxed);
                 }
             },
         );
     }
 
-    /// Where the search for `key` starts: the first slot of a cache line (4 slots).
+    /// Where the search for `key` starts: the first quarter of a line.
     #[inline(always)]
     fn home(&self, key: u64) -> usize {
         (spread(key) >> (64 - self.bits)) as usize & !3
@@ -706,106 +744,76 @@ impl IdTable {
         h as u32
     }
 
+    /// The key in slot `t`: a slot a search returned, or one a `Line::up` names.
+    #[inline(always)]
+    fn key(&self, t: u32) -> &AtomicU64 {
+        debug_assert!(((t >> 3) as usize) < self.lines.len() && t & 7 < 5);
+        // SAFETY: such a slot's line is below the line count and its place below 5
+        unsafe { self.lines.get_unchecked((t >> 3) as usize).key.get_unchecked((t & 7) as usize) }
+    }
+
+    /// What slot `t` hangs under (`Line::up`); `t` as for `key`.
+    #[inline(always)]
+    fn up(&self, t: u32) -> &AtomicU32 {
+        debug_assert!(((t >> 3) as usize) < self.lines.len() && t & 7 < 5);
+        // SAFETY: as in `key`
+        unsafe { self.lines.get_unchecked((t >> 3) as usize).up.get_unchecked((t & 7) as usize) }
+    }
+
     /// The slot of `key`, added if new. `ins` is the caller's count of additions not yet reported.
     #[cfg(test)]
     fn slot(&self, key: u64, ins: &mut usize) -> u32 {
-        self.slot_from(self.home(key) as u32, key, ins)
+        self.slot_scan(self.home(key) as u32 * 2, key, ins)
     }
 
-    /// `slot` given `home(key)`. A key sits in the first free slot from its home at the time it was added, and
-    /// slots never empty again, so it is in the four slots of its home line unless the line was full by then:
-    /// those four are compared without a branch between them (which of them holds the key is a coin toss to the
-    /// branch predictor), and only a key not among them takes the scan.
-    #[cfg(test)]
+    /// Bit j set when slot j of the line at `home` holds `key`, and bit j set when it is empty. Each key is read
+    /// whole (an aligned 8 bytes is never seen half written).
     #[inline(always)]
-    fn slot_from(&self, home: u32, key: u64, ins: &mut usize) -> u32 {
-        // SAFETY: home is a multiple of 4 below the (power of two, >= 2^16) slot count
-        let s = unsafe { self.slots.as_ptr().add(home as usize) };
-        let eq = |j: usize| (unsafe { (*s.add(j)).key.load(Relaxed) } == key) as u32;
-        let m = eq(0) | eq(1) << 1 | eq(2) << 2 | eq(3) << 3;
-        if m != 0 {
-            return home + m.trailing_zeros();
-        }
-        self.slot_scan(home, key, ins)
-    }
-
-    /// `slot_from` that does not leave the line at `home`: None when the line is full of other keys, so the key
-    /// is (or will be added) further on. The caller asks for the next line (`next_line`) and comes back when
-    /// it is in the cache, instead of waiting for it here.
-    ///
-    /// None is exact: a slot never changes once it holds a key, so four keys read here that are not `key` are
-    /// the line's four keys for good. A slot read as empty may have been filled since (by another thread, even
-    /// with this very key), so any empty one sends the lookup through `slot_scan`, which takes each slot in turn.
-    #[inline(always)]
-    fn slot_in_line(&self, home: u32, key: u64, ins: &mut usize) -> Option<u32> {
-        // SAFETY: as in `slot_from`
-        let s = unsafe { self.slots.as_ptr().add(home as usize) };
+    fn look(&self, home: u32, key: u64) -> (u32, u32) {
+        // SAFETY: home is a multiple of 4 below the (power of two, >= 2^16) quarter count: the first quarter of
+        // a line, 64 readable bytes
+        let l = unsafe { self.slots.as_ptr().add(home as usize) };
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        // SAFETY: the line is 64 readable bytes (4 slots of 16, the table starts on a page). Each key is read whole
-        // (an aligned 8 bytes is never seen half written), which is all the reasoning above needs.
         unsafe {
             use std::arch::x86_64::*;
-            let (a, b) = (_mm256_loadu_si256(s as *const __m256i), _mm256_loadu_si256((s as *const __m256i).add(1)));
-            // bits 0 and 2 of a half: its two keys (bits 1 and 3 are the slots' other fields)
-            let m = |x: __m256i| (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, x))) & 5 | (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, x))) & 5) << 4) as u32;
-            let eq = m(_mm256_set1_epi64x(key as i64));
-            if eq != 0 {
-                return Some(home + eq.trailing_zeros() / 2);
-            }
-            if m(_mm256_setzero_si256()) == 0 {
-                return None;
-            }
-            return Some(self.slot_scan(home, key, ins));
+            let (a, b) = (_mm256_loadu_si256(l as *const __m256i), _mm256_loadu_si256((l as *const __m256i).add(1)));
+            // the first four keys, and the fifth: the other three words of `b` are not keys
+            let m = |x: __m256i| (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, x))) | (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, x))) & 1) << 4) as u32;
+            return (m(_mm256_set1_epi64x(key as i64)), m(_mm256_setzero_si256()));
         }
         #[allow(unreachable_code)]
-        let k = [0, 1, 2, 3].map(|j| unsafe { (*s.add(j)).key.load(Relaxed) });
-        let m = (k[0] == key) as u32 | ((k[1] == key) as u32) << 1 | ((k[2] == key) as u32) << 2 | ((k[3] == key) as u32) << 3;
-        if m != 0 {
-            return Some(home + m.trailing_zeros());
+        {
+            let k = unsafe { &(*(l as *const Line)).key };
+            let m = |x: u64| (0..5).fold(0, |m, j| m | ((k[j].load(Relaxed) == x) as u32) << j);
+            (m(key), m(0))
         }
-        if (k[0] != 0) & (k[1] != 0) & (k[2] != 0) & (k[3] != 0) {
-            return None;
-        }
-        Some(self.slot_scan(home, key, ins))
     }
 
-    /// `slot_in_line` for a key that is probably new (the link builder): a key that is not in its home line goes
-    /// straight into the line's first empty slot as it was read, without a second look at the slots before it
-    /// (each holds another key, for good). When another thread takes that slot first, `slot_scan` goes on from it:
-    /// it may hold this very key now.
+    /// The slot of `key` (added if new) when that is settled by the line at `home`: None when the line is full of
+    /// other keys, so the key is (or will be added) further on. The caller asks for the next line (`next_line`)
+    /// and comes back when it is in the cache, instead of waiting for it here.
+    ///
+    /// A key sits in the first free slot from its home at the time it was added, and slots never empty again, so
+    /// it is in its home line unless the line was full by then. None is exact: a slot never changes once it holds
+    /// a key, so five keys read here that are not `key` are the line's five keys for good. A key that is not in
+    /// the line goes straight into the line's first empty slot as it was read, without a second look at the slots
+    /// before it (each holds another key, for good). When another thread takes that slot first, `slot_scan` goes
+    /// on from it: it may hold this very key now.
     #[inline(always)]
-    fn slot_new_in_line(&self, home: u32, key: u64, ins: &mut usize) -> Option<u32> {
-        // SAFETY: as in `slot_from`
-        let s = unsafe { self.slots.as_ptr().add(home as usize) };
-        let (eq, empty): (u32, u32);
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        // SAFETY: as in `slot_in_line`
-        unsafe {
-            use std::arch::x86_64::*;
-            let (a, b) = (_mm256_loadu_si256(s as *const __m256i), _mm256_loadu_si256((s as *const __m256i).add(1)));
-            // bits 0 and 2 of a half are its two keys: slot j of the line at bit 2 * j
-            let m = |x: __m256i| (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, x))) & 5 | (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, x))) & 5) << 4) as u32;
-            (eq, empty) = (m(_mm256_set1_epi64x(key as i64)), m(_mm256_setzero_si256()));
-        }
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-        {
-            let k = [0, 1, 2, 3].map(|j| unsafe { (*s.add(j)).key.load(Relaxed) });
-            let m = |x: u64| (k[0] == x) as u32 | ((k[1] == x) as u32) << 2 | ((k[2] == x) as u32) << 4 | ((k[3] == x) as u32) << 6;
-            (eq, empty) = (m(key), m(0));
-        }
+    fn slot_in_line(&self, home: u32, key: u64, ins: &mut usize) -> Option<u32> {
+        let (eq, empty) = self.look(home, key);
         if eq != 0 {
-            return Some(home + eq.trailing_zeros() / 2);
+            return Some(home * 2 + eq.trailing_zeros());
         }
         if empty == 0 {
             return None;
         }
-        let j = empty.trailing_zeros() / 2;
-        // SAFETY: j < 4, a slot of the line
-        if unsafe { (*s.add(j as usize)).key.compare_exchange(0, key, Relaxed, Relaxed) }.is_ok() {
+        let t = home * 2 + empty.trailing_zeros();
+        if self.key(t).compare_exchange(0, key, Relaxed, Relaxed).is_ok() {
             self.added(ins);
-            return Some(home + j);
+            return Some(t);
         }
-        Some(self.slot_scan(home + j, key, ins))
+        Some(self.slot_scan(t, key, ins))
     }
 
     /// The line after the one at `home`, with its cache line on the way.
@@ -816,34 +824,40 @@ impl IdTable {
         h as u32
     }
 
-    /// `slot_from` for a key that is not in its home line (yet): linear probing from `home`, adding the key in the
-    /// first free slot.
+    /// The slot of `key`, added if new, searching from slot `from` (a slot of its home line with only other keys
+    /// before it in the line, or the first slot of a line after a full one): slot by slot through the line and on
+    /// through the lines after it, adding the key in the first free slot.
     #[inline(never)]
-    fn slot_scan(&self, home: u32, key: u64, ins: &mut usize) -> u32 {
-        let mask = self.slots.len() - 1;
-        let mut i = home as usize;
+    fn slot_scan(&self, from: u32, key: u64, ins: &mut usize) -> u32 {
+        let mask = self.lines.len() - 1;
+        let (mut l, mut j) = ((from >> 3) as usize & mask, (from & 7) as usize);
         loop {
-            // SAFETY: i <= mask
-            let s = unsafe { self.slots.get_unchecked(i) };
-            let k = s.key.load(Relaxed);
-            if k == key {
-                return i as u32;
-            }
-            if k == 0 {
-                match s.key.compare_exchange(0, key, Relaxed, Relaxed) {
-                    Ok(_) => {
-                        self.added(ins);
-                        return i as u32;
-                    }
-                    Err(now) if now == key => return i as u32,
-                    Err(_) => {}
+            while j < 5 {
+                // SAFETY: l <= mask, j < 5
+                let s = unsafe { self.lines.get_unchecked(l).key.get_unchecked(j) };
+                let t = (l * 8 + j) as u32;
+                let k = s.load(Relaxed);
+                if k == key {
+                    return t;
                 }
+                if k == 0 {
+                    match s.compare_exchange(0, key, Relaxed, Relaxed) {
+                        Ok(_) => {
+                            self.added(ins);
+                            return t;
+                        }
+                        Err(now) if now == key => return t,
+                        Err(_) => {}
+                    }
+                }
+                j += 1;
             }
-            i = (i + 1) & mask;
+            j = 0;
+            l = (l + 1) & mask;
         }
     }
 
-    /// Counts an addition; a table three quarters full restarts the program with a larger one.
+    /// Counts an addition; a table with three IDs a line restarts the program with a larger one.
     #[inline(always)]
     fn added(&self, ins: &mut usize) {
         *ins += 1;
@@ -855,23 +869,188 @@ impl IdTable {
         }
     }
 
-    /// The person of the ID in `slot`, once the links are flattened.
+    /// The person of the ID in slot `t` when it hangs under nothing, never 0. Its partition (`person >>
+    /// (part + 3)`) is the high bits of its line; below that, 1 + (its place in the line << part | the low bits of
+    /// its line): the people of a partition are numbered from 1 through 5 << part.
     #[inline(always)]
-    fn person(&self, slot: u32) -> u32 {
-        slot ^ unsafe { self.slots.get_unchecked(slot as usize) }.px.load(Relaxed)
+    fn own(&self, t: u32) -> u32 {
+        let (line, j, k) = (t >> 3, t & 7, self.part);
+        (((line >> k) << (k + 3)) | ((line & ((1 << k) - 1)) * 5 + j)) + 1
     }
 
-    /// The root above `x`, halving the path on the way.
+    /// The slot of the ID that names `person`: `own` backwards.
+    #[inline(always)]
+    fn slot_of(&self, person: u32) -> u32 {
+        let (x, k) = (person.wrapping_sub(1), self.part);
+        let y = x & ((8 << k) - 1);
+        ((((x >> (k + 3)) << k) + y / 5) << 3) | (y % 5)
+    }
+
+    /// The name of `person`: the key of its root. For a number that is nobody's: 0 or some other key.
+    #[inline(always)]
+    fn name(&self, person: u32) -> u64 {
+        let t = self.slot_of(person);
+        match self.lines.get((t >> 3) as usize) {
+            Some(l) if t & 7 < 5 => l.key[(t & 7) as usize].load(Relaxed),
+            _ => 0,
+        }
+    }
+
+    /// The person of the ID in slot `t`, once the links are flattened.
+    #[inline(always)]
+    fn person(&self, t: u32) -> u32 {
+        let v = self.up(t).load(Relaxed);
+        if v != 0 {
+            return v;
+        }
+        self.first_seen(t)
+    }
+
+    /// `person` of an ID added after the links that has no person written down yet: its own, and written down
+    /// (whoever comes first writes the same number).
+    #[cold]
+    #[inline(never)]
+    fn first_seen(&self, t: u32) -> u32 {
+        let v = self.own(t);
+        self.up(t).store(v, Relaxed);
+        v
+    }
+
+    /// The people of the `n` IDs `key`, whose home lines `home` were asked for a batch ago (`aim`): the first pass
+    /// of `Shard::drain`. An ID that is not in its home line (the line was full of other keys when the ID was
+    /// added, or is now) asks for the next line and is looked up from there after the others.
+    #[inline(always)]
+    fn people(&self, key: &[u64; BATCH], home: &mut [u32; BATCH], n: usize, person: &mut [u32; BATCH], ins: &mut usize) {
+        let n = n.min(BATCH);
+        let mut late = Late { n: 0, at: [0; BATCH] };
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+        if self.wide {
+            // SAFETY: `wide` says the CPU has AVX-512 F and VL
+            unsafe { self.people_wide(key, home, n, person, &mut late, ins) };
+            return self.people_late(key, home, person, &late, ins);
+        }
+        for i in 0..n {
+            self.person_at(i, key, home, person, &mut late, ins);
+        }
+        self.people_late(key, home, person, &late, ins)
+    }
+
+    /// `people` for the ID at `i`, by the line at its home alone: its person, or its place in `late`.
+    #[inline(always)]
+    fn person_at(&self, i: usize, key: &[u64; BATCH], home: &mut [u32; BATCH], person: &mut [u32; BATCH], late: &mut Late, ins: &mut usize) {
+        match self.slot_in_line(home[i], key[i], ins) {
+            Some(t) => person[i] = self.person(t),
+            None => {
+                home[i] = self.next_line(home[i]);
+                late.at[late.n & (BATCH - 1)] = i as u8; // n < BATCH: at most one entry per ID of the batch
+                late.n += 1;
+            }
+        }
+    }
+
+    /// The IDs of `late`: each from the line after its home line, which holds five other keys for good.
+    #[inline(always)]
+    fn people_late(&self, key: &[u64; BATCH], home: &[u32; BATCH], person: &mut [u32; BATCH], late: &Late, ins: &mut usize) {
+        for &i in &late.at[..late.n.min(BATCH)] {
+            let i = i as usize & (BATCH - 1);
+            person[i] = self.person(self.slot_scan(home[i] * 2, key[i], ins));
+        }
+    }
+
+    /// `person_at` out of line, for the 512-bit loop: the few IDs that loop does not settle itself.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    #[cold]
+    #[inline(never)]
+    fn person_rare(&self, i: usize, key: &[u64; BATCH], home: &mut [u32; BATCH], person: &mut [u32; BATCH], late: &mut Late, ins: &mut usize) {
+        self.person_at(i & (BATCH - 1), key, home, person, late, ins)
+    }
+
+    /// The first pass of `people` with one 512-bit compare a line: the line's eight words against the ID, of which
+    /// the first five are its keys. An ID found with its person written down is settled here; any other goes
+    /// through `person_rare`.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    #[target_feature(enable = "avx512f,avx512vl,avx2,bmi1,bmi2")]
+    #[inline(never)]
+    unsafe fn people_wide(&self, key: &[u64; BATCH], home: &mut [u32; BATCH], n: usize, person: &mut [u32; BATCH], late: &mut Late, ins: &mut usize) {
+        use std::arch::x86_64::*;
+        let base = self.slots.as_ptr();
+        for i in 0..n.min(BATCH) {
+            // SAFETY: as in `look`: a home is the first quarter of a line, 64 readable bytes; a word of the line
+            // is read whole
+            let l = base.add(*home.get_unchecked(i) as usize);
+            let eq = _mm512_mask_cmpeq_epi64_mask(0x1f, _mm512_loadu_si512(l as *const _), _mm512_set1_epi64(*key.get_unchecked(i) as i64)) as u32;
+            if eq != 0 {
+                let p = (*(l as *const Line)).up.get_unchecked(eq.trailing_zeros() as usize).load(Relaxed);
+                if p != 0 {
+                    *person.get_unchecked_mut(i) = p;
+                    continue;
+                }
+            }
+            self.person_rare(i, key, home, person, late, ins);
+        }
+    }
+
+    /// Flattens the links, one pass over the table on `threads` threads: every ID gets its person (`own` of its
+    /// root) in place of what it hangs under. The linked IDs of a stretch wait, what they hang under asked for,
+    /// until WAIT of them do.
+    fn flatten(&self, threads: usize) {
+        let ids = self;
+        const SPAN: usize = 1 << 13;
+        const WAIT: usize = 32;
+        let n = ids.lines.len();
+        par(
+            threads,
+            n.div_ceil(SPAN),
+            || (),
+            |_, t| {
+                let mut wait = [(0u32, 0u32); WAIT + 4];
+                let mut nw = 0;
+                let settle = |wait: &[(u32, u32)]| {
+                    for &(i, p) in wait {
+                        // i hangs under p, so its root is p or above it
+                        ids.up(i).store(ids.own(ids.find(p)), Relaxed);
+                    }
+                };
+                for l in t * SPAN..((t + 1) * SPAN).min(n) {
+                    let line = &ids.lines[l];
+                    // the IDs of a line are its first slots: an ID goes into the first free one
+                    for j in 0..5 {
+                        if line.key[j].load(Relaxed) == 0 {
+                            break;
+                        }
+                        let i = (l * 8 + j) as u32;
+                        let u = line.up[j].load(Relaxed);
+                        if u == 0 {
+                            line.up[j].store(ids.own(i), Relaxed);
+                        } else {
+                            let p = (u & !LINKED) - 1; // an ID that hangs under another does so for good
+                            prefetch(&ids.lines[(p >> 3) as usize]);
+                            wait[nw] = (i, p);
+                            nw += 1;
+                        }
+                    }
+                    if nw >= WAIT {
+                        settle(&wait[..nw]);
+                        nw = 0;
+                    }
+                }
+                settle(&wait[..nw]);
+            },
+        );
+    }
+
+    /// The root above slot `x`, halving the path on the way. While the links are joined, or while they are
+    /// flattened: a slot that already holds its person gives that person's slot.
     fn find(&self, mut x: u32) -> u32 {
         loop {
-            let u = self.slots[x as usize].up.load(Relaxed);
-            if u == 0 {
-                return x;
+            let u = self.up(x).load(Relaxed);
+            if u & LINKED == 0 {
+                return if u == 0 { x } else { self.slot_of(u) };
             }
-            let p = u - 1;
-            let g = self.slots[p as usize].up.load(Relaxed);
-            if g != 0 {
-                let _ = self.slots[x as usize].up.compare_exchange(u, g, Relaxed, Relaxed);
+            let p = (u & !LINKED) - 1;
+            let g = self.up(p).load(Relaxed);
+            if g & LINKED != 0 {
+                let _ = self.up(x).compare_exchange(u, g, Relaxed, Relaxed);
             }
             x = p;
         }
@@ -886,9 +1065,9 @@ impl IdTable {
             if a == b {
                 return;
             }
-            let (ka, kb) = (self.slots[a as usize].key.load(Relaxed), self.slots[b as usize].key.load(Relaxed));
+            let (ka, kb) = (self.key(a).load(Relaxed), self.key(b).load(Relaxed));
             let (hi, lo) = if names.less(kb, ka) { (a, b) } else { (b, a) };
-            if self.slots[hi as usize].up.compare_exchange(0, lo + 1, Relaxed, Relaxed).is_ok() {
+            if self.up(hi).compare_exchange(0, LINKED | (lo + 1), Relaxed, Relaxed).is_ok() {
                 return;
             }
         }
@@ -905,8 +1084,8 @@ fn restart_bigger(bits: u32) -> ! {
             std::thread::park(); // another thread is already restarting
         }
     }
-    if bits + 2 > 36 {
-        die("ID table would pass 2^36 slots");
+    if bits + 2 > 30 {
+        die("ID table would pass 2^28 lines");
     }
     eprintln!("ID table of 2^{bits} slots filled up: restarting with 2^{}", bits + 2);
     let exe = std::env::current_exe().unwrap_or_else(|e| die(&format!("current_exe: {e}")));
@@ -2265,10 +2444,9 @@ impl Shard {
     /// Looks up the user IDs of the waiting events (`EVENTS`) or clicks and writes their records. Call when the
     /// batch is full and at the end of every chunk.
     ///
-    /// Two passes: the first turns every user ID into its person (the table lines were asked for as the lines were
-    /// parsed), the second writes the records. An ID that is not in its home line (the line was full of other keys
-    /// when the ID was added, or is now) asks for the next line and is looked up from there at the end of the first
-    /// pass. The streams' stages are not asked for: they stay in the L2 (Intel 20M: asking cost 1.4% wall).
+    /// Two passes: the first turns every user ID into its person (`IdTable::people`: the table lines were asked
+    /// for as the lines were parsed), the second writes the records. The streams' stages are not asked for: they
+    /// stay in the L2 (Intel 20M: asking cost 1.4% wall).
     #[inline(never)]
     fn drain<const EVENTS: bool>(&mut self, cx: &Ctx) {
         let Shard { arena, ev, ck, lg, far, ins, bt, .. } = self;
@@ -2278,23 +2456,7 @@ impl Shard {
         let (ids, pshift, qshift, abase) = (&cx.ids, cx.pshift, cx.qshift, cx.abase);
         let (evp, ckp, lgp) = (ev.as_mut_ptr(), ck.as_mut_ptr(), lg.as_mut_ptr());
         let mut person = [0u32; BATCH];
-        let mut late = [0u8; BATCH];
-        let mut nl = 0;
-        for i in 0..n {
-            match ids.slot_in_line(bt.home[i], bt.ukey[i], ins) {
-                Some(slot) => person[i] = ids.person(slot),
-                None => {
-                    bt.home[i] = ids.next_line(bt.home[i]);
-                    late[nl & (BATCH - 1)] = i as u8; // nl < n <= BATCH
-                    nl += 1;
-                }
-            }
-        }
-        for &i in &late[..nl] {
-            let i = i as usize;
-            // its home line holds four other keys for good, so the search may start at the line after it
-            person[i] = ids.person(ids.slot_scan(bt.home[i], bt.ukey[i], ins));
-        }
+        ids.people(&bt.ukey, &mut bt.home, n, &mut person, ins);
         for i in 0..n {
             let (a, tx, person) = (bt.a[i], bt.tx[i], person[i]);
             let part = (person >> pshift) as usize;
@@ -2417,7 +2579,7 @@ fn main() {
     // sizes: a link line is ~21 bytes and names ~1.4 new IDs; ~1 in 40 event lines brings an unlinked ID; an event
     // line is ~75 bytes. A wrong guess costs speed, never rows: the ID table restarts the run when it fills up.
     let id_est = link_bytes / 14 + ev_bytes / 3000 + bytes(&ck_files) / 3000;
-    let id_bits = env_num("SESS_ID_BITS").map(|v| v as u32).unwrap_or(usize::BITS - (id_est * 7 / 5).leading_zeros()).clamp(16, 36);
+    let id_bits = env_num("SESS_ID_BITS").map(|v| v as u32).unwrap_or(usize::BITS - (id_est * 7 / 5).leading_zeros()).clamp(16, 30);
     // about 90,000 events per person partition and per event-key bucket: more of them slow the parse (one open
     // block each per thread), fewer leave the later phases with work that no longer fits a core's cache
     let ev_est = ev_bytes / 72;
@@ -2426,7 +2588,7 @@ fn main() {
     // against 2^9 + 2^9, while 2^8 + 2^8 is even with it (164K events a partition); box, 75M events, 8 threads
     // on 4 CPUs: 2^10 3.03 s, 2^9 2.76 s. Only inputs over ~69M events change. The partitions' floor (a click
     // keeps its person's number in the partition in 16 bits) stays above the cap.
-    let pbits = (env_num("SESS_PBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000).min(9))).clamp(4, 12.min(id_bits - 4)).max(id_bits.saturating_sub(16));
+    let pbits = (env_num("SESS_PBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000).min(9))).clamp(4, 12.min(id_bits - 4)).max((id_bits + 1).saturating_sub(16));
     let qbits = (env_num("SESS_QBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000).min(9))).clamp(4, 12);
     // 128 KiB a read: the copy from the page cache passes the piece through the core's cache twice (as source and
     // as copy), and a larger piece pushes the thread's open stream groups out of it (L2 is 1 MiB, and on the scorer
@@ -2448,7 +2610,7 @@ fn main() {
     );
 
     // 1. links, on every thread; this one reads the small tables meanwhile
-    let ids = IdTable::new(id_bits);
+    let ids = IdTable::new(id_bits, pbits);
     let names = Interner::new();
     mark("files listed, ID table mapped");
     let (n_links, small) = std::thread::scope(|sc| {
@@ -2477,7 +2639,7 @@ fn main() {
         cat_rank,
         ids,
         names,
-        pshift: id_bits - pbits,
+        pshift: id_bits + 1 - pbits,
         qshift: 64 - qbits,
         abase,
         ihi,
@@ -2847,8 +3009,8 @@ impl LinkBatch {
         let mut nl = 0;
         for i in 0..n {
             for j in 0..2 {
-                match ids.slot_new_in_line(self.home[i][j], self.key[i][j], &mut self.ins) {
-                    Some(s) => slot[i][j] = s,
+                match ids.slot_in_line(self.home[i][j], self.key[i][j], &mut self.ins) {
+                    Some(t) => slot[i][j] = t,
                     None => {
                         self.home[i][j] = ids.next_line(self.home[i][j]);
                         late[nl] = (2 * i + j) as u8;
@@ -2859,13 +3021,13 @@ impl LinkBatch {
         }
         for &t in &late[..nl] {
             let (i, j) = (t as usize / 2, t as usize % 2);
-            // its home line holds four other keys for good, so the search may start at the line after it
-            slot[i][j] = ids.slot_scan(self.home[i][j], self.key[i][j], &mut self.ins);
+            // its home line holds five other keys for good, so the search may start at the line after it
+            slot[i][j] = ids.slot_scan(self.home[i][j] * 2, self.key[i][j], &mut self.ins);
         }
-        for s in slot[..n].iter().flatten() {
-            let u = ids.slots[*s as usize].up.load(Relaxed);
+        for &t in slot[..n].iter().flatten() {
+            let u = ids.up(t).load(Relaxed);
             if u != 0 {
-                prefetch(&ids.slots[u as usize - 1]);
+                prefetch(&ids.lines[(((u & !LINKED) - 1) >> 3) as usize]);
             }
         }
         for &[x, y] in &slot[..n] {
@@ -2874,24 +3036,6 @@ impl LinkBatch {
             }
         }
     }
-}
-
-/// Bit 4 * j + 2 set when slot `i + j` of the table hangs under another (its `up` is not 0), for j in 0..4; `i` is
-/// the first slot of a cache line.
-#[inline(always)]
-fn linked4(ids: &IdTable, i: usize) -> u32 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    // SAFETY: the line is 64 readable bytes (4 slots of 16, the table starts on a page); each `up` is read whole
-    unsafe {
-        use std::arch::x86_64::*;
-        let s = ids.slots.as_ptr().add(i) as *const __m256i;
-        let z = _mm256_setzero_si256();
-        // a slot is two keys' worth of 32-bit words: key, key, up, px
-        let m = |x: __m256i| _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(x, z))) as u32;
-        return !(m(_mm256_loadu_si256(s)) | m(_mm256_loadu_si256(s.add(1))) << 8) & 0x4444;
-    }
-    #[allow(unreachable_code)]
-    (0..4).fold(0, |m, j| m | ((ids.slots[i + j].up.load(Relaxed) != 0) as u32) << (4 * j + 2))
 }
 
 /// rules.md "Linked IDs": every link line joins its two IDs in the ID table. Returns the number of lines joined.
@@ -2940,45 +3084,8 @@ fn build_links(ids: &IdTable, names: &Interner, files: &[InFile], threads: usize
         },
     );
     mark("link lines joined");
-    // B. flatten, one pass over the table: every linked ID points straight at its root. The linked slots of a
-    //    stretch are found a cache line at a time and wait, what they hang under asked for, until WAIT of them do
-    const SPAN: usize = 1 << 15;
-    const WAIT: usize = 32;
-    let n = ids.slots.len();
-    par(
-        threads,
-        n.div_ceil(SPAN),
-        || (),
-        |_, t| {
-            let mut wait = [(0u32, 0u32); WAIT + 4];
-            let mut nw = 0;
-            let settle = |wait: &[(u32, u32)]| {
-                for &(i, p) in wait {
-                    // i hangs under p, so its root is p or above it
-                    let root = if ids.slots[p as usize].up.load(Relaxed) == 0 { p } else { ids.find(p) };
-                    ids.slots[i as usize].up.store(root + 1, Relaxed);
-                    ids.slots[i as usize].px.store(i ^ root, Relaxed);
-                }
-            };
-            // the table is a power of two (>= 2^16) slots: whole lines of 4
-            for i in (t * SPAN..((t + 1) * SPAN).min(n)).step_by(4) {
-                let mut m = linked4(ids, i);
-                while m != 0 {
-                    let s = i + (m.trailing_zeros() >> 2) as usize;
-                    m &= m - 1;
-                    let p = ids.slots[s].up.load(Relaxed) - 1; // not 0: an ID that hangs under another does so for good
-                    prefetch(&ids.slots[p as usize]);
-                    wait[nw] = (s as u32, p);
-                    nw += 1;
-                }
-                if nw >= WAIT {
-                    settle(&wait[..nw]);
-                    nw = 0;
-                }
-            }
-            settle(&wait[..nw]);
-        },
-    );
+    // B. every ID gets its person
+    ids.flatten(threads);
     parts.iter().map(|p| p.1.lines).sum()
 }
 
@@ -3827,8 +3934,10 @@ unsafe fn offsets(st: *mut u32, local: usize, act: *mut u32) -> (u32, usize) {
 /// rules.md "Events" 5-7 and "Clicks" 4-7 for person partition `p`: the people whose slot number starts with p.
 #[inline(never)]
 fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
-    let local = 1usize << cx.pshift;
-    let lmask = (local - 1) as u32;
+    let lmask = (1u32 << cx.pshift) - 1;
+    // the people of a partition are numbered 1..=5 << part (`IdTable::own`): bins 0..local, a multiple of 8, of the
+    // 2^pshift that the arrays have room for
+    let local = ((5usize << cx.ids.part) + 1).next_multiple_of(8);
 
     // events: counting sort by person (the low bits of the slot number), with no branch and no bounds check; a
     // dropped copy stays with its person (person_work leaves it out). `start[l + 2]` counts person l; then
@@ -3941,7 +4050,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     for i in 0..w.nact {
         let l = w.act[i] as usize;
         let (a, b) = (w.start[l] as usize, w.start[l + 1] as usize);
-        let name = cx.ids.slots[(p << cx.pshift) | l].key.load(Relaxed);
+        let name = cx.ids.name(((p << cx.pshift) | l) as u32);
         let (ca, cb) = (w.cstart[l] as usize, w.cstart[l + 1] as usize);
         let (pa, pb) = (w.pstart[l] as usize, w.pstart[l + 1] as usize);
         person_work(cx, name, &ev[a..b], pa, pb - pa, ca, cb - ca, w);
@@ -5050,9 +5159,9 @@ mod tests {
             campaigns: IdMap::new(&[]).with_short(&[]),
             unknown_cat: 2,
             cat_rank: vec![0, 1, 2],
-            ids: IdTable::new(16),
+            ids: IdTable::new(16, 4),
             names: Interner::new(),
-            pshift: 12,
+            pshift: 13,
             qshift: 60,
             abase: Ctx::record_fields(0).0,
             ihi: Ctx::record_fields(ws + 14 * DAY).1,
@@ -5809,6 +5918,64 @@ mod tests {
         assert!(root(5) == ids[6] && root(6) == ids[6]);
     }
 
+    /// `IdTable::people` (a batch at a time: with the 512-bit compare where the CPU has it, and without) against
+    /// `slot` and `person` one ID at a time: linked IDs, IDs the pass adds itself, IDs whose home line is full of
+    /// others. And the numbers of people: `slot_of` finds the slot `own` numbered, in the person's partition.
+    #[test]
+    fn batches_find_the_people_single_lookups_do() {
+        let c = ctx();
+        let ids = &c.ids;
+        let mut r = Rng(7);
+        let mut ins = 0;
+        let key = |k: usize| c.names.key(format!("u{k:07}").as_bytes());
+        // 24,000 IDs in 2^14 lines, a third of them joined into trees
+        let slots: Vec<u32> = (0..24_000).map(|k| ids.slot(key(k), &mut ins)).collect();
+        for _ in 0..8_000 {
+            ids.union(&c.names, slots[r.below(24_000)], slots[r.below(24_000)]);
+        }
+        ids.flatten(3);
+        let local = (1u32 << c.pshift) - 1;
+        for &t in &slots {
+            let p = ids.own(t);
+            assert_eq!(ids.slot_of(p), t);
+            assert_eq!(p >> c.pshift, (t >> 3) >> ids.part);
+            assert!((1..=5 << ids.part).contains(&(p & local)), "person {p} of slot {t}");
+        }
+        let want: Vec<u32> = slots.iter().map(|&t| ids.person(t)).collect();
+        let mut linked = 0;
+        for (k, &p) in want.iter().enumerate() {
+            // a person is the number of its root, which holds the tree's smallest ID and is its own person
+            assert!(ids.name(p) <= key(k) && ids.person(ids.slot_of(p)) == p);
+            linked += (ids.name(p) != key(k)) as usize;
+        }
+        assert!(linked > 5_000, "{linked}");
+        // the same table without the 512-bit compare
+        let narrow = IdTable { slots: ids.slots, lines: ids.lines, bits: ids.bits, part: ids.part, wide: false, count: AtomicUsize::new(0), limit: ids.limit };
+        let (mut fresh, mut far) = (0, 0);
+        for round in 0..400 {
+            let t = if round % 2 == 0 { ids } else { &narrow };
+            let n = 1 + r.below(BATCH);
+            let which: Vec<usize> = (0..n).map(|_| if r.below(3) == 0 { 24_000 + r.below(12_000) } else { r.below(24_000) }).collect();
+            let (mut keys, mut home, mut person) = ([0u64; BATCH], [0u32; BATCH], [0u32; BATCH]);
+            for (i, &k) in which.iter().enumerate() {
+                keys[i] = key(k);
+                home[i] = t.aim(keys[i]);
+            }
+            t.people(&keys, &mut home, n, &mut person, &mut ins);
+            for (i, &k) in which.iter().enumerate() {
+                let slot = ids.slot(keys[i], &mut ins);
+                far += (slot >> 3 != ids.home(keys[i]) as u32 >> 2) as usize;
+                if k < 24_000 {
+                    assert_eq!(person[i], want[k], "ID {k} in round {round}");
+                } else {
+                    fresh += 1;
+                    assert_eq!((ids.name(person[i]), ids.person(slot)), (keys[i], person[i]), "new ID {k} in round {round}");
+                }
+            }
+        }
+        assert!(fresh > 3_000 && far > 50, "{fresh} {far}");
+    }
+
     /// `mark_duplicates` against the rule itself, per key: every copy with an event that is ingested after the
     /// earliest copy is dropped, and of the earliest copies (identical ones) exactly one stays. Keys with one copy
     /// and with thousands, short IDs, copies without an event, far and late ingest_ts, three shards, four buckets.
@@ -5816,7 +5983,7 @@ mod tests {
     fn duplicates_keep_the_earliest_copy() {
         let mut c = ctx();
         c.qshift = 62;
-        let (parts, buckets) = (1usize << (16 - c.pshift), 4usize);
+        let (parts, buckets) = (1usize << (17 - c.pshift), 4usize);
         let mut r = Rng(5);
         let mut shards: Vec<Shard> = (0..3).map(|_| Shard::new(parts, buckets)).collect();
         let mut copies: HashMap<u64, Vec<(i64, *mut ERec)>> = HashMap::new();
@@ -5975,7 +6142,7 @@ mod tests {
         for (v, &i) in &num {
             let person = c.ids.person(c.ids.slot(c.names.key(v), &mut ins));
             let mut name = Vec::new();
-            c.names.bytes(c.ids.slots[person as usize].key.load(Relaxed), &mut name);
+            c.names.bytes(c.ids.name(person), &mut name);
             assert_eq!(&name, &best[&root(&mut up, i)], "ID {:?}", String::from_utf8_lossy(v));
         }
         assert_eq!(ins, 0, "an ID of the links was not in the table");

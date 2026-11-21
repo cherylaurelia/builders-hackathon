@@ -507,7 +507,10 @@ impl IdTable {
     #[inline(always)]
     fn aim(&self, key: u64) -> u32 {
         let h = self.home(key);
+        // the line of the home slot and the line of the third slot after it (often the same one): a search that
+        // runs past the end of the home line, as more do the fuller the table is, still finds its slots in cache
         prefetch(unsafe { self.slots.as_ptr().add(h) });
+        prefetch(self.slots.as_ptr().wrapping_add(h + 3));
         h as u32
     }
 

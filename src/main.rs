@@ -2233,7 +2233,7 @@ fn main() {
                     tx.send((cred, rev, assist)).unwrap_or_else(|_| die("campaign merger gone"));
                     // thread 0 writes even with no rows: the table needs at least one file
                     if t == 0 || !w.rows.is_empty() {
-                        write_users(&ud.join(format!("part-{t}.parquet")), &w.rows, &w.people, cat_names, &cx.names)
+                        write_users(&ud.join(format!("part-{t}.parquet")), &w.rows, &w.people, cat_names, &cx.ids, &cx.names)
                             .unwrap_or_else(|e| die(&format!("write user_daily: {e}")));
                     }
                     n_rows.fetch_add(w.rows.len(), Relaxed);
@@ -2871,7 +2871,7 @@ struct Sess {
 /// One sessions thread: its results, and scratch reused across partitions.
 struct Work {
     rows: Vec<UserRow>,
-    people: Vec<(u64, u32)>, // the people of `rows` in order: name, rows
+    people: Vec<(u32, u32)>, // the people of `rows` in order: slot of the name, rows
     // Per campaign and day (cell = campaign * days + day), in arrays of their own so that the ones every session
     // touches stay small: sessions credited; sessions assisted, in 16 bits with the times each count went round
     // apart (`around`); and for the credited sessions with a purchase their number and revenue.
@@ -2924,7 +2924,7 @@ impl Work {
             cred: filled(cells, 0),
             assist: filled(cells + 16, 0), // + 16: the vector steps of `credit_big` read and write whole vectors
             around: filled(cells, 0),
-            buy: filled(cells, Buy { purchasing: 0, revenue: 0 }),
+            buy: filled(cells + 1, Buy { purchasing: 0, revenue: 0 }), // + the cell of the sessions that bought nothing
             doff: cx.base - cx.day0 * DAY,
             start: filled(local + 2, 0),
             cstart: filled(local + 2, 0),
@@ -3225,10 +3225,11 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     for i in 0..w.nact {
         let l = w.act[i] as usize;
         let (a, b) = (w.start[l] as usize, w.start[l + 1] as usize);
-        let name = cx.ids.slots[(p << cx.pshift) | l].key.load(Relaxed);
+        // the person's slot: its name is read when the file is written, not here, where each would be waited for
+        let slot = ((p << cx.pshift) | l) as u32;
         let (ca, cb) = (w.cstart[l] as usize, w.cstart[l + 1] as usize);
         let (pa, pb) = (w.pstart[l] as usize, w.pstart[l + 1] as usize);
-        person_work(cx, name, &ev[a..b], pa, pb - pa, ca, cb - ca, w);
+        person_work(cx, slot, &ev[a..b], pa, pb - pa, ca, cb - ca, w);
     }
     w.ev = ev;
 }
@@ -3314,10 +3315,10 @@ unsafe fn scan_bins(bp: *mut Bin, wp: *mut u64, mut wm: u64, sp: *mut Ses, rp: *
     (ns, nr)
 }
 
-/// One person: `evs` = the ts of their events, a dropped copy as 0; their `np` purchases are the entries from `pa`
+/// One person (`slot` = the ID table slot of their name): `evs` = the ts of their events, a dropped copy as 0; their `np` purchases are the entries from `pa`
 /// of `w.pls`, and their `nc` valid clicks the entries from `ca` of `w.ck`, in any order.
 #[inline(never)]
-fn person_work(cx: &Ctx, name: u64, evs: &[u32], pa: usize, np: usize, ca: usize, nc: usize, w: &mut Work) {
+fn person_work(cx: &Ctx, slot: u32, evs: &[u32], pa: usize, np: usize, ca: usize, nc: usize, w: &mut Work) {
     let nbins = w.bins.len();
     w.rows.reserve(nbins + 1); // a row per session at most, and one being written
     let row0 = w.rows.len();
@@ -3337,7 +3338,7 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u32], pa: usize, np: usize, ca: usize
         let (ns, nr) = scan_bins(bp, wp, wm, w.ses.as_mut_ptr(), w.rows.as_mut_ptr().add(row0), cx.day0 as i32, w.doff);
         w.rows.set_len(row0 + nr);
         if nr != 0 {
-            w.people.push((name, nr as u32));
+            w.people.push((slot, nr as u32));
         }
         ns
     };
@@ -3398,11 +3399,12 @@ fn assisted(assist: &mut [u16], around: &mut [u32], at: usize, n: u32) {
 #[inline(always)]
 fn credit(cred: &mut [u32], buy: &mut [Buy], at: usize, revenue: i64) {
     cred[at] += 1;
-    if revenue != 0 {
-        let b = &mut buy[at];
-        b.purchasing += 1;
-        b.revenue += revenue;
-    }
+    // no branch on whether the session bought (one in seven does, unpredictably): one that did not adds 0 to the
+    // cell past the real ones, so the cells of the purchases are still only touched by purchases
+    let bought = revenue != 0;
+    let b = &mut buy[if bought { at } else { cred.len() }];
+    b.purchasing += bought as u32;
+    b.revenue += revenue;
 }
 
 /// Credit and assists of the `ns` sessions of a person with 1 to 64 clicks (`nc`, from `ca`), in the order they
@@ -4121,7 +4123,7 @@ fn put_run(b: &mut Vec<u8>, run: usize, idx: u32, vb: usize) {
     b.extend_from_slice(&idx.to_le_bytes()[..vb]);
 }
 
-fn write_users(path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: &[Bytes], names: &Interner) -> std::io::Result<()> {
+fn write_users(path: &Path, rows: &[UserRow], people: &[(u32, u32)], cat_names: &[Bytes], ids: &IdTable, names: &Interner) -> std::io::Result<()> {
     let segs: &[&[UserRow]] = &[rows];
     let mut tmp = Vec::with_capacity(64);
     let n: usize = segs.iter().map(|s| s.len()).sum();
@@ -4135,8 +4137,13 @@ fn write_users(path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: 
     // sessions and events stay far below 2^31: main() refuses inputs with that many events
     write_parquet(path, &USER_COLS, n, |c, lo, hi, b| {
         if c == 0 && lo == DICT_PAGE {
-            for &(name, _) in people {
-                put_name(b, names, name, &mut tmp);
+            // the names are all over the ID table: each is asked for AHEAD people before it is written
+            const AHEAD: usize = 16;
+            for (i, &(slot, _)) in people.iter().enumerate() {
+                if let Some(&(far, _)) = people.get(i + AHEAD) {
+                    prefetch(&ids.slots[far as usize]);
+                }
+                put_name(b, names, ids.slots[slot as usize].key.load(Relaxed), &mut tmp);
             }
             return entries;
         }

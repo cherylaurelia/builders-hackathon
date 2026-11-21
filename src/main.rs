@@ -428,70 +428,28 @@ impl Arena {
     }
 }
 
-/// Bytes a stream writes at a time: three cache lines, a whole number of records of every size here (12, 24).
-const GROUP: usize = 192;
-
-/// An append-only list of `T` in blocks of `per` records; a record never moves.
-///
-/// Records reach memory a group at a time: a thread appends to some 800 streams at once, and a record stored
-/// directly first reads its cache line from memory (read for ownership) and crowds the cache. A stream keeps the
-/// records of its current group (block offset a multiple of GROUP: blocks are 64-byte aligned, whole groups
-/// long) and writes the full group with non-temporal stores, three whole lines that are never read. A record's
-/// address is known when it is pushed; until its group is full or `finish` runs, its bytes are only in the stage.
-/// The caller fences (`sfence`) before others read, and calls `finish` once the pushing is over.
+/// An append-only list of `T` in blocks of `per` records; a record never moves. Records are pushed through the
+/// stream's `Hot` pointers (see `Shard`), and `cur` is up to date once they have been copied back.
 struct Stream<T> {
     cur: *mut T,
     end: *mut T,
     blocks: Vec<*mut T>,
-    n: usize,                    // records of the current group, in `stage`
-    stage: [u64; GROUP / 8],     // 8-byte aligned, as every record here
-    _t: std::marker::PhantomData<T>,
 }
 
 impl<T> Stream<T> {
-    const K: usize = GROUP / std::mem::size_of::<T>();
-
     fn new() -> Stream<T> {
-        const { assert!(GROUP % std::mem::size_of::<T>() == 0 && std::mem::align_of::<T>() <= 8 && !std::mem::needs_drop::<T>()) };
-        Stream { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), blocks: Vec::new(), n: 0, stage: [0; GROUP / 8], _t: std::marker::PhantomData }
-    }
-
-    #[inline(always)]
-    fn push(&mut self, arena: &mut Arena, per: usize, v: T) -> *mut T {
-        if self.cur == self.end {
-            self.grow(arena, per);
-        }
-        let p = self.cur;
-        // SAFETY: cur < end, inside the block `grow` took from the arena; n < K slots of the stage
-        unsafe {
-            (self.stage.as_mut_ptr() as *mut T).add(self.n).write(v);
-            self.cur = p.add(1);
-        }
-        self.n += 1;
-        if self.n == Self::K {
-            // SAFETY: the group [cur - K, cur) is GROUP bytes at a 64-byte aligned address of the block
-            unsafe { stream_group((self.cur as *mut u8).sub(GROUP), self.stage.as_ptr() as *const u8) };
-            self.n = 0;
-        }
-        p
+        const { assert!(std::mem::align_of::<T>() <= 8 && !std::mem::needs_drop::<T>()) };
+        Stream { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), blocks: Vec::new() }
     }
 
     #[cold]
     #[inline(never)]
     fn grow(&mut self, arena: &mut Arena, per: usize) {
-        debug_assert!(self.n == 0 && per % Self::K == 0);
         let p = arena.alloc(per * std::mem::size_of::<T>()) as *mut T;
         debug_assert!(p as usize % 64 == 0);
         self.blocks.push(p);
         self.cur = p;
         self.end = unsafe { p.add(per) };
-    }
-
-    /// Writes the records still staged (a group not yet full) to memory with plain stores.
-    fn finish(&mut self) {
-        // SAFETY: the n staged records belong at [cur - n, cur)
-        unsafe { std::ptr::copy_nonoverlapping(self.stage.as_ptr() as *const T, self.cur.sub(self.n), self.n) };
-        self.n = 0;
     }
 
     fn len(&self, per: usize) -> usize {
@@ -510,19 +468,38 @@ impl<T> Stream<T> {
     }
 }
 
-/// Copies a GROUP of bytes to `dst` (64-byte aligned) with non-temporal stores where available.
-#[inline(always)]
-unsafe fn stream_group(dst: *mut u8, src: *const u8) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    {
-        use std::arch::x86_64::*;
-        for i in 0..GROUP / 32 {
-            _mm256_stream_si256(dst.add(32 * i) as *mut __m256i, _mm256_loadu_si256(src.add(32 * i) as *const __m256i));
-        }
-        return;
+/// The two pointers of a `Stream` that a push needs, kept apart from it: a parse thread feeds 768 streams at 2^8
+/// partitions and buckets and 1536 at 2^9, and with these in arrays of their own (12 or 24 KB, in L1) a push
+/// reads no line but the one it writes. Records go straight to their block with plain stores (staging them in
+/// the stream for non-temporal group writes measured even on Intel and costs instructions). Intel Cascade Lake,
+/// 2 cores x 2 threads, NCPU=8, against the staged streams: 60M 3.438 -> 3.409 s (median 3.455 -> 3.415), 40M
+/// 0.994, 20M 0.993-0.996 (medians even).
+struct Hot<T> {
+    cur: *mut T,
+    end: *mut T,
+}
+
+impl<T> Hot<T> {
+    fn new() -> Hot<T> {
+        Hot { cur: std::ptr::null_mut(), end: std::ptr::null_mut() }
     }
-    #[allow(unreachable_code)]
-    std::ptr::copy_nonoverlapping(src, dst, GROUP);
+
+    /// Appends `v` to `s`, whose next record goes to `cur`; `s.cur` is stale until the caller copies `cur` back.
+    #[inline(always)]
+    fn push(&mut self, s: &mut Stream<T>, arena: &mut Arena, per: usize, v: T) -> *mut T {
+        if self.cur == self.end {
+            s.grow(arena, per);
+            self.cur = s.cur;
+            self.end = s.end;
+        }
+        let p = self.cur;
+        // SAFETY: cur < end, inside the block `grow` took from the arena
+        unsafe {
+            p.write(v);
+            self.cur = p.add(1);
+        }
+        p
+    }
 }
 
 /// Orders this thread's non-temporal stores before its later stores.
@@ -1768,6 +1745,12 @@ const RING: usize = 16;
 /// One parse thread's output.
 struct Shard {
     arena: Arena,
+    // where each stream's next record goes, and its block's end: what a push reads, in a few KB that stay in the
+    // core's L1 (the streams themselves, with their block lists, are only touched when a block fills up). At 2^9
+    // partitions and buckets a thread feeds 1536 streams.
+    evh: Vec<Hot<ERec>>,
+    ckh: Vec<Hot<CRec>>,
+    lgh: Vec<Hot<LRec>>,
     ev: Vec<Stream<ERec>>,
     ck: Vec<Stream<CRec>>,
     lg: Vec<Stream<LRec>>,
@@ -1813,6 +1796,9 @@ impl Shard {
     fn new(parts: usize, buckets: usize) -> Shard {
         Shard {
             arena: Arena::new(),
+            evh: (0..parts).map(|_| Hot::new()).collect(),
+            ckh: (0..parts).map(|_| Hot::new()).collect(),
+            lgh: (0..buckets).map(|_| Hot::new()).collect(),
             ev: (0..parts).map(|_| Stream::new()).collect(),
             ck: (0..parts).map(|_| Stream::new()).collect(),
             lg: (0..buckets).map(|_| Stream::new()).collect(),
@@ -1822,6 +1808,13 @@ impl Shard {
             head: 0,
             days: [NO_DAY; 32],
         }
+    }
+
+    /// Hands each stream its fill level, once the pushing is over.
+    fn settle(&mut self) {
+        self.evh.iter().zip(&mut self.ev).for_each(|(h, s)| s.cur = h.cur);
+        self.ckh.iter().zip(&mut self.ck).for_each(|(h, s)| s.cur = h.cur);
+        self.lgh.iter().zip(&mut self.lg).for_each(|(h, s)| s.cur = h.cur);
     }
 
     /// Queues `p`; returns the one queued RING entries ago, whose slot is in the cache by now.
@@ -1866,7 +1859,7 @@ impl Shard {
     #[inline(always)]
     fn log(&mut self, cx: &Ctx, ekey: u64, ingest: i64, loc: u64) {
         let q = (spread(ekey) >> cx.qshift) as usize;
-        self.lg[q].push(&mut self.arena, LG_BLOCK, LRec { key: ekey, ingest, loc });
+        self.lgh[q].push(&mut self.lg[q], &mut self.arena, LG_BLOCK, LRec { key: ekey, ingest, loc });
     }
 
     /// A valid, non-late event: into its person's partition, plus its dedup record, once its user ID is at hand.
@@ -1881,7 +1874,8 @@ impl Shard {
 
     #[inline(always)]
     fn put_event(&mut self, cx: &Ctx, p: Pend, person: u32) {
-        let rec = self.ev[(person >> cx.pshift) as usize].push(&mut self.arena, EV_BLOCK, ERec { person, ts: p.ts, pay: p.x });
+        let part = (person >> cx.pshift) as usize;
+        let rec = self.evh[part].push(&mut self.ev[part], &mut self.arena, EV_BLOCK, ERec { person, ts: p.ts, pay: p.x });
         self.log(cx, p.a, p.b, rec as u64);
     }
 
@@ -1897,7 +1891,8 @@ impl Shard {
 
     #[inline(always)]
     fn put_click(&mut self, cx: &Ctx, p: Pend, person: u32) {
-        self.ck[(person >> cx.pshift) as usize].push(&mut self.arena, CK_BLOCK, CRec::new(p.a, person & ((1 << cx.pshift) - 1), p.ts, p.x));
+        let part = (person >> cx.pshift) as usize;
+        self.ckh[part].push(&mut self.ck[part], &mut self.arena, CK_BLOCK, CRec::new(p.a, person & ((1 << cx.pshift) - 1), p.ts, p.x));
     }
 }
 
@@ -2040,9 +2035,7 @@ fn main() {
     );
     // the records of groups not yet full, written by this thread (each parse thread fenced its own before the join)
     for s in &mut shards {
-        s.ev.iter_mut().for_each(Stream::finish);
-        s.ck.iter_mut().for_each(Stream::finish);
-        s.lg.iter_mut().for_each(Stream::finish);
+        s.settle();
     }
     let n_ev: usize = shards.iter().flat_map(|s| s.ev.iter()).map(|s| s.len(EV_BLOCK)).sum();
     let n_ck: usize = shards.iter().flat_map(|s| s.ck.iter()).map(|s| s.len(CK_BLOCK)).sum();
@@ -4046,8 +4039,7 @@ mod tests {
     /// (events as (person, ts, pay), dedup records as (key, ingest, has a record)), each sorted
     type Flat = (Vec<(u32, u32, u32)>, Vec<(u64, i64, bool)>);
     fn flat(st: &mut Shard) -> Flat {
-        st.ev.iter_mut().for_each(Stream::finish);
-        st.lg.iter_mut().for_each(Stream::finish);
+        st.settle();
         let mut ev: Vec<_> = st.ev.iter().flat_map(|s| s.slices(EV_BLOCK)).flatten().map(|r| (r.person, r.ts, r.pay)).collect();
         let mut lg: Vec<_> = st.lg.iter().flat_map(|s| s.slices(LG_BLOCK)).flatten().map(|r| (r.key, r.ingest, r.loc != 0)).collect();
         ev.sort();
@@ -4152,6 +4144,8 @@ mod tests {
         let mut arena = Arena::new();
         let mut s12: Vec<Stream<ERec>> = (0..23).map(|_| Stream::new()).collect();
         let mut s24: Vec<Stream<LRec>> = (0..23).map(|_| Stream::new()).collect();
+        let mut h12: Vec<Hot<ERec>> = (0..23).map(|_| Hot::new()).collect();
+        let mut h24: Vec<Hot<LRec>> = (0..23).map(|_| Hot::new()).collect();
         let mut want12: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); 23];
         let mut want24: Vec<Vec<(u64, i64, u64)>> = vec![Vec::new(); 23];
         let mut at: Vec<(*mut ERec, u32)> = Vec::new();
@@ -4159,17 +4153,16 @@ mod tests {
             let b = r.below(23);
             if r.below(2) == 0 {
                 let rec = ERec { person: i, ts: r.next() as u32, pay: b as u32 };
-                at.push((s12[b].push(&mut arena, EV_BLOCK, rec), i));
+                at.push((h12[b].push(&mut s12[b], &mut arena, EV_BLOCK, rec), i));
                 want12[b].push((rec.person, rec.ts, rec.pay));
             } else {
                 let rec = LRec { key: r.next(), ingest: i as i64, loc: b as u64 };
-                s24[b].push(&mut arena, LG_BLOCK, rec);
+                h24[b].push(&mut s24[b], &mut arena, LG_BLOCK, rec);
                 want24[b].push((rec.key, rec.ingest, rec.loc));
             }
         }
-        sfence();
-        s12.iter_mut().for_each(Stream::finish);
-        s24.iter_mut().for_each(Stream::finish);
+        h12.iter().zip(&mut s12).for_each(|(h, s)| s.cur = h.cur);
+        h24.iter().zip(&mut s24).for_each(|(h, s)| s.cur = h.cur);
         for b in 0..23 {
             let got: Vec<_> = s12[b].slices(EV_BLOCK).flatten().map(|r| (r.person, r.ts, r.pay)).collect();
             assert_eq!(got, want12[b]);

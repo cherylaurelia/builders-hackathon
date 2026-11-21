@@ -1833,7 +1833,6 @@ unsafe impl Send for Shard {}
 unsafe impl Sync for Shard {}
 
 struct UserRow {
-    name: u64,
     revenue: i64,
     sessions: u32,
     events: u32,
@@ -2228,12 +2227,13 @@ fn main() {
                         }
                         partition_work(cx, shards, order[i].1, &mut w);
                     }
-                    let cred: Vec<Cred> = w.cell.iter().zip(&w.buy).map(|(c, b)| Cred { sessions: c[0], purchasing: b.purchasing }).collect();
-                    let (rev, assist): (Vec<i64>, Vec<u32>) = (w.buy.iter().map(|b| b.revenue).collect(), w.cell.iter().map(|c| c[1]).collect());
+                    let cred: Vec<Cred> = w.cred.iter().zip(&w.buy).map(|(&c, b)| Cred { sessions: c, purchasing: b.purchasing }).collect();
+                    let rev: Vec<i64> = w.buy.iter().map(|b| b.revenue).collect();
+                    let assist: Vec<u32> = w.assist.iter().zip(&w.around).map(|(&a, &r)| a as u32 + (r << 16)).collect();
                     tx.send((cred, rev, assist)).unwrap_or_else(|_| die("campaign merger gone"));
                     // thread 0 writes even with no rows: the table needs at least one file
                     if t == 0 || !w.rows.is_empty() {
-                        write_users(&ud.join(format!("part-{t}.parquet")), &w.rows, cat_names, &cx.names)
+                        write_users(&ud.join(format!("part-{t}.parquet")), &w.rows, &w.people, cat_names, &cx.names)
                             .unwrap_or_else(|e| die(&format!("write user_daily: {e}")));
                     }
                     n_rows.fetch_add(w.rows.len(), Relaxed);
@@ -2711,7 +2711,7 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
     par(
         threads,
         buckets,
-        || (Vec::<u64>::new(), Vec::<LRec>::new(), Vec::<u32>::new(), 0usize),
+        || (Vec::<u64>::new(), Vec::<LRec>::new(), Vec::<LRec>::new(), 0usize),
         |(seen, cand, table, total), b| {
             let n: usize = shards.iter().map(|s| s.lg[b].len(LG_BLOCK)).sum();
             if n == 0 {
@@ -2776,44 +2776,44 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
             // SAFETY: the first c entries are written
             unsafe { cand.set_len(c) };
             *total += c;
-            // exact: a table of candidate numbers + 1 on another hash of the key; of two copies of a key the one
-            // with the smaller ingest_ts stays in the table (the earlier one when they are equal: copies with
-            // equal ingest_ts are identical) and the other is dropped, so only the earliest copy is never dropped
-            let slots = (c * 2).next_power_of_two().max(16);
+            // exact: a table on another hash of the key that holds, per key, its earliest copy so far (key 0 =
+            // free; a record with key 0 has `zero` for a table). Of two copies of a key the one with the smaller
+            // ingest_ts stays (the earlier one when they are equal: copies with equal ingest_ts are identical) and
+            // the other is dropped, so only the earliest copy is never dropped. At most two thirds full.
+            let slots = (c + c / 2 + 1).next_power_of_two().max(16);
             let tshift = 64 - slots.trailing_zeros();
             table.clear();
-            table.resize(slots, 0);
-            const AHEAD: usize = 8;
-            let home = |key: u64| (key.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> tshift) as usize;
-            for i in 0..c {
-                if let Some(f) = cand.get(i + AHEAD) {
-                    prefetch(&table[home(f.key)]);
-                    prefetch(rec_at(abase, f.loc)); // loc 0 is a harmless hint
-                }
-                let r = cand[i];
-                let mut h = home(r.key);
-                loop {
-                    let e = table[h];
-                    if e == 0 {
-                        table[h] = i as u32 + 1;
-                        break;
-                    }
-                    let o = cand[e as usize - 1];
-                    if o.key == r.key {
-                        let lost = if cx.ingest_of(&r, far) < cx.ingest_of(&o, far) {
-                            table[h] = i as u32 + 1;
-                            o
-                        } else {
-                            r
-                        };
-                        if lost.loc != 0 {
-                            // SAFETY: the address of an ERec in a live arena; no other thread touches this record now
-                            // dropped: ts and pay 0, an event of bin 0 that is not a purchase (person_work)
-                            unsafe { ((rec_at(abase, lost.loc) as *mut u8).add(4) as *mut u64).write_unaligned(0) };
+            table.resize(slots, LRec { key: 0, ing: 0, loc: 0 });
+            let mut zero: Option<LRec> = None;
+            'cands: for r in cand.iter() {
+                let best: &mut LRec = if r.key == 0 {
+                    match &mut zero {
+                        Some(z) => z,
+                        None => {
+                            zero = Some(*r);
+                            continue;
                         }
-                        break;
                     }
-                    h = (h + 1) & (slots - 1);
+                } else {
+                    let mut h = (r.key.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> tshift) as usize;
+                    loop {
+                        // SAFETY: h < slots, by the shift and the mask
+                        let e = unsafe { &mut *table.as_mut_ptr().add(h) };
+                        if e.key == r.key {
+                            break e;
+                        }
+                        if e.key == 0 {
+                            *e = *r;
+                            continue 'cands;
+                        }
+                        h = (h + 1) & (slots - 1);
+                    }
+                };
+                let lost = if cx.ingest_of(r, far) < cx.ingest_of(best, far) { std::mem::replace(best, *r) } else { *r };
+                if lost.loc != 0 {
+                    // dropped: ts and pay 0, an event of bin 0 that is not a purchase (person_work)
+                    // SAFETY: the address of an ERec in a live arena; no other thread touches this record now
+                    unsafe { ((rec_at(abase, lost.loc) as *mut u8).add(4) as *mut u64).write_unaligned(0) };
                 }
             }
         },
@@ -2873,9 +2873,13 @@ struct Sess {
 /// One sessions thread: its results, and scratch reused across partitions.
 struct Work {
     rows: Vec<UserRow>,
-    // per campaign and day: [sessions credited, sessions assisted], and for the credited sessions with a purchase
-    // their number and revenue, apart: most sessions buy nothing, and the cells every session touches stay small
-    cell: Vec<[u32; 2]>,
+    people: Vec<(u64, u32)>, // the people of `rows` in order: name, rows
+    // Per campaign and day (cell = campaign * days + day), in arrays of their own so that the ones every session
+    // touches stay small: sessions credited; sessions assisted, in 16 bits with the times each count went round
+    // apart (`around`); and for the credited sessions with a purchase their number and revenue.
+    cred: Vec<u32>,
+    assist: Vec<u16>,
+    around: Vec<u32>,
     buy: Vec<Buy>,
     doff: i64, // ts (ms after `Ctx::base`) + doff = ms after the midnight that starts day 0 of the window
     start: Vec<u32>, // see partition_work
@@ -2916,7 +2920,10 @@ impl Work {
         let nbins = ((cx.we - cx.base) / GAP) as usize + 2;
         Work {
             rows: huge_vec(rows_cap),
-            cell: filled(cells + 4, [0; 2]), // + cells for the unused steps of the assists
+            people: huge_vec(rows_cap / 2),
+            cred: filled(cells, 0),
+            assist: filled(cells, 0),
+            around: filled(cells, 0),
             buy: filled(cells, Buy { purchasing: 0, revenue: 0 }),
             doff: cx.base - cx.day0 * DAY,
             start: filled(local + 2, 0),
@@ -3245,7 +3252,7 @@ unsafe fn bin_events(evs: &[u64], bp: *mut Bin, wp: *mut u64, pp: *mut (u32, u32
 /// SAFETY: `wm` = the words of `wp` that are not zero; `sp` has room for a session per taken bin + 1 and `rp` for
 /// as many rows; `doff` + a bin's min is not negative.
 #[inline(never)]
-unsafe fn scan_bins(bp: *mut Bin, wp: *mut u64, mut wm: u64, sp: *mut Ses, rp: *mut UserRow, name: u64, day0: i32, doff: i64) -> (usize, usize) {
+unsafe fn scan_bins(bp: *mut Bin, wp: *mut u64, mut wm: u64, sp: *mut Ses, rp: *mut UserRow, day0: i32, doff: i64) -> (usize, usize) {
     let (mut ns, mut nr) = (0usize, 0usize);
     let mut prev_max = i64::MIN / 2;
     let mut prev_d = u32::MAX;
@@ -3267,7 +3274,7 @@ unsafe fn scan_bins(bp: *mut Bin, wp: *mut u64, mut wm: u64, sp: *mut Ses, rp: *
             prev_d = if new != 0 { d } else { prev_d };
             sp.add(ns).write(Ses { start: mn, d, row: 0, rev: 0 });
             ns += new;
-            rp.add(nr).write(UserRow { name, revenue: 0, sessions: 0, events: 0, day: day0 + d as i32, top: NO_CAT });
+            rp.add(nr).write(UserRow { revenue: 0, sessions: 0, events: 0, day: day0 + d as i32, top: NO_CAT });
             nr += new_row;
             // the first bin starts a session and a row, so ns - 1 and nr - 1 are entries written here
             let r = &mut *rp.add(nr - 1);
@@ -3305,8 +3312,11 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], ca: usize, nc: usize, w: &mut W
         let w0 = *wp & !1;
         *wp = w0;
         wm &= !((w0 == 0) as u64);
-        let (ns, nr) = scan_bins(bp, wp, wm, w.ses.as_mut_ptr(), w.rows.as_mut_ptr().add(row0), name, cx.day0 as i32, w.doff);
+        let (ns, nr) = scan_bins(bp, wp, wm, w.ses.as_mut_ptr(), w.rows.as_mut_ptr().add(row0), cx.day0 as i32, w.doff);
         w.rows.set_len(row0 + nr);
+        if nr != 0 {
+            w.people.push((name, nr as u32));
+        }
         w.purch.set_len(np);
         (np, ns)
     };
@@ -3341,10 +3351,10 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], ca: usize, nc: usize, w: &mut W
 
     // credit and assists
     if nc == 0 {
-        let Work { cell, buy, ses, .. } = w;
+        let Work { cred, buy, ses, .. } = w;
         let (width, organic) = (cx.ndays, cx.ncamp);
         for s in &ses[..ns] {
-            credit(cell, buy, organic * width + s.d as usize, s.rev);
+            credit(cred, buy, organic * width + s.d as usize, s.rev);
         }
     } else if nc <= 64 {
         credit_clicks(cx, ca, nc, ns, w);
@@ -3353,10 +3363,20 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], ca: usize, nc: usize, w: &mut W
     }
 }
 
+/// `n` more sessions assisted by the campaign on the day of cell `at`.
+#[inline(always)]
+fn assisted(assist: &mut [u16], around: &mut [u32], at: usize, n: u32) {
+    let v = assist[at] as u32 + n;
+    assist[at] = v as u16;
+    if v >> 16 != 0 {
+        around[at] += v >> 16;
+    }
+}
+
 /// A session credited to the campaign and day of cell `at`.
 #[inline(always)]
-fn credit(cell: &mut [[u32; 2]], buy: &mut [Buy], at: usize, revenue: i64) {
-    cell[at][0] += 1;
+fn credit(cred: &mut [u32], buy: &mut [Buy], at: usize, revenue: i64) {
+    cred[at] += 1;
     if revenue != 0 {
         let b = &mut buy[at];
         b.purchasing += 1;
@@ -3370,25 +3390,23 @@ fn credit(cell: &mut [[u32; 2]], buy: &mut [Buy], at: usize, revenue: i64) {
 #[inline(never)]
 fn credit_clicks(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
     let (width, organic) = (cx.ndays, cx.ncamp);
-    let Work { cell, buy, ses, ck, cts, ccamp, eq, .. } = w;
+    let Work { cred, assist, around, buy, ses, ck, cts, ccamp, eq, .. } = w;
     let cs = &ck[ca..ca + nc];
-    assert!(nc <= 64);
+    assert!(nc <= 64 && assist.len() == (organic + 1) * width);
     for (j, c) in cs.iter().enumerate() {
         // SAFETY: j < nc <= 64, and the arrays hold 72
         unsafe {
             *cts.0.get_unchecked_mut(j) = c.ts();
-            *ccamp.0.get_unchecked_mut(j) = c.camp();
+            *ccamp.0.get_unchecked_mut(j) = c.camp() * width as u32; // the campaign's first cell
         }
     }
     // the vector passes read up to 8 entries past the last click: the arrays hold 72
     let (tp, cp) = (cts.0.as_ptr(), ccamp.0.as_ptr());
     unsafe { same_campaign(cp, nc, eq) };
-    let adummy = cell.len() - 4; // absorbs the increments of the unused steps
-    let ap = cell.as_mut_ptr();
     for s in &ses[..ns] {
         let d = s.d as usize;
-        // SAFETY: a bit of m or e is below nc, the index of one of the person's clicks; a campaign is below ncamp
-        // and d below ndays, a cell
+        // SAFETY: a bit of m or e is below nc, the index of one of the person's clicks; a click's campaign is
+        // below ncamp and d below ndays, so the campaign's first cell + d is a cell
         unsafe {
             let (m, e) = click_window(tp, nc, s.start);
             let mut best = (e.trailing_zeros() & 63) as usize;
@@ -3403,24 +3421,21 @@ fn credit_clicks(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
                     }
                 }
             }
-            let camp = if m != 0 { *cp.add(best) as usize } else { organic };
-            // assists: three fixed steps, the rest in a loop
+            let at = if m != 0 { *cp.add(best) as usize } else { organic * width } + d;
+            // assists: one click of each campaign in the window
+            let day = assist.as_mut_ptr().add(d);
             let mut c = m;
-            macro_rules! bump {
-                ($n:expr) => {
-                    let j = (c.trailing_zeros() & 63) as usize;
-                    let at = if c != 0 { *cp.add(j) as usize * width + d } else { adummy + $n };
-                    (*ap.add(at))[1] += 1;
-                    c &= !*eq.get_unchecked(j);
-                };
-            }
-            bump!(0);
-            bump!(1);
-            bump!(2);
             while c != 0 {
-                bump!(3);
+                let j = c.trailing_zeros() as usize;
+                let a = day.add(*cp.add(j) as usize);
+                let v = (*a).wrapping_add(1);
+                *a = v;
+                if v == 0 {
+                    around[*cp.add(j) as usize + d] += 1;
+                }
+                c &= !*eq.get_unchecked(j);
             }
-            credit(cell, buy, camp * width + d, s.rev);
+            credit(cred, buy, at, s.rev);
         }
     }
 }
@@ -3466,7 +3481,7 @@ fn sort_clicks(v: &mut [CRec], tmp: &mut Vec<CRec>, cnt: &mut [u32]) {
 fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
     let width = cx.ndays;
     let organic = cx.ncamp;
-    let Work { cell, buy, stamp, iv, seen, sctr, sessions, touched, ck, ckt, sat, ses, sbit, spre, sday, .. } = w;
+    let Work { cred, assist, around, buy, stamp, iv, seen, sctr, sessions, touched, ck, ckt, sat, ses, sbit, spre, sday, .. } = w;
     sort_clicks(&mut ck[ca..ca + nc], ckt, sat);
     let cs: &[CRec] = &ck[ca..ca + nc];
     sessions.clear();
@@ -3474,7 +3489,7 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
 
     let cts = |c: &CRec| c.ts() as i64;
     let ccamp = |c: &CRec| c.camp() as usize;
-    let mut credit = |cell: &mut [[u32; 2]], camp: usize, s: &Sess| credit(cell, buy, camp * width + s.d, s.revenue);
+    let mut credit = |camp: usize, s: &Sess| credit(cred, buy, camp * width + s.d, s.revenue);
     // the campaign of the latest click among cs[lo..hi] (all at or before the session start); tie -> smallest click_id
     let latest = |lo: usize, hi: usize| -> usize {
         let t = cts(&cs[hi - 1]);
@@ -3512,11 +3527,11 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
                     let kk = ccamp(c);
                     if seen[kk] != *sctr {
                         seen[kk] = *sctr;
-                        cell[kk * width + s.d][1] += 1;
+                        assisted(assist, around, kk * width + s.d, 1);
                     }
                 }
             }
-            credit(cell, camp, s);
+            credit(camp, s);
         }
     } else {
         // credit: latest click with start - 7d <= ts <= start
@@ -3529,7 +3544,7 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
             if q > 0 && s.start - cts(&cs[q - 1]) <= WEEK {
                 camp = latest(0, q);
             }
-            credit(cell, camp, s);
+            credit(camp, s);
         }
         // assists: a click at t assists sessions starting in [t, t + 7d]; merge per campaign. The sessions of an
         // interval without a search: at most one session starts in a 30-minute bin (two starts are more than 30
@@ -3558,7 +3573,7 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
             *x = j as u32;
         }
         let (ses, sday): (&[Ses], &[u32]) = (&ses[..ns], sday);
-        let flush = |cell: &mut [[u32; 2]], k: usize, lo: i64, hi: i64| {
+        let mut flush = |k: usize, lo: i64, hi: i64| {
             let mut a = before((lo / GAP) as usize);
             a += (a < ns && (ses[a].start as i64) < lo) as usize;
             let mut b = before((hi / GAP) as usize);
@@ -3567,7 +3582,7 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
                 return;
             }
             for d in ses[a].d as usize..=ses[b - 1].d as usize {
-                cell[k * width + d][1] += (sday[d + 1] as usize).min(b) as u32 - (sday[d] as usize).max(a) as u32;
+                assisted(assist, around, k * width + d, (sday[d + 1] as usize).min(b) as u32 - (sday[d] as usize).max(a) as u32);
             }
         };
         touched.clear();
@@ -3582,13 +3597,13 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
                 iv[k].1 = t + WEEK;
             } else {
                 let (lo, hi) = iv[k];
-                flush(cell, k, lo, hi);
+                flush(k, lo, hi);
                 iv[k] = (t, t + WEEK);
             }
         }
         for &k in touched.iter() {
             let (lo, hi) = iv[k];
-            flush(cell, k, lo, hi);
+            flush(k, lo, hi);
             stamp[k] = false;
         }
     }
@@ -4049,27 +4064,23 @@ fn put_run(b: &mut Vec<u8>, run: usize, idx: u32, vb: usize) {
     b.extend_from_slice(&idx.to_le_bytes()[..vb]);
 }
 
-fn write_users(path: &Path, rows: &[UserRow], cat_names: &[Bytes], names: &Interner) -> std::io::Result<()> {
+fn write_users(path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: &[Bytes], names: &Interner) -> std::io::Result<()> {
     let segs: &[&[UserRow]] = &[rows];
     let mut tmp = Vec::with_capacity(64);
     let n: usize = segs.iter().map(|s| s.len()).sum();
     let mut part: Vec<&[UserRow]> = Vec::new();
     let mut run: Vec<u8> = Vec::new();
-    // user_id is dictionary encoded: one entry per run of equal IDs (a person's days are consecutive rows), and
-    // the data pages are runs of that entry's index
-    let (mut entries, mut idx, mut last): (usize, u32, Option<u64>) = (0, u32::MAX, None);
+    // user_id is dictionary encoded: one entry per person (a person's days are consecutive rows), and the data
+    // pages are runs of that entry's index. `at` = the person the next page starts in, and how many of its rows
+    // the pages before took.
+    let entries = people.len();
+    let mut at = (0usize, 0usize);
     // sessions and events stay far below 2^31: main() refuses inputs with that many events
     write_parquet(path, &USER_COLS, n, |c, lo, hi, b| {
         if c == 0 && lo == DICT_PAGE {
-            let mut prev: Option<u64> = None;
-            for r in segs.iter().flat_map(|s| s.iter()) {
-                if prev != Some(r.name) {
-                    put_name(b, names, r.name, &mut tmp);
-                    entries += 1;
-                    prev = Some(r.name);
-                }
+            for &(name, _) in people {
+                put_name(b, names, name, &mut tmp);
             }
-            (idx, last) = (u32::MAX, None);
             return entries;
         }
         page_slices(segs, lo, hi, &mut part);
@@ -4077,21 +4088,13 @@ fn write_users(path: &Path, rows: &[UserRow], cat_names: &[Bytes], names: &Inter
             0 => {
                 let w = (usize::BITS - (entries.max(2) - 1).leading_zeros()) as usize;
                 b.push(w as u8);
-                let mut count = 0;
-                for r in part.iter().flat_map(|s| s.iter()) {
-                    if last == Some(r.name) {
-                        count += 1;
-                    } else {
-                        if count > 0 {
-                            put_run(b, count, idx, w.div_ceil(8));
-                        }
-                        idx = idx.wrapping_add(1);
-                        last = Some(r.name);
-                        count = 1;
-                    }
-                }
-                if count > 0 {
-                    put_run(b, count, idx, w.div_ceil(8));
+                let mut left = hi - lo;
+                while left > 0 {
+                    let (i, used) = at;
+                    let run = (people[i].1 as usize - used).min(left);
+                    put_run(b, run, i as u32, w.div_ceil(8));
+                    left -= run;
+                    at = if used + run == people[i].1 as usize { (i + 1, 0) } else { (i, used + run) };
                 }
             }
             1..=4 => {

@@ -196,6 +196,7 @@ fn map_anon(bytes: usize) -> *mut u8 {
         die(&format!("mmap {bytes} bytes failed"));
     }
     let a = (p as usize + HP - 1) & !(HP - 1);
+    register(a, bytes);
     #[cfg(target_os = "linux")]
     if std::env::var_os("C2_NOHP").is_none() {
         unsafe { libc::madvise(a as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE) };
@@ -958,6 +959,7 @@ fn map_file(p: &Path) -> Bytes {
         return &[];
     }
     let m = unsafe { Mmap::map(&f) }.unwrap_or_else(|e| die(&format!("mmap {}: {e}", p.display())));
+    register(m.as_ptr() as usize, m.len());
     let m: &'static Mmap = Box::leak(Box::new(m));
     &m[..]
 }
@@ -1301,7 +1303,7 @@ fn main() {
     write_outputs(&out, &user_parts, &camp_rows, &cat_names, threads);
     lap(&format!("written: {} user rows, {} campaign rows", user_parts.iter().map(|p| p.len()).sum::<usize>(), camp_rows.len()));
     // everything is on disk: no destructors, the memory is released in parallel
-    fast_exit(threads)
+    release_and_exit(threads)
 }
 
 /// products.csv -> (category names, product -> category, unknown category, byte-wise rank of each category);
@@ -2278,139 +2280,28 @@ fn write_camps(path: &Path, rows: &[CampRow]) -> std::io::Result<()> {
 
 // ---------------------------------------------------------------- exit
 
-/// Ends the process once the outputs are on disk. Left to the kernel, freeing the GBs of heap and unmapping the
-/// input files runs on one thread (about 0.1 s); here every thread zaps a share first with MADV_DONTNEED.
-/// Nothing may be freed or dropped after the first zap: the heap, malloc state included, reads as zeros from then on.
-/// Never zapped: the threads' stacks (their TCBs sit in them), this thread's TLS block, every region under 1 MiB
-/// (libc state), `[heap]` and the other named regions. Any surprise before the zap falls back to a plain exit.
-#[cfg(target_os = "linux")]
-fn fast_exit(threads: usize) -> ! {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::{Acquire, Release}};
-    const MAXP: usize = 2048;
+/// Every region this program mapped itself (record arenas, ID table, union-find, input files): (address, length).
+static REGIONS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+fn register(addr: usize, len: usize) {
+    if let Ok(mut r) = REGIONS.lock() {
+        r.push((addr, len));
+    }
+}
+
+/// Ends the process once the outputs are written and closed. Left to the kernel, unmapping the GBs of records and
+/// input files runs on one thread; here `threads` threads first drop the pages of the regions in REGIONS
+/// (MADV_DONTNEED runs under the shared mmap lock, so the zaps run in parallel). Only those regions are touched,
+/// all of them dead by now: the malloc heap, stacks and libc state stay intact, so nothing can fault on the way out.
+fn release_and_exit(threads: usize) -> ! {
+    let regions = REGIONS.lock().map(|r| r.clone()).unwrap_or_default();
     const PIECE: usize = 16 << 20;
-    const MARGIN: usize = 64 << 10;
-    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else { std::process::exit(0) };
-    // shared state lives on this thread's stack: the heap is about to be zeroed
-    let reg = AtomicUsize::new(0);
-    let go = AtomicBool::new(false);
-    let next = AtomicUsize::new(0);
-    let done = AtomicUsize::new(0);
-    let np = AtomicUsize::new(0);
-    let keep: [[AtomicUsize; 2]; 32] = std::array::from_fn(|_| [AtomicUsize::new(0), AtomicUsize::new(0)]);
-    let pieces: [[AtomicUsize; 2]; MAXP] = std::array::from_fn(|_| [AtomicUsize::new(0), AtomicUsize::new(0)]);
-    std::thread::scope(|sc| {
-        let mut n = 0;
-        while n < threads.clamp(1, 32) {
-            let (reg, go, next, done, np, keep, pieces) = (&reg, &go, &next, &done, &np, &keep, &pieces);
-            let k = n;
-            let spawned = std::thread::Builder::new().spawn_scoped(sc, move || {
-                // publish this thread's stack: never zap it
-                let (mut lo, mut hi) = (0usize, 0usize);
-                unsafe {
-                    let mut attr: libc::pthread_attr_t = std::mem::zeroed();
-                    if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) == 0 {
-                        let mut addr = std::ptr::null_mut();
-                        let mut size = 0usize;
-                        libc::pthread_attr_getstack(&attr, &mut addr, &mut size);
-                        lo = addr as usize;
-                        hi = lo + size;
-                        libc::pthread_attr_destroy(&mut attr);
-                    }
-                }
-                keep[k][0].store(lo.saturating_sub(MARGIN), Relaxed);
-                keep[k][1].store(hi + MARGIN, Relaxed);
-                reg.fetch_add(1, Release);
-                while !go.load(Acquire) {
-                    unsafe { libc::sched_yield() };
-                }
-                loop {
-                    let i = next.fetch_add(1, Relaxed);
-                    if i >= np.load(Relaxed) {
-                        break;
-                    }
-                    unsafe { libc::madvise(pieces[i][0].load(Relaxed) as *mut libc::c_void, pieces[i][1].load(Relaxed), libc::MADV_DONTNEED) };
-                    done.fetch_add(1, Release);
-                }
-                // never return: thread exit would free into the zeroed heap
-                loop {
-                    unsafe { libc::sched_yield() };
-                }
-            });
-            if spawned.is_err() {
-                break;
-            }
-            n += 1;
-        }
-        if n == 0 {
-            std::process::exit(0);
-        }
-        while reg.load(Acquire) < n {
-            std::thread::yield_now();
-        }
-        // a thread that could not read its stack bounds publishes (0, MARGIN): nothing is zapped then
-        if (0..n).any(|k| keep[k][1].load(Relaxed) <= MARGIN) {
-            std::process::exit(0);
-        }
-        let me = unsafe { libc::pthread_self() } as usize;
-        let mut excl: Vec<(usize, usize)> = (0..n).map(|k| (keep[k][0].load(Relaxed), keep[k][1].load(Relaxed))).collect();
-        excl.push((me.saturating_sub(MARGIN), me + MARGIN));
-        let mut cnt = 0usize;
-        for line in maps.lines() {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            // anonymous heap (no name), or an input file mapped read-only and shared
-            let anon = f.len() == 5 && f[1] == "rw-p";
-            let file = f.len() == 6 && f[1] == "r--s" && f[5].starts_with('/') && !f[5].starts_with("/dev/");
-            if !anon && !file {
-                continue;
-            }
-            let Some((a, b)) = f[0].split_once('-') else { continue };
-            let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) else { continue };
-            let mut segs = vec![(a, b)];
-            for &(x, y) in &excl {
-                let mut out = Vec::new();
-                for (s, e) in segs {
-                    if y <= s || x >= e {
-                        out.push((s, e));
-                    } else {
-                        if x > s {
-                            out.push((s, x & !4095));
-                        }
-                        if y < e {
-                            out.push(((y + 4095) & !4095, e));
-                        }
-                    }
-                }
-                segs = out;
-            }
-            for (s, e) in segs {
-                if e <= s || e - s < (1 << 20) {
-                    continue;
-                }
-                let mut p = s;
-                while p < e && cnt < MAXP {
-                    let l = PIECE.min(e - p);
-                    pieces[cnt][0].store(p, Relaxed);
-                    pieces[cnt][1].store(l, Relaxed);
-                    cnt += 1;
-                    p += l;
-                }
-            }
-        }
-        np.store(cnt, Relaxed);
-        go.store(true, Release);
-        while done.load(Acquire) < cnt {
-            std::thread::yield_now();
-        }
-        unsafe { libc::_exit(0) }
+    let pieces: Vec<(usize, usize)> = regions.iter().flat_map(|&(p, n)| (0..n).step_by(PIECE).map(move |o| (p + o, (n - o).min(PIECE)))).collect();
+    par(threads, pieces.len(), || (), |_, i| unsafe {
+        libc::madvise(pieces[i].0 as *mut libc::c_void, pieces[i].1, libc::MADV_DONTNEED);
     });
-    unreachable!()
+    unsafe { libc::_exit(0) }
 }
-
-#[cfg(not(target_os = "linux"))]
-fn fast_exit(_threads: usize) -> ! {
-    std::process::exit(0)
-}
-
 
 #[cfg(test)]
 mod tests {

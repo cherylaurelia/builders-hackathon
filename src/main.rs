@@ -2330,7 +2330,7 @@ fn main() {
     let n_rows = AtomicUsize::new(0);
     // A thread that has emptied the queue hands its campaign cells to this thread, then writes its user file; this
     // thread merges the cells and writes campaign_daily meanwhile instead of after the last file.
-    let (tx, rx) = std::sync::mpsc::channel::<(Vec<Cred>, Vec<u32>)>();
+    let (tx, rx) = std::sync::mpsc::channel::<(Vec<Cell>, Vec<Paid>)>();
     let (camp_rows, _results) = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..threads)
             .map(|t| {
@@ -2345,7 +2345,7 @@ fn main() {
                         }
                         partition_work(cx, shards, order[i].1, &mut w);
                     }
-                    tx.send((std::mem::take(&mut w.cred), std::mem::take(&mut w.assist))).unwrap_or_else(|_| die("campaign merger gone"));
+                    tx.send((std::mem::take(&mut w.cells), std::mem::take(&mut w.paid))).unwrap_or_else(|_| die("campaign merger gone"));
                     // thread 0 writes even with no rows: the table needs at least one file
                     if t == 0 || w.cols.n > 0 {
                         write_users(&ud.join(format!("part-{t}.parquet")), &w.cols, cat_names, cx.day0, cx.ndays)
@@ -2362,13 +2362,13 @@ fn main() {
         let mut assist = filled((ncamp + 1) * width, 0i64);
         for _ in 0..threads {
             let (c, a) = rx.recv().unwrap_or_else(|_| die("a worker ended without its campaign cells"));
-            for (x, y) in cred.iter_mut().zip(&c) {
+            for ((x, y), z) in cred.iter_mut().zip(&c).zip(&a) {
                 x[0] += y.sessions as i64;
-                x[1] += y.purchasing as i64;
-                x[2] += y.revenue;
+                x[1] += z.purchasing as i64;
+                x[2] += z.revenue;
             }
-            for (x, y) in assist.iter_mut().zip(&a) {
-                *x += *y as i64;
+            for (x, y) in assist.iter_mut().zip(&c) {
+                *x += y.assisted as i64;
             }
         }
         let mut camp_rows = Vec::new();
@@ -3032,9 +3032,17 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
     .sum()
 }
 
+/// A (campaign, day) cell of one thread: the sessions credited to the campaign, and the sessions it assisted. A
+/// session with a click adds to both for the campaign it is credited to (which assists it too): one cache line.
 #[derive(Clone, Copy, Default)]
-struct Cred {
+struct Cell {
     sessions: u32,
+    assisted: u32,
+}
+
+/// The rest of a (campaign, day) cell, which only the sessions with a purchase touch.
+#[derive(Clone, Copy, Default)]
+struct Paid {
     purchasing: u32,
     revenue: i64,
 }
@@ -3076,8 +3084,8 @@ struct Sess {
 struct Work {
     cols: Cols,
     tmp: Vec<u8>,
-    cred: Vec<Cred>,
-    assist: Vec<u32>,
+    cells: Vec<Cell>, // + 4 past the last cell for the unused steps of the vector window
+    paid: Vec<Paid>,
     stamp: Vec<bool>,
     iv: Vec<(u32, u32)>, // per campaign, the sessions a..b its clicks so far assist (`person_work`, many clicks)
     seen: Vec<u32>,
@@ -3112,8 +3120,8 @@ impl Work {
         Work {
             cols: Cols::new(rows),
             tmp: Vec::with_capacity(64),
-            cred: vec![Cred::default(); cells],
-            assist: filled(cells + 4, 0), // + cells for the unused steps of the vector window
+            cells: filled(cells + 4, Cell::default()),
+            paid: filled(cells, Paid::default()),
             stamp: vec![false; cx.ncamp + 1],
             iv: vec![(0, 0); cx.ncamp + 1],
             seen: filled(cx.ncamp + 1, 0),
@@ -3299,6 +3307,9 @@ struct Win {
     cid: [u64; 72],
 }
 
+/// Slots between asking for a cache line of names (four slots) and reading it in `partition_work`.
+const NAME_AHEAD: usize = 64;
+
 /// rules.md "Events" 5-7 and "Clicks" 4-7 for person partition `p`: the people whose slot number starts with p.
 fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     let local = 1usize << cx.pshift;
@@ -3378,6 +3389,10 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     let ev = std::mem::take(&mut w.ev);
     let mut ck = std::mem::take(&mut w.ck);
     for l in 0..local {
+        if l & 3 == 0 {
+            // the names come from the partition's part of the ID table, which was last read during the parse
+            prefetch(cx.ids.slots.as_ptr().wrapping_add(((p << cx.pshift) | l) + NAME_AHEAD));
+        }
         let (a, b) = (w.start[l] as usize, w.start[l + 1] as usize);
         if a == b {
             continue;
@@ -3424,7 +3439,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
 fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
     let width = cx.ndays;
     let organic = cx.ncamp;
-    let Work { cols, tmp, cred, assist, stamp, iv, seen, sctr, sessions, day_groups, cats, touched, small, bins, bits, bin_sess, purch, sess_day, days, dcats, .. } = w;
+    let Work { cols, tmp, cells, paid, stamp, iv, seen, sctr, sessions, day_groups, cats, touched, small, bins, bits, bin_sess, purch, sess_day, days, dcats, .. } = w;
 
     // sessions + user_daily rows: the events go into their 30-minute bins, and the bins in order are the sessions
     for &e in evs {
@@ -3495,12 +3510,17 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
 
     let cts = |c: &Ck| (c.k >> 32) as i64;
     let ccamp = |c: &Ck| (c.k & 0xffff_ffff) as usize;
-    let mut credit = |camp: usize, s: &Sess| {
-        let a = &mut cred[camp * width + s.d];
-        a.sessions += 1;
-        a.purchasing += s.purchased as u32;
-        a.revenue += s.revenue;
-    };
+    macro_rules! credit {
+        ($camp:expr, $s:expr) => {{
+            let (s, at): (&Sess, usize) = ($s, $camp * width + $s.d);
+            cells[at].sessions += 1;
+            if s.purchased {
+                let a = &mut paid[at];
+                a.purchasing += 1;
+                a.revenue += s.revenue;
+            }
+        }};
+    }
     // the campaign of the latest click among cs[lo..hi] (all at or before the session start); tie -> smallest click_id
     let latest = |lo: usize, hi: usize| -> usize {
         let t = cts(&cs[hi - 1]);
@@ -3517,7 +3537,7 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
     let (nc, ns) = (cs.len(), sessions.len());
     if nc == 0 {
         for s in sessions.iter() {
-            credit(organic, s);
+            credit!(organic, s);
         }
     } else if nc <= 64 {
         // up to 64 clicks (sorted into `small`): per session, one vector pass finds the clicks of its 7-day window
@@ -3525,7 +3545,7 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
         // campaign in the run
         let nch = nc.div_ceil(8);
         let valid = if nc == 64 { !0u64 } else { (1u64 << nc) - 1 };
-        let adummy = assist.len() - 4; // absorbs the increments of the unused steps
+        let adummy = cells.len() - 4; // absorbs the increments of the unused steps
         for s in sessions.iter() {
             let m = win_mask(&small.ts.0, nch, s.start as u32) & valid;
             let nz = m != 0;
@@ -3550,7 +3570,7 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
                 ($n:expr) => {
                     let j = (c.trailing_zeros() & 63) as usize;
                     let at = if c != 0 { small.camp[j] as usize * width + s.d } else { adummy + $n };
-                    assist[at] += 1;
+                    cells[at].assisted += 1;
                     c &= c.wrapping_sub(1);
                 };
             }
@@ -3560,7 +3580,7 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
             while c != 0 {
                 bump!(3);
             }
-            credit(camp, s);
+            credit!(camp, s);
         }
     } else if nc * ns <= 2048 {
         // few sessions: per session, look at the clicks of its 7-day window [start - 7d, start]
@@ -3586,11 +3606,11 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
                     let kk = ccamp(c);
                     if seen[kk] != *sctr {
                         seen[kk] = *sctr;
-                        assist[kk * width + s.d] += 1;
+                        cells[kk * width + s.d].assisted += 1;
                     }
                 }
             }
-            credit(camp, s);
+            credit!(camp, s);
         }
     } else {
         // credit: latest click with start - 7d <= ts <= start
@@ -3603,13 +3623,13 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
             if q > 0 && s.start - cts(&cs[q - 1]) <= WEEK {
                 camp = latest(0, q);
             }
-            credit(camp, s);
+            credit!(camp, s);
         }
         // assists: a click at t assists the sessions that start in [t, t + 7d]. Those are sessions a..b, where a
         // (the sessions before t) and b (the sessions up to t + 7d) only grow from one click to the next, so there
         // is nothing to search for. Per campaign, ranges that touch or overlap are one range, and a range adds
         // the sessions it holds of each day it spans.
-        let flush = |assist: &mut [u32], k: usize, (a, b): (u32, u32)| {
+        let flush = |cells: &mut [Cell], k: usize, (a, b): (u32, u32)| {
             let (a, b) = (a as usize, b as usize);
             if a >= b {
                 return;
@@ -3618,7 +3638,7 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
             for g in sess_day[a] as usize..=sess_day[b - 1] as usize {
                 let (d, first) = day_groups[g];
                 let end = day_groups.get(g + 1).map_or(ns, |x| x.1);
-                assist[k * width + d] += (end.min(b) - first.max(a)) as u32;
+                cells[k * width + d].assisted += (end.min(b) - first.max(a)) as u32;
             }
         };
         touched.clear();
@@ -3641,12 +3661,12 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
             } else if a as u32 <= iv[k].1 {
                 iv[k].1 = b as u32;
             } else {
-                flush(assist, k, iv[k]);
+                flush(cells, k, iv[k]);
                 iv[k] = (a as u32, b as u32);
             }
         }
         for &k in touched.iter() {
-            flush(assist, k, iv[k]);
+            flush(cells, k, iv[k]);
             stamp[k] = false;
         }
     }

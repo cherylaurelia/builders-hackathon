@@ -1742,7 +1742,7 @@ fn main() {
     let width = ndays;
     let next = AtomicUsize::new(0);
     let n_rows = AtomicUsize::new(0);
-    let results: Vec<Work> = std::thread::scope(|sc| {
+    let results: Vec<(Vec<Cred>, Vec<u32>)> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..threads)
             .map(|t| {
                 let (cx, shards, order, next, n_rows, ud, cat_names) = (&cx, &shards, &order, &next, &n_rows, &ud, &cat_names);
@@ -1761,7 +1761,9 @@ fn main() {
                             .unwrap_or_else(|e| die(&format!("write user_daily: {e}")));
                     }
                     n_rows.fetch_add(w.rows.len(), Relaxed);
-                    w
+                    // only the campaign counts go on. The thread's rows and work buffers are freed here, on every
+                    // thread at once: kept, the exit frees them on one (they are malloc memory, in 4 KiB pages)
+                    (std::mem::take(&mut w.cred), std::mem::take(&mut w.assist))
                 })
             })
             .collect();
@@ -1776,13 +1778,13 @@ fn main() {
     // campaign_daily
     let mut cred = vec![[0i64; 3]; (ncamp + 1) * width];
     let mut assist = vec![0i64; (ncamp + 1) * width];
-    for r in &results {
-        for (a, b) in cred.iter_mut().zip(&r.cred) {
+    for (rc, ra) in &results {
+        for (a, b) in cred.iter_mut().zip(rc) {
             a[0] += b.sessions as i64;
             a[1] += b.purchasing as i64;
             a[2] += b.revenue;
         }
-        for (a, b) in assist.iter_mut().zip(&r.assist) {
+        for (a, b) in assist.iter_mut().zip(ra) {
             *a += *b as i64;
         }
     }

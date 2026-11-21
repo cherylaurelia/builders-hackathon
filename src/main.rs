@@ -569,7 +569,8 @@ impl IdTable {
 
     #[inline(always)]
     fn home(&self, key: u64) -> usize {
-        (mix(key) >> (64 - self.bits)) as usize
+        // one multiply: the high bits of the product depend on every bit of the key
+        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - self.bits)) as usize
     }
 
     /// `home(key)`, with its cache line on the way: the lookup comes a few lines of input later.

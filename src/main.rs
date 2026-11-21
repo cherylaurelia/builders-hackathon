@@ -547,13 +547,6 @@ impl<T> Stream<T> {
         }
     }
 
-    /// Asks for the cache line the next record will be staged in (reading `pos` brings the line of the stream's
-    /// own fields).
-    #[inline(always)]
-    fn aim(&self) {
-        prefetch(unsafe { (self.stage.as_ptr() as *const u8).add(self.pos) });
-    }
-
     /// The staged group is full: it goes to memory and the group after it is staged, in a new block when this
     /// one is full (or there is none yet).
     #[inline(always)]
@@ -1398,6 +1391,270 @@ unsafe fn ts_memo(p: *const u8, len: usize, days: &mut [Day; 64]) -> Option<i64>
     Some(if at(19) == b'+' { t - off } else { t + off })
 }
 
+/// A date already checked, for the one-pass event loop: bytes 0..8 and 3..11 of its `YYYY-MM-DDT` and the epoch
+/// ms of its midnight. The slot of a date is the low bits of its two day digits (`DAY_BITS` of bytes 3..11).
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct DayM {
+    a: u64,
+    a2: u64,
+    ms: i64,
+}
+/// Matches no input: bytes 3..8 cannot be both 0x00 and 0xFF.
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
+const NO_DAYM: DayM = DayM { a: 0, a2: u64::MAX, ms: 0 };
+/// In bytes 3..11 of a timestamp: the low two bits of the tens of the day and the low four of its units.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+const DAY_BITS: u64 = (0x03 << 40) | (0x0F << 48);
+
+/// The first five digits of a 13-digit F3 timestamp already checked: those bytes above three zero bytes, and
+/// their value in ms (x 10^8). The slot is the low bits of the fourth and fifth digit (`MS_BITS`).
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct MsM {
+    key: u64,
+    val: i64,
+}
+/// Matches no input: a key's low three bytes are zero.
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
+const NO_MSM: MsM = MsM { key: 1, val: 0 };
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+const MS_BITS: u64 = (0x03 << 48) | (0x0F << 56);
+
+/// The 64-bit constants of the one-pass event loop. They are read from memory (the compiler cannot see their
+/// values), so each use is an operand of its instruction instead of a ten-byte load of an immediate before it.
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
+#[repr(C)]
+struct K {
+    hi: u64,       // the high bit of every byte
+    hms_x: u64,    // "00:00:00"
+    hms_add: u64,  // per byte, 0x7F - the largest value allowed: 2 9 : 5 9 : 5 9
+    hms_pair: u64, // the bytes that hold hours, minutes and seconds once the digits are paired
+    hms_mul: u64,  // 3600, 60 and 1 placed so that the three products meet at bit 48
+    zeros: u64,    // "00000000"
+    d76: u64,      // per byte, 0x7F - 9
+    p7f: u64,      // the low seven bits of every byte
+    sw_m: u64,     // `swar8`
+    sw_a: u64,
+    sw_b: u64,
+}
+
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
+impl K {
+    const NEW: K = K {
+        hi: HI,
+        hms_x: u64::from_le_bytes(*b"00:00:00"),
+        hms_add: u64::from_le_bytes([0x7F - 2, 0x76, 0x7F, 0x7F - 5, 0x76, 0x7F, 0x7F - 5, 0x76]),
+        hms_pair: 0x00FF_0000_FF00_00FF,
+        hms_mul: (3600 << 48) | (60 << 24) | 1,
+        zeros: u64::from_le_bytes([b'0'; 8]),
+        d76: 0x7676_7676_7676_7676,
+        p7f: 0x7F7F_7F7F_7F7F_7F7F,
+        sw_m: 0x0000_00FF_0000_00FF,
+        sw_a: 100 + (1_000_000 << 32),
+        sw_b: 1 + (10_000 << 32),
+    };
+}
+
+/// Remembers the date of the timestamp at `p` (F1 or F2: its first 19 bytes are a valid date and time). False when
+/// they are not.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[cold]
+#[inline(never)]
+unsafe fn day_fill(p: *const u8, dm: &mut [DayM; 64]) -> bool {
+    let Some(t) = civil_at(p) else { return false };
+    let (a, a2) = ((p as *const u64).read_unaligned(), (p.add(3) as *const u64).read_unaligned());
+    dm[std::arch::x86_64::_pext_u64(a2, DAY_BITS) as usize] = DayM { a, a2, ms: t.div_euclid(DAY) * DAY };
+    true
+}
+
+/// `ts_at`, for a timestamp the one-pass loop does not take itself; a good one leaves its date (F1, F2) or its
+/// first five digits (F3 of 13) remembered for the next.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[cold]
+#[inline(never)]
+unsafe fn ts_cold(p: *const u8, len: usize, dm: &mut [DayM; 64], fm: &mut [MsM; 64]) -> Option<i64> {
+    let t = ts_at(p, len)?;
+    if len == 20 || len == 25 {
+        day_fill(p, dm);
+    } else if len == 13 {
+        let key = (p as *const u64).read_unaligned() << 24;
+        let d = key ^ (u64::from_le_bytes([b'0'; 8]) << 24);
+        fm[std::arch::x86_64::_pext_u64(key, MS_BITS) as usize] = MsM { key, val: (swar8(d) * 100_000_000) as i64 };
+    }
+    Some(t)
+}
+
+/// The time of day of the `HH:MM:SS` at `p` in seconds, and nonzero when a byte is not what it may be. It is a
+/// time when that is zero and the seconds are below `DAY_SECS`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn hms_at(k: &K, p: *const u8) -> (u64, u64) {
+    let x = (p as *const u64).read_unaligned() ^ k.hms_x;
+    let bad = (x.wrapping_add(k.hms_add) | x) & k.hi;
+    let pb = (x * 10 + (x >> 8)) & k.hms_pair;
+    let secs = ((pb as u128 * k.hms_mul as u128) >> 48) as u64 & 0x1_FFFF;
+    (secs, bad)
+}
+
+/// Seconds in a day: `hms_at` of an hour of 24 to 29 passes its digit check and gives this many or more.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+const DAY_SECS: u64 = 86_400;
+
+/// The key of the ID of 8 or 9 bytes (`len`) at `p`, every byte of it 1..=127 (`pack_at`).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn pack89(k: &K, p: *const u8, len: usize) -> u64 {
+    pack_m(k, p, 0u8.wrapping_sub(len as u8 - 8))
+}
+
+/// `pack89` given the mask of the ninth byte: 0xFF for an ID of 9 bytes, 0 for one of 8.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn pack_m(k: &K, p: *const u8, ninth: u8) -> u64 {
+    let lo = (p as *const u64).read_unaligned();
+    (std::arch::x86_64::_pext_u64(lo.swap_bytes(), k.p7f) << 7) | (*p.add(8) & ninth) as u64
+}
+
+/// `ts_at` of the `tl` bytes at `tp` for the one-pass loops: F1 and F2 of a date seen before and F3 of 13 digits
+/// whose first five were seen before are taken here, the rest by `ts_cold`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn ts_usual(k: &K, dm: *const DayM, fm: *const MsM, st: *mut Shard, tp: *const u8, tl: usize) -> Option<i64> {
+    use std::arch::x86_64::_pext_u64;
+    if tl == 20 {
+        let (ta, ta2) = ((tp as *const u64).read_unaligned(), (tp.add(3) as *const u64).read_unaligned());
+        let d = dm.add(_pext_u64(ta2, DAY_BITS) as usize);
+        if ((*d).a == ta) & ((*d).a2 == ta2) & (*tp.add(19) == b'Z') {
+            let (secs, bad) = hms_at(k, tp.add(11));
+            if bad != 0 || secs >= DAY_SECS {
+                return None;
+            }
+            return Some((*d).ms + (secs * 1000) as i64);
+        }
+    } else if tl == 13 {
+        let key = (tp as *const u64).read_unaligned() << 24;
+        let m = fm.add(_pext_u64(key, MS_BITS) as usize);
+        if (*m).key == key {
+            let lo = (tp.add(5) as *const u64).read_unaligned() ^ k.zeros;
+            if (lo.wrapping_add(k.d76) | lo) & k.hi != 0 {
+                return None;
+            }
+            let d = lo * 10 + (lo >> 8);
+            let v = ((d & k.sw_m).wrapping_mul(k.sw_a)).wrapping_add(((d >> 16) & k.sw_m).wrapping_mul(k.sw_b)) >> 32;
+            return Some((*m).val + v as i64);
+        }
+    } else if tl == 25 {
+        let (ta, ta2) = ((tp as *const u64).read_unaligned(), (tp.add(3) as *const u64).read_unaligned());
+        let d = dm.add(_pext_u64(ta2, DAY_BITS) as usize);
+        let sign = *tp.add(19);
+        if ((*d).a == ta) & ((*d).a2 == ta2) & ((sign == b'+') | (sign == b'-')) & (*tp.add(22) == b':') {
+            let (secs, bad) = hms_at(k, tp.add(11));
+            let at = |i: usize| (*tp.add(i)).wrapping_sub(b'0');
+            let (h1, h2, m1, m2) = (at(20), at(21), at(23), at(24));
+            let (oh, om) = (h1 as i64 * 10 + h2 as i64, m1 as i64 * 10 + m2 as i64);
+            if (bad != 0) | (secs >= DAY_SECS) | (h1 > 9) | (h2 > 9) | (m1 > 9) | (m2 > 9) | (oh > 23) | (om > 59) {
+                return None;
+            }
+            let off = (oh * 60 + om) * 60_000;
+            let t = (*d).ms + (secs * 1000) as i64;
+            return Some(if sign == b'+' { t - off } else { t + off });
+        }
+    }
+    ts_cold(tp, tl, &mut (*st).dm, &mut (*st).fm)
+}
+
+/// One shape of an event line's first three fields, already worked out: the commas `c` and quotes `q` of the
+/// line through its third comma, and what `window2` and the checks after it make of them. Lines come in a few
+/// hundred such shapes (two ID lengths, three timestamp lengths, quotes or none), so nearly every line finds its
+/// own here and skips the work. Only shapes the one-pass loop takes are kept: well quoted, both IDs 8 or 9 bytes.
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
+#[derive(Clone, Copy)]
+#[repr(C, align(32))]
+struct Head {
+    c: u64, // 0 = no shape here (a shape has three commas)
+    q: u64,
+    es: u8, // where event_id starts
+    us: u8, // where user_id starts
+    ts: u8, // where ts starts
+    tl: u8, // its length
+    e9: u8, // 0xFF when event_id is 9 bytes, 0 when 8: the mask of its ninth byte
+    u9: u8, // the same for user_id
+}
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
+const NO_HEAD: Head = Head { c: 0, q: 0, es: 0, us: 0, ts: 0, tl: 0, e9: 0, u9: 0 };
+/// Places for shapes per thread: many more than there are shapes, so that two seldom want the same one (only the
+/// places in use are ever touched).
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
+const HEADS: usize = 4096;
+
+/// Where the shape (c, q) is looked for first.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+fn head_slot(c: u64, q: u64) -> usize {
+    (spread(c ^ (q << 7)) >> (64 - HEADS.trailing_zeros())) as usize
+}
+
+/// The shape (c, q) when it is not in its first place: in one of the three places after it, or worked out now and
+/// kept (in the first free of the four, else in the first). Null when the one-pass loop does not take such a line.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[cold]
+#[inline(never)]
+fn head_find(heads: &mut [Head], c: u64, q: u64) -> *const Head {
+    let at = |i: usize| (head_slot(c, q) + i) & (HEADS - 1);
+    if let Some(i) = (1..4).find(|&i| heads[at(i)].c == c && heads[at(i)].q == q) {
+        return &heads[at(i)];
+    }
+    let (s, e, bad) = window2(c, q);
+    let mut f = Cut { s, e };
+    let ((es, el), (us, ul), (ts, tl)) = (f.next(), f.next(), f.next());
+    if bad != 0 || (el.wrapping_sub(8) | ul.wrapping_sub(8)) > 1 {
+        return std::ptr::null();
+    }
+    let i = at((0..4).find(|&i| heads[at(i)].c == 0).unwrap_or(0));
+    heads[i] = Head { c, q, es: es as u8, us: us as u8, ts: ts as u8, tl: tl as u8, e9: if el == 9 { 0xFF } else { 0 }, u9: if ul == 9 { 0xFF } else { 0 } };
+    &heads[i]
+}
+
+/// `x.trailing_zeros()` (64 for 0) as the bare instruction. The compiler puts a clearing of the result register
+/// before every `tzcnt` it emits itself, against a false dependency that the scorer's CPU (Skylake and later) does
+/// not have: some fifteen instructions a line in the one-pass loops.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+fn tz(x: u64) -> usize {
+    let r: usize;
+    // SAFETY: one register-to-register instruction of BMI1, which this build requires
+    unsafe { std::arch::asm!("tzcnt {r}, {x}", x = in(reg) x, r = lateout(reg) r, options(pure, nomem, nostack)) };
+    r
+}
+
+/// `tz` of 32 bits (32 for 0).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+fn tz32(x: u32) -> usize {
+    let r: usize;
+    // SAFETY: as `tz`; writing the 32-bit register clears the upper half
+    unsafe { std::arch::asm!("tzcnt {r:e}, {x:e}", x = in(reg) x, r = lateout(reg) r, options(pure, nomem, nostack)) };
+    r
+}
+
+/// `window` for the one-pass loop: the same three results from fewer steps. With S the fields' first bytes,
+/// Z their last and Y the closing quotes moved onto their boundaries: a quote is in exactly one of S and Z, or it
+/// is out of place; an opening quote moves its field's start up by adding its own bit, a closing one moves the end
+/// down by subtracting its bit from the boundary's.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+fn window2(b: u64, q: u64) -> (u64, u64, u64) {
+    let s = (b << 1) | 1;
+    let z = b >> 1;
+    let x = q & s;
+    let yz = q & z;
+    let bad = (q & !(s ^ z)) | ((yz << 1).wrapping_sub(x) & b);
+    (s + x, b - yz, bad)
+}
+
 // ---------------------------------------------------------------- input files
 
 fn map_file(p: &Path) -> Bytes {
@@ -1498,7 +1755,7 @@ fn read_ahead(queue: Vec<(&'static InFile, usize, usize)>, _threads: usize) {
 #[cfg(not(target_os = "linux"))]
 fn read_ahead(_queue: Vec<(&'static InFile, usize, usize)>, _threads: usize) {}
 
-/// Bytes past the data that `read_span` keeps readable (and starts with a `\n`): `scan_lines` loads 144 past a line start.
+/// Bytes past the data that `read_span` keeps readable (and starts with a `\n`): the parsers load 144 past a line start.
 const PAD: usize = 160;
 
 /// Reads into `buf` every line of `f` that starts in [s, e): from byte s - 1 (to see whether a line starts at s)
@@ -1641,27 +1898,6 @@ unsafe fn split_click(line: *const u8) -> Option<(Cut, usize)> {
         return None;
     }
     Some((Cut { s, e }, b3.trailing_zeros() as usize + 1))
-}
-
-/// Calls `fast(st, line)` for every line that starts in [start, end) of the `len` bytes at `buf`; it returns the
-/// line's length with its `\n`, or 0 for a line it leaves to `slow`, which gets the line whole. The header line is
-/// skipped. `buf` must be readable for 144 bytes past `len`, and buf[len] must be `\n`.
-#[inline(always)]
-unsafe fn scan_lines<S>(buf: *const u8, start: usize, end: usize, len: usize, st: &mut S, fast: impl Fn(&mut S, *const u8) -> usize, slow: impl Fn(&mut S, Bytes)) {
-    let file = std::slice::from_raw_parts(buf, len);
-    let first = start.saturating_sub(1);
-    let Some(nl) = memchr::memchr(b'\n', &file[first..]) else { return };
-    let mut p = first + nl + 1;
-    while p < end && p < len {
-        let n = fast(st, buf.add(p));
-        if n != 0 {
-            p += n;
-        } else {
-            let e = memchr::memchr(b'\n', &file[p..]).map_or(len, |i| p + i);
-            slow(st, std::mem::transmute::<&[u8], Bytes>(&file[p..e]));
-            p = e + 1;
-        }
-    }
 }
 
 /// (user + sys CPU seconds, instructions retired) of this process so far; instructions only on macOS
@@ -1826,6 +2062,15 @@ struct Shard {
     ins: usize,
     bt: Batch,
     days: [Day; 64],
+    // what the one-pass loops remember and read (`parse_events`, `parse_clicks`)
+    #[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
+    dm: [DayM; 64],
+    #[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
+    fm: [MsM; 64],
+    #[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
+    k: K,
+    #[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
+    heads: Vec<Head>, // HEADS of them
 }
 // SAFETY: the streams own their blocks; after the parse they are only read, except for `ERec::person` of distinct
 // records written by the dedup phase while nothing reads them
@@ -1870,13 +2115,12 @@ impl Ctx {
     /// `LRec::ing` of an ingest_ts; None for one that 32 bits cannot hold (it goes in `Shard::far`, as ING_FAR).
     #[inline(always)]
     fn ing(&self, ingest: i64) -> Option<u32> {
-        if ingest > self.ihi {
-            return Some(ING_LATE);
-        }
-        // ms above ilo (a negative difference is a huge unsigned one)
+        // ms above ilo (a negative difference is a huge unsigned one): below ING_SPAN through ihi
         let d = ingest.wrapping_sub(self.ilo) as u64;
         if d < ING_SPAN as u64 {
             Some(d as u32 + 1)
+        } else if ingest > self.ihi {
+            Some(ING_LATE)
         } else {
             None
         }
@@ -1916,17 +2160,20 @@ impl Shard {
             ins: 0,
             bt: Batch { n: 0, a: [0; BATCH], b: [0; BATCH], ukey: [0; BATCH], tx: [0; BATCH], home: [0; BATCH] },
             days: [NO_DAY; 64],
+            dm: [NO_DAYM; 64],
+            fm: [NO_MSM; 64],
+            k: std::hint::black_box(K::NEW),
+            heads: vec![NO_HEAD; HEADS],
         }
     }
 
     /// Looks up the user IDs of the waiting events (`EVENTS`) or clicks and writes their records. Call when the
     /// batch is full and at the end of every chunk.
     ///
-    /// Two passes, so that no record waits on a chain of memory: the first turns every user ID into its person
-    /// (the table lines were asked for as the lines were parsed) and asks for the lines of the streams the records
-    /// will go to, which only the person tells; the second writes the records. An ID that is not in its home line
-    /// (the line was full of other keys when the ID was added, or is now) asks for the next line and is looked up
-    /// from there at the end of the first pass.
+    /// Two passes: the first turns every user ID into its person (the table lines were asked for as the lines were
+    /// parsed), the second writes the records. An ID that is not in its home line (the line was full of other keys
+    /// when the ID was added, or is now) asks for the next line and is looked up from there at the end of the first
+    /// pass. The streams' stages are not asked for: they stay in the L2 (Intel 20M: asking cost 1.4% wall).
     #[inline(never)]
     fn drain<const EVENTS: bool>(&mut self, cx: &Ctx) {
         let Shard { arena, ev, ck, lg, far, ins, bt, .. } = self;
@@ -1935,27 +2182,12 @@ impl Shard {
         // what the loops need, in locals: nothing is read again through `cx` or `self` per record
         let (ids, pshift, qshift, abase) = (&cx.ids, cx.pshift, cx.qshift, cx.abase);
         let (evp, ckp, lgp) = (ev.as_mut_ptr(), ck.as_mut_ptr(), lg.as_mut_ptr());
-        // SAFETY (the three streams, here and below): a person is a slot number, so its partition is below the
-        // 2^pbits streams of `ev` and `ck`; the shift of the event key leaves qbits bits, a bucket below the
-        // 2^qbits streams of `lg`
-        let aim = |bt: &Batch, i: usize, person: u32| unsafe {
-            let part = (person >> pshift) as usize;
-            if EVENTS {
-                (*evp.add(part)).aim();
-                (*lgp.add((spread(bt.a[i]) >> qshift) as usize)).aim();
-            } else {
-                (*ckp.add(part)).aim();
-            }
-        };
         let mut person = [0u32; BATCH];
         let mut late = [0u8; BATCH];
         let mut nl = 0;
         for i in 0..n {
             match ids.slot_in_line(bt.home[i], bt.ukey[i], ins) {
-                Some(slot) => {
-                    person[i] = ids.person(slot);
-                    aim(bt, i, person[i]);
-                }
+                Some(slot) => person[i] = ids.person(slot),
                 None => {
                     bt.home[i] = ids.next_line(bt.home[i]);
                     late[nl & (BATCH - 1)] = i as u8; // nl < n <= BATCH
@@ -1967,12 +2199,12 @@ impl Shard {
             let i = i as usize;
             // its home line holds four other keys for good, so the search may start at the line after it
             person[i] = ids.person(ids.slot_scan(bt.home[i], bt.ukey[i], ins));
-            aim(bt, i, person[i]);
         }
         for i in 0..n {
             let (a, tx, person) = (bt.a[i], bt.tx[i], person[i]);
             let part = (person >> pshift) as usize;
-            // SAFETY: as above
+            // SAFETY: a person is a slot number, so its partition is below the 2^pbits streams of `ev` and `ck`;
+            // the shift of the event key leaves qbits bits, a bucket below the 2^qbits streams of `lg`
             unsafe {
                 if EVENTS {
                     let rec = (*evp.add(part)).push(arena, EV_BLOCK, ERec { person, ts: (tx >> 32) as u32, pay: tx as u32 });
@@ -2617,29 +2849,199 @@ unsafe fn fast_event(cx: &Ctx, line: *const u8, mut a: Cut, rest: *const u8, mut
     st.keep(cx, ekey, ingest, cx.names.key_at(line.add(us), ul), ts, pay);
 }
 
-/// Parses the event lines that start in [start, end) of the `len` bytes at `buf` (see `scan_lines`) into `st`.
+/// The event line at `buf + p` through the two-window parser (`split_event`, `fast_event`), or, when that does not
+/// take it, as a whole line through `split` and `event_fields`. Returns where the next line starts.
+#[inline(never)]
+unsafe fn event_line(cx: &Ctx, buf: *const u8, p: usize, len: usize, st: &mut Shard) -> usize {
+    let line = buf.add(p);
+    if let Some((a, b, o, n)) = split_event(line) {
+        fast_event(cx, line, a, line.add(o), b, st);
+        return p + n;
+    }
+    let file = std::slice::from_raw_parts(buf, len);
+    let e = memchr::memchr(b'\n', &file[p..]).map_or(len, |i| p + i);
+    if let Some(f) = split::<7>(std::mem::transmute::<&[u8], Bytes>(&file[p..e])) {
+        event_fields(cx, f, st);
+    }
+    e + 1
+}
+
+/// Parses the event lines that start in [start, end) of the `len` bytes at `buf` into `st`; the header line is
+/// skipped. `buf` must be readable for 144 bytes past `len`, and buf[len] must be `\n` (`read_span`).
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
 unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: usize, st: &mut Shard) {
-    scan_lines(
-        buf,
-        start,
-        end,
-        len,
-        st,
-        |st, line| match split_event(line) {
-            Some((a, b, o, n)) => {
-                fast_event(cx, line, a, line.add(o), b, st);
-                n
-            }
-            None => 0,
-        },
-        |st, l| {
-            if let Some(f) = split::<7>(l) {
-                event_fields(cx, f, st);
-            }
-        },
-    );
+    let file = std::slice::from_raw_parts(buf, len);
+    if let Some(nl) = memchr::memchr(b'\n', &file[start.saturating_sub(1)..]) {
+        let mut p = start.saturating_sub(1) + nl + 1;
+        while p < end && p < len {
+            p = event_line(cx, buf, p, len, st);
+        }
+    }
     st.drain::<true>(cx);
     sfence();
+}
+
+/// Parses the event lines that start in [start, end) of the `len` bytes at `buf` into `st`; the header line is
+/// skipped. `buf` must be readable for 144 bytes past `len`, and buf[len] must be `\n` (`read_span`).
+///
+/// One pass per line for the usual shape, everything else goes to `event_line`, which is exact on any line. The
+/// usual shape: the line ends in its bytes 64..96 and its first 64 bytes are all 0x20..=0x7F; its first three
+/// fields end in those 64 bytes and the other four fit the 64 bytes after them; both IDs are 8 or 9 bytes;
+/// ingest_ts is F1 of a date seen before. For such a line this does what `fast_event` does, with the same
+/// precedence of the checks. What the line gives is written straight into the next place of the batch
+/// (`Shard::wait`), which counts only once the event is known to be kept.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: usize, st: &mut Shard) {
+    use std::arch::x86_64::*;
+    let file = std::slice::from_raw_parts(buf, len);
+    let first = start.saturating_sub(1);
+    if let Some(nl) = memchr::memchr(b'\n', &file[first..]) {
+        let mut p = first + nl + 1;
+        let stop = end.min(len);
+        let (cm, qt, nv, lowest) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'"' as i8), _mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(0x20));
+        let (ws, span, back) = (cx.ws, (cx.we - cx.ws) as u64, (cx.ws - cx.base) as u64);
+        let (slots, hshift) = (cx.ids.slots.as_ptr(), 64 - cx.ids.bits);
+        let st: *mut Shard = st;
+        let k: *const K = &(*st).k;
+        let (dm, fm): (*const DayM, *const MsM) = ((*st).dm.as_ptr(), (*st).fm.as_ptr());
+        let heads: *const Head = (*st).heads.as_ptr();
+        let bt: *mut Batch = &mut (*st).bt;
+        let (ba, bb, bu, bx, bh) = ((*bt).a.as_mut_ptr(), (*bt).b.as_mut_ptr(), (*bt).ukey.as_mut_ptr(), (*bt).tx.as_mut_ptr(), (*bt).home.as_mut_ptr());
+        'lines: while p < stop {
+            let line = buf.add(p);
+            // SAFETY: 144 bytes are readable from every line start: the three loads take 96, and no
+            // field read below goes past byte 96 + 32
+            let mm = |x: __m256i| _mm256_movemask_epi8(x) as u32;
+            let v2 = _mm256_loadu_si256(line.add(64) as *const __m256i);
+            let nhi = mm(_mm256_cmpeq_epi8(v2, nv));
+            let (v0, v1) = (_mm256_loadu_si256(line as *const __m256i), _mm256_loadu_si256(line.add(32) as *const __m256i));
+            // a byte of the first 64 below 0x20 or above 0x7F (as a signed byte, it is below 0x20): no newline there,
+            // and both IDs are bytes that pack
+            let odd = mm(_mm256_cmpgt_epi8(lowest, _mm256_min_epi8(v0, v1)));
+            'usual: {
+                if (nhi == 0) | (odd != 0) {
+                    break 'usual;
+                }
+                let clo = mm(_mm256_cmpeq_epi8(v0, cm)) as u64 | (mm(_mm256_cmpeq_epi8(v1, cm)) as u64) << 32;
+                let qlo = mm(_mm256_cmpeq_epi8(v0, qt)) as u64 | (mm(_mm256_cmpeq_epi8(v1, qt)) as u64) << 32;
+                let thru = nhi ^ nhi.wrapping_sub(1); // through the newline
+                let bhi = (mm(_mm256_or_si256(_mm256_cmpeq_epi8(v2, cm), _mm256_cmpeq_epi8(v2, nv))) & thru) as u64;
+                let qhi = (mm(_mm256_cmpeq_epi8(v2, qt)) & thru) as u64;
+                let e2 = tz32(nhi);
+                // the first window: through the third comma
+                let c3 = drop_low(drop_low(clo));
+                let o = tz(c3) + 1; // 65 when there is none
+                // the second window starts after the third comma, at byte o, and must hold the newline (byte 64 + e2)
+                if (o > 63) | (e2 >= o) {
+                    break 'usual;
+                }
+                let ma = c3 ^ c3.wrapping_sub(1);
+                let (ca, qa) = (clo & ma, qlo & ma);
+                let b2 = (clo >> o) | (bhi << (64 - o));
+                let q2 = (qlo >> o) | (qhi << (64 - o));
+                let (sb, eb, bad_b) = window2(b2, q2);
+                // the second window well quoted, and four boundaries from the third comma through the newline:
+                // seven fields
+                if (bad_b != 0) | (b2.count_ones() != 4) {
+                    break 'usual;
+                }
+                // the first window: its shape is nearly always one seen before (`Head`)
+                let mut hd = heads.add(head_slot(ca, qa));
+                if ((*hd).c != ca) | ((*hd).q != qa) {
+                    hd = head_find(&mut (*st).heads, ca, qa);
+                    if hd.is_null() {
+                        break 'usual;
+                    }
+                }
+                let next = p + 65 + e2;
+                let n = (*bt).n;
+                // event_id, user_id: into the batch
+                let (tp, tl) = (line.add((*hd).ts as usize), (*hd).tl as usize);
+                let ekey = pack_m(&*k, line.add((*hd).es as usize), (*hd).e9);
+                let ukey = pack_m(&*k, line.add((*hd).us as usize), (*hd).u9);
+                *ba.add(n) = ekey;
+                *bu.add(n) = ukey;
+                let home = (spread(ukey) >> hshift) as usize & !3;
+                prefetch(slots.add(home));
+                *bh.add(n) = home as u32;
+                // ingest_ts: F1 when its 20 bytes are a date, a time and a Z, and the field ends there. The quotes
+                // are in place, so the byte after the Z ends the field when it is a comma or a (closing) quote
+                let rest = line.add(o as usize);
+                let ip = rest.add(tz(sb));
+                let zend = (ip.add(19) as *const u16).read_unaligned();
+                if (zend != u16::from_le_bytes(*b"Z,")) & (zend != u16::from_le_bytes(*b"Z\"")) {
+                    break 'usual;
+                }
+                let (ia, ia2) = ((ip as *const u64).read_unaligned(), (ip.add(3) as *const u64).read_unaligned());
+                let di = _pext_u64(ia2, DAY_BITS) as usize;
+                if ((*dm.add(di)).a != ia) | ((*dm.add(di)).a2 != ia2) {
+                    if !day_fill(ip, &mut (*st).dm) {
+                        break 'usual;
+                    }
+                }
+                let (isecs, ibad) = hms_at(&*k, ip.add(11));
+                if ibad != 0 || isecs >= DAY_SECS {
+                    break 'usual;
+                }
+                let ingest = (*dm.add(di)).ms + (isecs * 1000) as i64;
+                *bb.add(n) = ingest;
+                'kept: {
+                    // event_type: `view` or `cart` when those four bytes are followed by a comma or a (closing) quote
+                    let (sb, eb) = (drop_low(sb), drop_low(eb));
+                    let w = (rest.add(tz(sb)) as *const u64).read_unaligned();
+                    let after = (w >> 32) as u8;
+                    let mut pay = 0;
+                    if !(((w as u32 == u32::from_le_bytes(*b"view")) | (w as u32 == u32::from_le_bytes(*b"cart"))) & ((after == b',') | (after == b'"'))) {
+                        pay = purchase(cx, rest, w, sb, eb);
+                        if pay == 0 {
+                            break 'kept;
+                        }
+                    }
+                    // product_id: empty when its first byte is where it ends
+                    let (sb, eb) = (drop_low(sb), drop_low(eb));
+                    if (sb & sb.wrapping_neg()) & eb != 0 {
+                        break 'kept;
+                    }
+                    let Some(t) = ts_usual(&*k, dm, fm, st, tp, tl) else { break 'kept };
+                    let tw = t.wrapping_sub(ws) as u64;
+                    if (tw >= span) | (ingest.wrapping_sub(t) > DAY) {
+                        break 'kept;
+                    }
+                    *bx.add(n) = ((tw + back) as u32 as u64) << 32 | pay as u64;
+                    (*bt).n = n + 1;
+                    if n + 1 == BATCH {
+                        (*st).drain::<true>(cx);
+                    }
+                    p = next;
+                    continue 'lines;
+                }
+                // an event that is not kept: its dedup record alone
+                (*st).log(cx, *ba.add(n), *bb.add(n), 0);
+                p = next;
+                continue 'lines;
+            }
+            p = event_line(cx, buf, p, len, &mut *st);
+        }
+    }
+    st.drain::<true>(cx);
+    sfence();
+}
+
+/// What `fast_event` makes of an event whose type is neither `view` nor `cart`: category << 24 | price_cents for
+/// a `purchase` with a good price, else 0 (a price is never 0). `sb` and `eb` are the second window's fields from
+/// the type on, `w` the eight bytes where the type starts.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(never)]
+unsafe fn purchase(cx: &Ctx, rest: *const u8, w: u64, sb: u64, eb: u64) -> u32 {
+    let mut f = Cut { s: sb, e: eb };
+    let (_, kl) = f.next();
+    if kl != 8 || w != u64::from_le_bytes(*b"purchase") {
+        return 0;
+    }
+    let (ps, pl) = f.next();
+    let (cs, cl) = f.next();
+    let Some(price) = parse_price(std::slice::from_raw_parts(rest.add(cs), cl)) else { return 0 };
+    (cx.products.get_at(rest.add(ps), pl).unwrap_or(cx.unknown_cat) as u32) << 24 | price
 }
 
 /// rules.md "Clicks" 1, 3 for one line given as its 4 fields: the generic path of `fast_click`.
@@ -2672,26 +3074,120 @@ unsafe fn fast_click(cx: &Ctx, line: *const u8, mut f: Cut, st: &mut Shard) {
     st.click(cx, cx.names.key_at(line.add(cs), cl), cx.names.key_at(line.add(us), ul), t, camp);
 }
 
+/// The click line at `buf + p` through `split_click` and `fast_click`, or, when that does not take it, as a whole
+/// line through `split` and `click_fields`. Returns where the next line starts.
+#[inline(never)]
+unsafe fn click_line(cx: &Ctx, buf: *const u8, p: usize, len: usize, st: &mut Shard) -> usize {
+    let line = buf.add(p);
+    if let Some((f, n)) = split_click(line) {
+        fast_click(cx, line, f, st);
+        return p + n;
+    }
+    let file = std::slice::from_raw_parts(buf, len);
+    let e = memchr::memchr(b'\n', &file[p..]).map_or(len, |i| p + i);
+    if let Some(f) = split::<4>(std::mem::transmute::<&[u8], Bytes>(&file[p..e])) {
+        click_fields(cx, f, st);
+    }
+    e + 1
+}
+
+/// Parses the click lines that start in [start, end) of the `len` bytes at `buf` into `st`; the header line is
+/// skipped. `buf` must be readable for 144 bytes past `len`, and buf[len] must be `\n` (`read_span`).
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
 unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: usize, st: &mut Shard) {
-    scan_lines(
-        buf,
-        start,
-        end,
-        len,
-        st,
-        |st, line| match split_click(line) {
-            Some((f, n)) => {
-                fast_click(cx, line, f, st);
-                n
+    let file = std::slice::from_raw_parts(buf, len);
+    if let Some(nl) = memchr::memchr(b'\n', &file[start.saturating_sub(1)..]) {
+        let mut p = start.saturating_sub(1) + nl + 1;
+        while p < end && p < len {
+            p = click_line(cx, buf, p, len, st);
+        }
+    }
+    st.drain::<false>(cx);
+    sfence();
+}
+
+/// Parses the click lines that start in [start, end) of the `len` bytes at `buf` into `st`; the header line is
+/// skipped. `buf` must be readable for 144 bytes past `len`, and buf[len] must be `\n` (`read_span`).
+///
+/// One pass per line for the usual shape, as `parse_events`; every other line goes to `click_line`. The usual
+/// shape: the line ends in its first 64 bytes and every byte before that is 0x20..=0x7F; both IDs are 8 or 9 bytes.
+/// For such a line this does what `fast_click` does.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: usize, st: &mut Shard) {
+    use std::arch::x86_64::*;
+    let file = std::slice::from_raw_parts(buf, len);
+    let first = start.saturating_sub(1);
+    if let Some(nl) = memchr::memchr(b'\n', &file[first..]) {
+        let mut p = first + nl + 1;
+        let stop = end.min(len);
+        let (cm, qt, lowest) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'"' as i8), _mm256_set1_epi8(0x20));
+        let (base, span) = (cx.base, (cx.we - cx.base) as u64);
+        let (slots, hshift) = (cx.ids.slots.as_ptr(), 64 - cx.ids.bits);
+        let st: *mut Shard = st;
+        let k: *const K = &(*st).k;
+        let (dm, fm): (*const DayM, *const MsM) = ((*st).dm.as_ptr(), (*st).fm.as_ptr());
+        let bt: *mut Batch = &mut (*st).bt;
+        let (ba, bu, bx, bh) = ((*bt).a.as_mut_ptr(), (*bt).ukey.as_mut_ptr(), (*bt).tx.as_mut_ptr(), (*bt).home.as_mut_ptr());
+        'lines: while p < stop {
+            let line = buf.add(p);
+            // SAFETY: 144 bytes are readable from every line start: the two loads take 64, and no
+            // field read below goes past byte 64 + 32
+            let (v0, v1) = (_mm256_loadu_si256(line as *const __m256i), _mm256_loadu_si256(line.add(32) as *const __m256i));
+            let m64 = |x: __m256i, y: __m256i| _mm256_movemask_epi8(x) as u32 as u64 | (_mm256_movemask_epi8(y) as u32 as u64) << 32;
+            // the bytes below 0x20 or above 0x7F (as signed bytes, they are below 0x20): the first must be the
+            // line's newline, so that both IDs are bytes that pack
+            let odd = m64(_mm256_cmpgt_epi8(lowest, v0), _mm256_cmpgt_epi8(lowest, v1));
+            'usual: {
+                let e = tz(odd);
+                if (odd == 0) || *line.add(e) != b'\n' {
+                    break 'usual;
+                }
+                let thru = odd ^ odd.wrapping_sub(1); // through the newline
+                let b = (m64(_mm256_cmpeq_epi8(v0, cm), _mm256_cmpeq_epi8(v1, cm)) | odd) & thru;
+                let q = m64(_mm256_cmpeq_epi8(v0, qt), _mm256_cmpeq_epi8(v1, qt)) & thru;
+                let (s, en, bad) = window2(b, q);
+                // well quoted, and four boundaries through the newline: four fields
+                if (bad != 0) | (b.count_ones() != 4) {
+                    break 'usual;
+                }
+                let next = p + e + 1;
+                let (cs, ce) = (tz(s), tz(en));
+                let (s, en) = (drop_low(s), drop_low(en));
+                let (us, ue) = (tz(s), tz(en));
+                let (cl, ul) = (ce - cs, ue - us);
+                if (cl.wrapping_sub(8) | ul.wrapping_sub(8)) > 1 {
+                    break 'usual;
+                }
+                let (s, en) = (drop_low(s), drop_low(en));
+                let ks = tz(s);
+                let kl = tz(en) - ks;
+                let (s, en) = (drop_low(s), drop_low(en));
+                let ts = tz(s);
+                let (tp, tl) = (line.add(ts), tz(en) - ts);
+                p = next;
+                let Some(t) = ts_usual(&*k, dm, fm, st, tp, tl) else { continue 'lines };
+                let tw = t.wrapping_sub(base) as u64;
+                if tw >= span {
+                    continue 'lines;
+                }
+                let Some(camp) = cx.campaigns.get_short(line.add(ks), kl) else { continue 'lines };
+                let n = (*bt).n;
+                let ukey = pack89(&*k, line.add(us), ul);
+                *ba.add(n) = pack89(&*k, line.add(cs), cl);
+                *bu.add(n) = ukey;
+                let home = (spread(ukey) >> hshift) as usize & !3;
+                prefetch(slots.add(home));
+                *bh.add(n) = home as u32;
+                *bx.add(n) = (tw as u32 as u64) << 32 | camp as u64;
+                (*bt).n = n + 1;
+                if n + 1 == BATCH {
+                    (*st).drain::<false>(cx);
+                }
+                continue 'lines;
             }
-            None => 0,
-        },
-        |st, l| {
-            if let Some(f) = split::<4>(l) {
-                click_fields(cx, f, st);
-            }
-        },
-    );
+            p = click_line(cx, buf, p, len, &mut *st);
+        }
+    }
     st.drain::<false>(cx);
     sfence();
 }
@@ -4553,6 +5049,134 @@ mod tests {
             assert!(fa == fb, "round {round}: fast parse differs\n{}", std::str::from_utf8(file).unwrap());
         }
         assert!(kept > 1000, "too few kept events ({kept}) to mean anything");
+    }
+
+    /// Lines of the generator's shape (IDs of 8 or 9 bytes, event lines of 64 to 95 bytes), fields quoted at
+    /// random and now and then a byte changed: `parse_events` and `parse_clicks` against the generic field parsers.
+    #[test]
+    fn usual_lines_match_reference() {
+        let mut c = ctx();
+        let camps: Vec<(Bytes, u16)> = (0..40u16).map(|i| (&*Box::leak(format!("c_{}", i * 37).into_bytes().into_boxed_slice()), i)).collect();
+        c.campaigns = IdMap::new(&camps).with_short(&camps);
+        c.ncamp = camps.len();
+        let mut r = Rng(0x9e37_79b9_7f4a_7c15);
+        fn b36(r: &mut Rng, n: usize) -> String {
+            (0..n).map(|_| char::from_digit(r.below(36) as u32, 36).unwrap()).collect()
+        }
+        // F1 of 2028-02-15T00:00:00Z + ms
+        fn f1(ms: u64) -> String {
+            let (d, s) = ((ms / 86_400_000) as usize, ms % 86_400_000 / 1000);
+            let (mo, dd) = if d < 15 { (2, 15 + d) } else { (3, d - 14) };
+            format!("2028-{mo:02}-{dd:02}T{:02}:{:02}:{:02}Z", s / 3600, s / 60 % 60, s % 60)
+        }
+        let t0 = parse_ts(b"2028-02-15T00:00:00Z").unwrap() as u64;
+        fn ts(r: &mut Rng, t0: u64, ms: u64) -> String {
+            match r.below(12) {
+                0..=5 => f1(ms),
+                6..=8 => (t0 + ms).to_string(),
+                9 => format!("{}+05:00", &f1(ms + 5 * 3_600_000)[..19]),
+                10 => format!("{}-10:30", &f1(ms.saturating_sub(37_800_000))[..19]),
+                _ => ts_value(r),
+            }
+        }
+        fn quote(r: &mut Rng, v: String) -> String {
+            if r.below(5) == 0 {
+                format!("\"{v}\"")
+            } else {
+                v
+            }
+        }
+        fn id(r: &mut Rng, c: char) -> String {
+            match r.below(40) {
+                0 => String::new(),
+                1 => {
+                    let n = 5 + r.below(7);
+                    format!("{c}{}", b36(r, n))
+                }
+                2..=5 => format!("{c}{}", b36(r, 7)),
+                _ => format!("{c}{}", b36(r, 8)),
+            }
+        }
+        fn mutate(r: &mut Rng, mut l: String) -> String {
+            if r.below(10) == 0 && !l.is_empty() {
+                let k = r.below(l.len());
+                if l.is_char_boundary(k) && l.is_char_boundary(k + 1) {
+                    match r.below(3) {
+                        0 => l.replace_range(k..k + 1, r.pick(&["\"", ",", "\r", "\u{1}", "é", " ", "0", "Z", ":", "x", "\n", "\u{7f}"])),
+                        1 => {
+                            l.remove(k);
+                        }
+                        _ => l.insert(k, ['"', ',', '9', 'T'][r.below(4)]),
+                    }
+                }
+            }
+            l
+        }
+        let (mut kept, mut clicks) = (0, 0);
+        for round in 0..200 {
+            let mut ev = String::from("event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n");
+            let mut ck = String::from("click_id,user_id,campaign_id,ts\n");
+            for _ in 0..r.below(300) {
+                let ms = r.below(25 * 86_400_000) as u64;
+                let ing = ms / 1000 * 1000 + [30_000, 600_000, 3_000_000, 86_400_000, 86_401_000, 3 * 86_400_000][r.below(6)];
+                let f = [
+                    id(&mut r, 'e'),
+                    id(&mut r, 'u'),
+                    ts(&mut r, t0, ms),
+                    if r.below(30) == 0 { ts(&mut r, t0, ing) } else { f1(ing) },
+                    r.pick(&["view", "view", "view", "view", "cart", "cart", "purchase", "purchase", "Purchase", "views", "car", ""]).to_string(),
+                    r.pick(&["p1", "p2", "p39594", "p17893", "p8823", "p310", ""]).to_string(),
+                    r.pick(&["", "", "", "41607", "720", "0", "10000000", "10000001", "-5", "1.5"]).to_string(),
+                ];
+                let l = f.map(|v| quote(&mut r, v)).join(",");
+                ev += &mutate(&mut r, l);
+                ev.push('\n');
+                let ms = r.below(25 * 86_400_000) as u64;
+                let f = [id(&mut r, 'k'), id(&mut r, 'u'), format!("c_{}", r.below(45) * 37), ts(&mut r, t0, ms)];
+                let l = f.map(|v| quote(&mut r, v)).join(",");
+                ck += &mutate(&mut r, l);
+                ck.push('\n');
+            }
+            if round % 3 == 0 {
+                ev.pop(); // no trailing newline
+                ck.pop();
+            }
+            for (events, text) in [(true, ev), (false, ck)] {
+                let len = text.len();
+                let mut padded = text.clone().into_bytes();
+                padded.extend_from_slice(&[b'\n'; PAD]);
+                let file: Bytes = Box::leak(text.into_bytes().into_boxed_slice());
+                let mut cuts = vec![0, len];
+                for _ in 0..r.below(4) {
+                    cuts.push(r.below(len + 1));
+                }
+                cuts.sort();
+                let (mut a, mut b) = (Shard::new(16, 16), Shard::new(16, 16));
+                for w in cuts.windows(2) {
+                    if events {
+                        unsafe { parse_events(&c, padded.as_ptr(), w[0], w[1], len, &mut a) };
+                        for_records::<7>(file, w[0], w[1], |f| event_fields(&c, f, &mut b));
+                        b.drain::<true>(&c);
+                    } else {
+                        unsafe { parse_clicks(&c, padded.as_ptr(), w[0], w[1], len, &mut a) };
+                        for_records::<4>(file, w[0], w[1], |f| click_fields(&c, f, &mut b));
+                        b.drain::<false>(&c);
+                    }
+                }
+                let cks = |st: &mut Shard| {
+                    st.ck.iter_mut().for_each(Stream::finish);
+                    let mut v: Vec<_> = st.ck.iter().flat_map(|s| s.slices(CK_BLOCK)).flatten().map(|r| (r.cid, r.w)).collect();
+                    v.sort();
+                    v
+                };
+                let (ca, cb) = (cks(&mut a), cks(&mut b));
+                let (fa, fb) = (flat(&mut a), flat(&mut b));
+                kept += fb.0.len();
+                clicks += cb.len();
+                assert!(fa == fb && ca == cb, "round {round}: one-pass parse differs\n{}", String::from_utf8_lossy(file));
+            }
+        }
+        assert!(kept > 3000 && clicks > 5000, "too few kept events ({kept}) or clicks ({clicks}) to mean anything");
     }
 
     #[test]

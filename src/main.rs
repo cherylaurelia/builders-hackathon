@@ -2349,20 +2349,22 @@ fn line_match(line: &[u32; 16], tag: u32) -> (u32, u32) {
 ///
 /// One pass over the bucket's records puts each in a table of 64-byte lines, 8 tags + 8 positions each, probed
 /// with one SIMD compare: a record's line is the top bits of key * 2^64 / phi, its tag 31 lower bits | 1, a full line spills
-/// into the next. A record whose tag is already there is a candidate, and so is the record it met (once). All
-/// copies of a key share its tag, so they all become candidates; a few other keys do too and are told apart by key.
+/// into the next. A record whose tag is already there joins that tag's group (the slot then holds the group, and
+/// the group starts with the record it met), chained in `mem`. All copies of a key share its tag, so they all meet
+/// in one group; a few other keys do too and are told apart by key.
 fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
-    // a record's position: shard << POS_T | index in that shard's stream of the bucket; with at most 127 shards,
-    // position + 1 stays below u32::MAX, the table's "already a candidate" mark
+    // a record's position: shard << POS_T | index in that shard's stream of the bucket. With at most 127 shards a
+    // position + 1 is at most 127 << POS_T < GRP: a table slot at or above GRP holds a group number + GRP instead
     const POS_T: u32 = 25;
+    const GRP: u32 = (127 << POS_T) + 1;
     if shards.len() > 127 || shards.iter().any(|s| s.lg.iter().any(|l| l.len(LG_BLOCK) >> POS_T != 0)) {
         die("too many events for the duplicate finder");
     }
     par(
         threads,
         buckets,
-        || (Vec::<DLine>::new(), Vec::<u64>::new(), Vec::<LRec>::new(), 0usize),
-        |(table, dups, recs, total), b| {
+        || (Vec::<DLine>::new(), Vec::<(LRec, u32)>::new(), Vec::<(u32, u32)>::new(), Vec::<(u32, u32)>::new(), Vec::<LRec>::new(), 0usize),
+        |(table, mem, groups, firsts, grp, total), b| {
             let n: usize = shards.iter().map(|s| s.lg[b].len(LG_BLOCK)).sum();
             let lines = (n / 6).next_power_of_two().max(4); // at most 3/4 full
             let mask = lines - 1;
@@ -2371,7 +2373,14 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
             let fib = |k: u64| k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
             table.clear();
             table.resize(lines, DLine([0; 16]));
-            dups.clear();
+            mem.clear();
+            groups.clear();
+            firsts.clear();
+            let at = |pos: u32| {
+                let (t, i) = ((pos - 1) as usize >> POS_T, (pos - 1) as usize & ((1 << POS_T) - 1));
+                // SAFETY: i < the stream's length, so block i / LG_BLOCK holds it
+                unsafe { shards[t].lg[b].blocks[i / LG_BLOCK].add(i % LG_BLOCK) as *const LRec }
+            };
             for (t, s) in shards.iter().enumerate() {
                 let mut me = ((t as u32) << POS_T) + 1;
                 for blk in s.lg[b].slices(LG_BLOCK) {
@@ -2387,11 +2396,23 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
                             let (eq, empty) = line_match(line, tag);
                             if eq != 0 {
                                 let at = 8 + eq.trailing_zeros() as usize;
-                                if line[at] != u32::MAX {
-                                    dups.push((tag as u64) << 32 | line[at] as u64);
-                                    line[at] = u32::MAX;
+                                let x = mem.len() as u32;
+                                if line[at] < GRP {
+                                    // the tag's first repeat: a new group of the record it met (copied below) and this one
+                                    if groups.len() as u32 >= u32::MAX - GRP {
+                                        die("too many duplicate groups in one event-key bucket");
+                                    }
+                                    firsts.push((x, line[at]));
+                                    mem.push((*r, x + 2));
+                                    mem.push((*r, 0));
+                                    line[at] = GRP + groups.len() as u32;
+                                    groups.push((x, x + 1));
+                                } else {
+                                    let g = &mut groups[(line[at] - GRP) as usize];
+                                    mem[g.1 as usize].1 = x + 1;
+                                    mem.push((*r, 0));
+                                    g.1 = x;
                                 }
-                                dups.push((tag as u64) << 32 | me as u64);
                                 break;
                             }
                             if empty != 0 {
@@ -2406,52 +2427,58 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
                     }
                 }
             }
-            *total += dups.len();
-            dups.sort_unstable();
-            let at = |d: u64| {
-                let pos = (d as u32 - 1) as usize;
-                let (t, i) = (pos >> POS_T, pos & ((1 << POS_T) - 1));
-                // SAFETY: i < the stream's length, so block i / LG_BLOCK holds it
-                unsafe { shards[t].lg[b].blocks[i / LG_BLOCK].add(i % LG_BLOCK) as *const LRec }
-            };
-            // the candidates' records, and then the events they may mark, asked for AHEAD candidates before use
+            *total += mem.len();
+            // the records the groups started with, asked for AHEAD before use
             const AHEAD: usize = 16;
-            recs.clear();
-            for x in 0..dups.len() {
-                if let Some(&d) = dups.get(x + AHEAD) {
-                    prefetch(at(d));
+            for k in 0..firsts.len() {
+                if let Some(&(_, p)) = firsts.get(k + AHEAD) {
+                    prefetch(at(p));
                 }
+                let (x, p) = firsts[k];
                 // SAFETY: `at` is the address of a record of a live stream
-                recs.push(unsafe { *at(dups[x]) });
+                mem[x as usize].0 = unsafe { *at(p) };
             }
-            for r in recs.iter().take(AHEAD) {
-                prefetch(r.loc as *const ERec);
-            }
-            let mut i = 0;
-            while i < recs.len() {
-                // the candidates of one tag, in table order; mostly the copies of one key
-                let mut j = i + 1;
-                while j < recs.len() && dups[j] >> 32 == dups[i] >> 32 {
-                    j += 1;
+            // per group, the events it may mark asked for AHEAD groups before
+            let ahead = |g: (u32, u32)| {
+                prefetch(mem[g.0 as usize].0.loc as *const ERec); // loc 0 is a harmless hint
+                prefetch(mem[g.0 as usize + 1].0.loc as *const ERec);
+            };
+            groups.iter().take(AHEAD).for_each(|&g| ahead(g));
+            for gi in 0..groups.len() {
+                if let Some(&g) = groups.get(gi + AHEAD) {
+                    ahead(g);
                 }
-                for r in &recs[(i + AHEAD).min(recs.len())..(j + AHEAD).min(recs.len())] {
-                    prefetch(r.loc as *const ERec); // loc 0 is a harmless hint
+                // the records of one tag, in table order; mostly the copies of one key
+                grp.clear();
+                let mut x = groups[gi].0 as usize + 1;
+                while x != 0 {
+                    grp.push(mem[x - 1].0);
+                    x = mem[x - 1].1 as usize;
                 }
-                let g = &recs[i..j];
-                for (k, r) in g.iter().enumerate() {
+                if grp.len() > 16 {
+                    // a big group (one event_id with many copies, or many keys on one tag): sorted, not pairwise
+                    grp.sort_unstable_by_key(|r| (r.key, r.ingest));
+                    for k in 1..grp.len() {
+                        if grp[k].loc != 0 && grp[k - 1].key == grp[k].key {
+                            // SAFETY: as below
+                            unsafe { (*(grp[k].loc as *mut ERec)).person = DROPPED };
+                        }
+                    }
+                    continue;
+                }
+                for (k, r) in grp.iter().enumerate() {
                     // dropped: a valid copy with an earlier copy of its key (smaller ingest_ts, or equal and before it:
                     // copies with equal ingest_ts are identical, so exactly one of them is kept)
-                    if r.loc != 0 && g.iter().enumerate().any(|(x, o)| o.key == r.key && (o.ingest < r.ingest || (o.ingest == r.ingest && x < k))) {
+                    if r.loc != 0 && grp.iter().enumerate().any(|(x, o)| o.key == r.key && (o.ingest < r.ingest || (o.ingest == r.ingest && x < k))) {
                         // SAFETY: the address of an ERec in a live arena; no other thread touches this record now
                         unsafe { (*(r.loc as *mut ERec)).person = DROPPED };
                     }
                 }
-                i = j;
             }
         },
     )
     .iter()
-    .map(|x| x.3)
+    .map(|x| x.5)
     .sum()
 }
 

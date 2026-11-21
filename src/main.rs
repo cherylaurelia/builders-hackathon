@@ -1763,14 +1763,32 @@ fn uncached(f: &InFile, off: usize) -> bool {
 
 const READ_AHEAD_THREADS: usize = 2;
 
+/// True when `f` is on a file system that keeps its files in memory (tmpfs, ramfs): nothing of it waits on a disk.
+/// Such a file answers the probe of `uncached` with "not supported", which reads as not cached.
+#[cfg(target_os = "linux")]
+fn in_memory(f: &InFile) -> bool {
+    use std::os::unix::io::AsRawFd;
+    const TMPFS: i64 = 0x0102_1994;
+    const RAMFS: i64 = 0x8584_58f6;
+    // SAFETY: fstatfs fills the zeroed struct or fails; a failure counts as a disk
+    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::fstatfs(f.f.as_raw_fd(), &mut s) } == 0;
+    ok && matches!(s.f_type as i64, TMPFS | RAMFS)
+}
+
 /// Cold page cache: asks the kernel for the whole input at once, in the order it will be parsed, from a few
 /// threads of their own, so the disk works at full speed from the first moment whatever the parse is doing.
-/// An input that is cached already (16 probes all answer without the disk) is left alone.
+/// An input that is cached already (16 probes all answer without the disk, or are of files kept in memory) is
+/// left alone: on a tmpfs the threads only took two CPUs from the link builder for the calls they made.
 #[cfg(target_os = "linux")]
 fn read_ahead(queue: Vec<(&'static InFile, usize, usize)>, _threads: usize) {
     use std::os::unix::io::AsRawFd;
     let n = queue.len();
-    if n == 0 || !(0..16).any(|i| uncached(queue[i * n / 16].0, (queue[i * n / 16].1 + queue[i * n / 16].2) / 2)) {
+    let cold = |i: usize| {
+        let (f, s, e) = queue[i * n / 16];
+        !in_memory(f) && uncached(f, (s + e) / 2)
+    };
+    if n == 0 || !(0..16).any(cold) {
         return;
     }
     let queue = std::sync::Arc::new(queue);
@@ -1990,6 +2008,16 @@ fn usage() -> (f64, u64) {
 fn die(msg: &str) -> ! {
     eprintln!("fatal: {msg}");
     std::process::exit(1)
+}
+
+/// When the run started (set first thing in `main`).
+static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// With SESS_DEBUG set: prints how long after the start a step inside a phase ended.
+fn mark(what: &str) {
+    if std::env::var_os("SESS_DEBUG").is_some() {
+        eprintln!("[{:7.3}s] {what}", START.get().map_or(0.0, |t| t.elapsed().as_secs_f64()));
+    }
 }
 
 /// Runs `work(state, i)` for i in 0..n across `threads` threads; returns each thread's state.
@@ -2349,7 +2377,7 @@ fn log2_near(n: usize) -> u32 {
 }
 
 fn main() {
-    let t0 = Instant::now();
+    let t0 = *START.get_or_init(Instant::now);
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let threads: usize = env_num("NCPU")
@@ -2422,12 +2450,15 @@ fn main() {
     // 1. links, on every thread; this one reads the small tables meanwhile
     let ids = IdTable::new(id_bits);
     let names = Interner::new();
+    mark("files listed, ID table mapped");
     let (n_links, small) = std::thread::scope(|sc| {
         let links = sc.spawn(|| {
             ids.populate(threads);
+            mark("ID table populated");
             build_links(&ids, &names, link_files, threads)
         });
         let small = small_tables(&data);
+        mark("small tables read");
         (links.join().unwrap_or_else(|_| die("link builder panicked")), small)
     });
     let Small { products, campaigns, cat_names, cat_rank, unknown_cat, camp_ids, camp_channel } = small;
@@ -2609,10 +2640,11 @@ impl IdMap {
     fn new(ids: &[(Bytes, u16)]) -> IdMap {
         let cap = (ids.len() * 2).next_power_of_two().max(16);
         let mut m = IdMap { slots: filled(cap, (0, 0)), shift: 64 - cap.trailing_zeros(), other: BytesMap::default(), rkeys: Vec::new(), rvals: Vec::new(), rshift: 0 };
+        // an ID given twice keeps its first number: a lookup stops at the first slot that holds the key
         for &(id, v) in ids {
             match pack(id) {
                 0 => {
-                    m.other.insert(id, v);
+                    m.other.entry(id).or_insert(v);
                 }
                 k => {
                     let mut i = (spread(k) >> m.shift) as usize;
@@ -2721,9 +2753,9 @@ fn small_tables(data: &Path) -> Small {
     // products -> categories; "unknown" is its own category, never one of the file's
     let mut cat_names: Vec<Bytes> = Vec::new();
     let mut cat_idx: BytesMap<u16> = BytesMap::default();
-    let mut products: Vec<(Bytes, u16)> = Vec::new();
-    let mut seen: BytesMap<()> = BytesMap::default();
-    for (p, c) in small_table(&data.join("products.csv")) {
+    let rows = small_table(&data.join("products.csv"));
+    let mut products: Vec<(Bytes, u16)> = Vec::with_capacity(rows.len());
+    for (p, c) in rows {
         let n = cat_names.len() as u16;
         let ci = *cat_idx.entry(c).or_insert_with(|| {
             cat_names.push(c);
@@ -2731,9 +2763,10 @@ fn small_tables(data: &Path) -> Small {
         });
         products.push((p, ci));
     }
-    // product_id is unique per rules.md; were one repeated, its last line would count
+    // product_id is unique per rules.md; were one repeated, its last line would count: of the entries of one ID
+    // an `IdMap` answers with the first it was given
     products.reverse();
-    products.retain(|&(p, _)| seen.insert(p, ()).is_none());
+    let mut seen: BytesMap<()> = BytesMap::default();
     let unknown_cat = cat_names.len() as u16;
     cat_names.push(b"unknown");
     if cat_names.len() > 256 {
@@ -2906,6 +2939,7 @@ fn build_links(ids: &IdTable, names: &Interner, files: &[InFile], threads: usize
             bt.join(ids, names);
         },
     );
+    mark("link lines joined");
     // B. flatten, one pass over the table: every linked ID points straight at its root. The linked slots of a
     //    stretch are found a cache line at a time and wait, what they hang under asked for, until WAIT of them do
     const SPAN: usize = 1 << 15;

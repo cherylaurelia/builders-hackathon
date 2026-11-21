@@ -1200,6 +1200,9 @@ fn main() {
         }
     }
     let user_parts: Vec<&[UserRow]> = results.iter().map(|r| r.rows.as_slice()).collect();
+    if n_ev >= i32::MAX as usize {
+        die("too many events for 32-bit session and event counts");
+    }
     write_outputs(&out, &user_parts, &camp_rows, &cat_names, threads);
     lap(&format!("written: {} user rows, {} campaign rows", user_parts.iter().map(|p| p.len()).sum::<usize>(), camp_rows.len()));
     // everything is on disk: no destructors, the memory is released in parallel
@@ -2016,8 +2019,8 @@ const fn col(name: &'static str, ty: i32, converted: Option<i32>) -> ColSpec {
 const USER_COLS: [ColSpec; 6] = [
     col("user_id", T_BYTES, Some(CT_UTF8)),
     col("day", T_INT32, Some(CT_DATE)),
-    col("sessions", T_INT64, None),
-    col("events", T_INT64, None),
+    col("sessions", T_INT32, None),
+    col("events", T_INT32, None),
     col("revenue_cents", T_INT64, None),
     ColSpec { name: "top_category", ty: T_BYTES, optional: true, converted: Some(CT_UTF8) },
 ];
@@ -2032,36 +2035,53 @@ const CAMP_COLS: [ColSpec; 7] = [
     col("assisted_sessions", T_INT64, None),
 ];
 
-/// Writes `path` with one row group of `n` rows. `fill(i, buf)` appends column i's PLAIN page body to `buf`
-/// (for the optional column: the definition levels first, as a length-prefixed RLE/bit-packed run).
-fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(usize, &mut Vec<u8>)) -> std::io::Result<()> {
+/// Rows per data page: a page body stays cache-sized and one buffer is reused for every page.
+const PAGE_ROWS: usize = 16384;
+/// Room reserved in front of a page body for its Thrift page header, which is written backwards from here.
+const HDR_ROOM: usize = 48;
+
+/// Writes `path` with one row group of `n` rows. `fill(i, lo, hi, buf)` appends the PLAIN body of the data page of
+/// column i holding rows lo..hi to `buf` (for the optional column: the definition levels first, as a length-prefixed
+/// RLE/bit-packed run).
+fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(usize, usize, usize, &mut Vec<u8>)) -> std::io::Result<()> {
     use std::io::Write;
-    let mut f = std::io::BufWriter::with_capacity(1 << 16, std::fs::File::create(path)?);
+    let mut f = std::fs::File::create(path)?;
     f.write_all(b"PAR1")?;
     let mut off = 4i64;
-    let mut body = Vec::new();
+    let mut page = Vec::new();
     let mut chunks = Vec::with_capacity(cols.len()); // (offset, size)
     for i in 0..cols.len() {
-        body.clear();
-        fill(i, &mut body);
-        let size = i32::try_from(body.len()).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
-        let mut h = Thrift::new();
-        h.begin();
-        h.i32(1, 0); // DATA_PAGE
-        h.i32(2, size);
-        h.i32(3, size);
-        h.sub(5);
-        h.i32(1, n as i32); // num_values
-        h.i32(2, 0); // PLAIN
-        h.i32(3, 3); // definition levels: RLE
-        h.i32(4, 3); // repetition levels: RLE
-        h.end();
-        h.end();
-        f.write_all(&h.b)?;
-        f.write_all(&body)?;
-        let total = (h.b.len() + body.len()) as i64;
-        chunks.push((off, total));
-        off += total;
+        let start = off;
+        let mut lo = 0;
+        loop {
+            let hi = (lo + PAGE_ROWS).min(n);
+            page.clear();
+            page.resize(HDR_ROOM, 0);
+            fill(i, lo, hi, &mut page);
+            let size = i32::try_from(page.len() - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
+            let mut h = Thrift::new();
+            h.begin();
+            h.i32(1, 0); // DATA_PAGE
+            h.i32(2, size);
+            h.i32(3, size);
+            h.sub(5);
+            h.i32(1, (hi - lo) as i32); // num_values
+            h.i32(2, 0); // PLAIN
+            h.i32(3, 3); // definition levels: RLE
+            h.i32(4, 3); // repetition levels: RLE
+            h.end();
+            h.end();
+            assert!(h.b.len() <= HDR_ROOM);
+            let at = HDR_ROOM - h.b.len();
+            page[at..HDR_ROOM].copy_from_slice(&h.b);
+            f.write_all(&page[at..])?;
+            off += (page.len() - at) as i64;
+            lo = hi;
+            if lo >= n {
+                break;
+            }
+        }
+        chunks.push((start, off - start));
     }
     let mut t = Thrift::new();
     t.begin();
@@ -2112,10 +2132,10 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
     t.end();
     t.str(6, "sessions");
     t.end();
-    f.write_all(&t.b)?;
-    f.write_all(&(t.b.len() as u32).to_le_bytes())?;
-    f.write_all(b"PAR1")?;
-    f.flush()
+    let len = t.b.len() as u32;
+    t.b.extend_from_slice(&len.to_le_bytes());
+    t.b.extend_from_slice(b"PAR1");
+    f.write_all(&t.b)
 }
 
 fn plain_bytes<'a>(buf: &mut Vec<u8>, vals: impl Iterator<Item = &'a [u8]>) {
@@ -2167,52 +2187,118 @@ fn write_outputs(out: &Path, users: &[&[UserRow]], camps: &[CampRow], cat_names:
     });
 }
 
+/// The pieces of `segs` (consecutive row slices) that cover rows lo..hi of their concatenation.
+fn page_slices<'a>(segs: &[&'a [UserRow]], lo: usize, hi: usize, out: &mut Vec<&'a [UserRow]>) {
+    out.clear();
+    let mut base = 0;
+    for &s in segs {
+        let (a, b) = (base, base + s.len());
+        if b > lo && a < hi {
+            out.push(&s[lo.max(a) - a..hi.min(b) - a]);
+        }
+        base = b;
+    }
+}
+
+/// Appends `s` as a PLAIN byte array: 4-byte length, then the bytes. Inline IDs copy 16 bytes in one go.
+#[inline]
+fn put_name(b: &mut Vec<u8>, s: &SStr) {
+    let n = s.0[15];
+    if n != SStr::LONG {
+        if b.capacity() - b.len() < 20 {
+            b.reserve(1 << 16);
+        }
+        // room for 4 + 16 bytes is there; only the first 4 + n of them stay in the vector
+        unsafe {
+            let p = b.as_mut_ptr().add(b.len());
+            (p as *mut u32).write_unaligned(n as u32);
+            std::ptr::copy_nonoverlapping(s.0.as_ptr(), p.add(4), 16);
+            b.set_len(b.len() + 4 + n as usize);
+        }
+    } else {
+        let v = s.get();
+        b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        b.extend_from_slice(v);
+    }
+}
+
+/// Appends one `W`-byte little-endian value per row.
+fn put_fixed<const W: usize>(b: &mut Vec<u8>, part: &[&[UserRow]], f: impl Fn(&UserRow) -> [u8; W]) {
+    let rows: usize = part.iter().map(|s| s.len()).sum();
+    let at = b.len();
+    b.resize(at + rows * W, 0);
+    let mut dst = b[at..].chunks_exact_mut(W);
+    for r in part.iter().flat_map(|s| s.iter()) {
+        dst.next().unwrap().copy_from_slice(&f(r));
+    }
+}
+
 fn write_users(path: &Path, segs: &[&[UserRow]], cat_names: &[Bytes]) -> std::io::Result<()> {
     let n: usize = segs.iter().map(|s| s.len()).sum();
-    let rows = || segs.iter().flat_map(|s| s.iter());
-    write_parquet(path, &USER_COLS, n, |c, b| match c {
-        0 => {
-            b.reserve(n * 24);
-            plain_bytes(b, rows().map(|r| r.name.get()))
-        }
-        1 => {
-            b.reserve(n * 4);
-            rows().for_each(|r| b.extend_from_slice(&r.day.to_le_bytes()))
-        }
-        2 => plain_i64(b, rows().map(|r| r.sessions)),
-        3 => plain_i64(b, rows().map(|r| r.events)),
-        4 => plain_i64(b, rows().map(|r| r.revenue)),
-        _ => {
-            // definition levels: one bit-packed run of ceil(n / 8) groups of 8 bits (1 = present)
-            let groups = n.div_ceil(8);
-            let mut run = Vec::with_capacity(groups + 5);
-            let mut v = ((groups as u64) << 1) | 1;
-            while v >= 0x80 {
-                run.push(v as u8 | 0x80);
-                v >>= 7;
+    let mut part: Vec<&[UserRow]> = Vec::new();
+    let mut run: Vec<u8> = Vec::new();
+    // sessions and events stay far below 2^31: main() refuses inputs with that many events
+    write_parquet(path, &USER_COLS, n, |c, lo, hi, b| {
+        page_slices(segs, lo, hi, &mut part);
+        match c {
+            0 => {
+                b.reserve((hi - lo) * 20 + 64);
+                for r in part.iter().flat_map(|s| s.iter()) {
+                    put_name(b, &r.name);
+                }
             }
-            run.push(v as u8);
-            let at = run.len();
-            run.resize(at + groups, 0);
-            for (i, r) in rows().enumerate() {
-                run[at + i / 8] |= (r.top.is_some() as u8) << (i % 8);
+            1 => put_fixed(b, &part, |r| r.day.to_le_bytes()),
+            2 => put_fixed(b, &part, |r| (r.sessions as i32).to_le_bytes()),
+            3 => put_fixed(b, &part, |r| (r.events as i32).to_le_bytes()),
+            4 => put_fixed(b, &part, |r| r.revenue.to_le_bytes()),
+            _ => {
+                // definition levels: one bit-packed run of ceil(rows / 8) groups of 8 bits (1 = present)
+                let groups = (hi - lo).div_ceil(8);
+                run.clear();
+                let mut v = ((groups as u64) << 1) | 1;
+                while v >= 0x80 {
+                    run.push(v as u8 | 0x80);
+                    v >>= 7;
+                }
+                run.push(v as u8);
+                let (mut cur, mut k) = (0u8, 0);
+                for r in part.iter().flat_map(|s| s.iter()) {
+                    cur |= (r.top.is_some() as u8) << k;
+                    k += 1;
+                    if k == 8 {
+                        run.push(cur);
+                        (cur, k) = (0, 0);
+                    }
+                }
+                if k > 0 {
+                    run.push(cur);
+                }
+                b.extend_from_slice(&((run.len()) as u32).to_le_bytes());
+                b.extend_from_slice(&run);
+                for r in part.iter().flat_map(|s| s.iter()) {
+                    if let Some(t) = r.top {
+                        let v = cat_names[t as usize];
+                        b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                        b.extend_from_slice(v);
+                    }
+                }
             }
-            b.extend_from_slice(&(run.len() as u32).to_le_bytes());
-            b.extend_from_slice(&run);
-            plain_bytes(b, rows().filter_map(|r| r.top.map(|t| cat_names[t as usize])))
         }
     })
 }
 
 fn write_camps(path: &Path, rows: &[CampRow]) -> std::io::Result<()> {
-    write_parquet(path, &CAMP_COLS, rows.len(), |c, b| match c {
-        0 => plain_bytes(b, rows.iter().map(|r| r.0)),
-        1 => plain_bytes(b, rows.iter().map(|r| r.1)),
-        2 => rows.iter().for_each(|r| b.extend_from_slice(&r.2.to_le_bytes())),
-        3 => plain_i64(b, rows.iter().map(|r| r.3)),
-        4 => plain_i64(b, rows.iter().map(|r| r.4)),
-        5 => plain_i64(b, rows.iter().map(|r| r.5)),
-        _ => plain_i64(b, rows.iter().map(|r| r.6)),
+    write_parquet(path, &CAMP_COLS, rows.len(), |c, lo, hi, b| {
+        let rows = &rows[lo..hi];
+        match c {
+            0 => plain_bytes(b, rows.iter().map(|r| r.0)),
+            1 => plain_bytes(b, rows.iter().map(|r| r.1)),
+            2 => rows.iter().for_each(|r| b.extend_from_slice(&r.2.to_le_bytes())),
+            3 => plain_i64(b, rows.iter().map(|r| r.3)),
+            4 => plain_i64(b, rows.iter().map(|r| r.4)),
+            5 => plain_i64(b, rows.iter().map(|r| r.5)),
+            _ => plain_i64(b, rows.iter().map(|r| r.6)),
+        }
     })
 }
 

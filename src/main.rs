@@ -969,6 +969,16 @@ unsafe fn ts_at(p: *const u8, len: usize) -> Option<i64> {
         let t = civil_at(p)?;
         return Some(if at(19) == b'+' { t - off } else { t + off });
     }
+    if len == 13 {
+        // F3 as the generator writes it: digits 0..8 and digits 5..13 as two 8-digit numbers
+        let zeros = u64::from_le_bytes([b'0'; 8]);
+        let a = (p as *const u64).read_unaligned() ^ zeros;
+        let b = (p.add(5) as *const u64).read_unaligned() ^ zeros;
+        if (a.wrapping_add(0x7676_7676_7676_7676) | a | b.wrapping_add(0x7676_7676_7676_7676) | b) & HI != 0 {
+            return None;
+        }
+        return Some(((swar8(a) / 1000) * 100_000_000 + swar8(b)) as i64);
+    }
     if len == 0 || len > 16 {
         return parse_ts(std::slice::from_raw_parts(p, len));
     }

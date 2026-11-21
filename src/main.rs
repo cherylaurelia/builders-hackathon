@@ -249,6 +249,22 @@ fn filled<T: Clone>(n: usize, v: T) -> Vec<T> {
     x
 }
 
+/// An empty vector with room for `cap` elements whose memory the kernel backs with huge pages where it can (THP in
+/// `madvise` mode leaves an allocator's memory in 4 KiB pages: a page fault and a zeroed page per 4 KiB written;
+/// the sessions phase took 37,000 of them at 20M against the parse's 3,700). A hint only.
+fn huge_vec<T>(cap: usize) -> Vec<T> {
+    let v: Vec<T> = Vec::with_capacity(cap);
+    const HUGE: usize = 2 << 20;
+    let (p, bytes) = (v.as_ptr() as usize, cap * std::mem::size_of::<T>());
+    let (a, b) = ((p + HUGE - 1) & !(HUGE - 1), (p + bytes) & !(HUGE - 1));
+    #[cfg(target_os = "linux")]
+    if b > a {
+        // SAFETY: [a, b) lies inside the allocation; the advice changes no contents
+        unsafe { libc::madvise(a as *mut libc::c_void, b - a, libc::MADV_HUGEPAGE) };
+    }
+    v
+}
+
 /// Gives the pages of every `map_anon` region back to the kernel, on `threads` threads. Call when nothing reads
 /// them any more: they read as zeros afterwards. Whatever is left, the exit frees on its one thread, and the run
 /// is not over before that. With huge pages that is a few ms either way; where the kernel gave 4 KiB pages (THP
@@ -2097,6 +2113,8 @@ fn main() {
     let mut order: Vec<(usize, usize)> = (0..np).map(|p| (shards.iter().map(|s| s.ev[p].len(EV_BLOCK)).sum(), p)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let width = ndays;
+    // a thread's rows: about one per 9 events, and room for twice its share (more only grows the vector)
+    let rows_cap = n_ev / threads / 4 + 1024;
     let next = AtomicUsize::new(0);
     let n_rows = AtomicUsize::new(0);
     // A thread that has emptied the queue hands its campaign cells to this thread, then writes its user file; this
@@ -2108,7 +2126,7 @@ fn main() {
                 let (cx, shards, order, next, n_rows, ud, cat_names) = (&cx, &shards, &order, &next, &n_rows, &ud, &cat_names);
                 let tx = tx.clone();
                 sc.spawn(move || {
-                    let mut w = Work::new(cx);
+                    let mut w = Work::new(cx, rows_cap);
                     loop {
                         let i = next.fetch_add(1, Relaxed);
                         if i >= order.len() {
@@ -2862,11 +2880,11 @@ struct Work {
 }
 
 impl Work {
-    fn new(cx: &Ctx) -> Work {
+    fn new(cx: &Ctx, rows_cap: usize) -> Work {
         let cells = (cx.ncamp + 1) * cx.ndays;
         let local = (1usize << cx.pshift) + 1;
         Work {
-            rows: Vec::new(),
+            rows: huge_vec(rows_cap),
             cred: vec![Cred::default(); cells],
             rev: filled(cells, 0),
             assist: filled(cells + 4, 0), // + cells for the unused steps of the vector window
@@ -3594,7 +3612,7 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
     let mut f = std::fs::File::create(path)?;
     // the whole file is built in memory and written by one call: a write(2) per page cost 10 ms a file when eight
     // threads wrote at once (journal and page-cache locks), the one big call does not
-    let mut out: Vec<u8> = Vec::with_capacity(n * 12 + (1 << 20));
+    let mut out: Vec<u8> = huge_vec(n * 12 + (1 << 20));
     out.extend_from_slice(b"PAR1");
     let mut off = 4i64;
     let mut page = Vec::new();

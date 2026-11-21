@@ -45,6 +45,12 @@ fn mix(mut x: u64) -> u64 {
     x ^ (x >> 33)
 }
 
+/// A hash to take the top bits of (a table slot, a bucket): one multiply, where `mix` is two and five more steps.
+#[inline(always)]
+fn spread(x: u64) -> u64 {
+    x.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
 #[inline]
 fn hash_bytes(b: &[u8]) -> u64 {
     const K: u64 = 0x9E3779B97F4A7C15;
@@ -151,19 +157,23 @@ fn pack16(v: u128, len: usize) -> u64 {
     unsafe {
         use std::arch::x86_64::*;
         let c = _mm_set_epi64x((v >> 64) as i64, v as i64);
-        let rng = |lo: u8, hi: u8| _mm_and_si128(_mm_cmpgt_epi8(c, _mm_set1_epi8(lo as i8 - 1)), _mm_cmpgt_epi8(_mm_set1_epi8(hi as i8 + 1), c));
-        let (dg, up, lw) = (rng(b'0', b'9'), rng(b'A', b'Z'), rng(b'a', b'z'));
-        let us = _mm_cmpeq_epi8(c, _mm_set1_epi8(b'_' as i8));
-        let valid = _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(dg, up), _mm_or_si128(us, lw))) as u32;
-        let need = (1u32 << len) - 1;
-        if valid & need != need {
+        // A byte is in the alphabet when its two nibbles agree on a class (one bit each): high nibble 3 with low
+        // 0..=9 (bit 0), 4 or 6 with 1..=F (bit 1), 5 with 0..=A or F (bit 2), 7 with 0..=A (bit 3). A byte of
+        // 0x80 or more looks up nothing with its low nibble.
+        const LO: [u8; 16] = [13, 15, 15, 15, 15, 15, 15, 15, 15, 15, 14, 2, 2, 2, 2, 6];
+        const HI: [u8; 16] = [0, 0, 0, 1, 2, 4, 2, 8, 0, 0, 0, 0, 0, 0, 0, 0];
+        // digit = byte - offset: 47 for a digit, 54 for A-Z, 59 for a-z by the high nibble alone, 4 more for `_`
+        const OFF: [u8; 16] = [0, 0, 0, 47, 54, 54, 59, 59, 0, 0, 0, 0, 0, 0, 0, 0];
+        let tbl = |t: &[u8; 16]| _mm_loadu_si128(t.as_ptr() as *const __m128i);
+        let hi = _mm_and_si128(_mm_srli_epi16(c, 4), _mm_set1_epi8(0x0F));
+        let class = _mm_and_si128(_mm_shuffle_epi8(tbl(&LO), c), _mm_shuffle_epi8(tbl(&HI), hi));
+        let invalid = _mm_movemask_epi8(_mm_cmpeq_epi8(class, _mm_setzero_si128())) as u32;
+        if invalid & ((1u32 << len) - 1) != 0 {
             return 0;
         }
-        // digit = byte - offset of its class; the zero bytes past `len` are in no class and stay 0
-        let off = _mm_or_si128(
-            _mm_or_si128(_mm_and_si128(dg, _mm_set1_epi8(47)), _mm_and_si128(up, _mm_set1_epi8(54))),
-            _mm_or_si128(_mm_and_si128(us, _mm_set1_epi8(58)), _mm_and_si128(lw, _mm_set1_epi8(59))),
-        );
+        // the zero bytes past `len` have offset 0 and stay 0
+        let us = _mm_cmpeq_epi8(c, _mm_set1_epi8(b'_' as i8));
+        let off = _mm_add_epi8(_mm_shuffle_epi8(tbl(&OFF), hi), _mm_and_si128(us, _mm_set1_epi8(4)));
         let d = _mm_sub_epi8(c, off);
         let w = _mm_maddubs_epi16(d, _mm_set1_epi16(0x0140)); // two digits -> 12 bits
         let l = _mm_madd_epi16(w, _mm_set1_epi32(0x0001_1000)); // four digits -> 24 bits
@@ -462,7 +472,7 @@ impl IdTable {
     /// Where the search for `key` starts: the first slot of a cache line (4 slots).
     #[inline(always)]
     fn home(&self, key: u64) -> usize {
-        (mix(key) >> (64 - self.bits)) as usize & !3
+        (spread(key) >> (64 - self.bits)) as usize & !3
     }
 
     /// `home(key)`, with its cache line on the way: the lookup comes a few lines of input later.
@@ -1277,11 +1287,22 @@ unsafe fn fast_split<const N: usize>(line: *const u8, e: usize, c: u128, q: u128
         return None;
     }
     let mut f = [(0usize, 0usize); N];
-    let mut cc = c;
+    // the commas in order: those of the first 64 bytes, then the rest (N - 1 in all, so `w` never runs dry twice)
+    let (mut w, hi) = (c as u64, (c >> 64) as u64);
+    let mut base = 0;
     let mut at = 0;
     for i in 0..N {
-        let k = if i + 1 == N { e } else { cc.trailing_zeros() as usize };
-        cc &= cc.wrapping_sub(1);
+        let k = if i + 1 == N {
+            e
+        } else {
+            if w == 0 {
+                w = hi;
+                base = 64;
+            }
+            let k = base + w.trailing_zeros() as usize;
+            w &= w.wrapping_sub(1);
+            k
+        };
         // a quoted field starts with `"` (an empty unquoted field starts on its `,` or `\n`)
         let qd = (*line.add(at) == b'"') as usize;
         f[i] = (at + qd, k - at - 2 * qd);
@@ -1452,7 +1473,7 @@ struct Ctx {
     ids: IdTable,
     names: Interner,
     pshift: u32, // person >> pshift = person partition
-    qshift: u32, // mix(event key) >> qshift = event-key bucket
+    qshift: u32, // spread(event key) >> qshift = event-key bucket
 }
 
 impl Shard {
@@ -1496,7 +1517,7 @@ impl Shard {
     /// Any parsed event: its dedup record. `loc` = 0 for an invalid or late one.
     #[inline(always)]
     fn log(&mut self, cx: &Ctx, ekey: u64, ingest: i64, loc: u64) {
-        let q = (mix(ekey) >> cx.qshift) as usize;
+        let q = (spread(ekey) >> cx.qshift) as usize;
         self.lg[q].push(&mut self.arena, LG_BLOCK, LRec { key: ekey, ingest, loc });
     }
 

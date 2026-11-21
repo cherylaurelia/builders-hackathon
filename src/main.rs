@@ -3316,11 +3316,24 @@ unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
 /// Parses the click lines that start in [start, end) of the `len` bytes at `buf` into `st`; the header line is
 /// skipped. `buf` must be readable for 144 bytes past `len`, and buf[len] must be `\n` (`read_span`).
 ///
-/// One pass per line for the usual shape, as `parse_events`; every other line goes to `click_line`. The usual
+/// Eight lines at a time where the CPU has AVX-512 (`wide`), else one at a time (`parse_clicks_v3`), as
+/// `parse_events`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: usize, st: &mut Shard) {
+    if wide::available() && cx.ws % 1000 == 0 {
+        wide::parse_clicks(cx, buf, start, end, len, st)
+    } else {
+        parse_clicks_v3(cx, buf, start, end, len, st)
+    }
+}
+
+/// `parse_clicks` one line at a time.
+///
+/// One pass per line for the usual shape, as `parse_events_v3`; every other line goes to `click_line`. The usual
 /// shape: the line ends in its first 64 bytes and every byte before that is 0x20..=0x7F; both IDs are 8 or 9 bytes.
 /// For such a line this does what `fast_click` does.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
-unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: usize, st: &mut Shard) {
+unsafe fn parse_clicks_v3(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: usize, st: &mut Shard) {
     use std::arch::x86_64::*;
     let file = std::slice::from_raw_parts(buf, len);
     let first = start.saturating_sub(1);
@@ -5057,6 +5070,23 @@ mod tests {
         v
     }
 
+    /// Every click parser of this build: the one the run uses first.
+    fn click_parsers() -> Vec<(&'static str, EventParser)> {
+        #[allow(unused_mut)]
+        let mut v: Vec<(&'static str, EventParser)> = vec![("parse_clicks", parse_clicks)];
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+        v.push(("parse_clicks_v3", parse_clicks_v3));
+        v
+    }
+
+    /// The clicks of a shard as (click key, the rest of the record), sorted.
+    fn click_list(st: &mut Shard) -> Vec<(u64, u64)> {
+        st.ck.iter_mut().for_each(Stream::finish);
+        let mut v: Vec<_> = st.ck.iter().flat_map(|s| s.slices(CK_BLOCK)).flatten().map(|r| (r.cid, r.w)).collect();
+        v.sort();
+        v
+    }
+
     /// (events as (person, ts, pay), dedup records as (key, ingest, has a record)), each sorted
     type Flat = (Vec<(u32, u32, u32)>, Vec<(u64, i64, bool)>);
     fn flat(st: &mut Shard) -> Flat {
@@ -5391,15 +5421,17 @@ mod tests {
                         unsafe { parse_clicks(&c, padded.as_ptr(), w[0], w[1], len, &mut a) };
                         for_records::<4>(file, w[0], w[1], |f| click_fields(&c, f, &mut b));
                         b.drain::<false>(&c);
+                        // the other click parsers of this build give the same
+                        for (name, parse) in click_parsers().into_iter().skip(1) {
+                            let (mut a2, mut b2) = (Shard::new(16, 16), Shard::new(16, 16));
+                            unsafe { parse(&c, padded.as_ptr(), w[0], w[1], len, &mut a2) };
+                            for_records::<4>(file, w[0], w[1], |f| click_fields(&c, f, &mut b2));
+                            b2.drain::<false>(&c);
+                            assert!(click_list(&mut a2) == click_list(&mut b2), "round {round}: {name} differs\n{}", String::from_utf8_lossy(file));
+                        }
                     }
                 }
-                let cks = |st: &mut Shard| {
-                    st.ck.iter_mut().for_each(Stream::finish);
-                    let mut v: Vec<_> = st.ck.iter().flat_map(|s| s.slices(CK_BLOCK)).flatten().map(|r| (r.cid, r.w)).collect();
-                    v.sort();
-                    v
-                };
-                let (ca, cb) = (cks(&mut a), cks(&mut b));
+                let (ca, cb) = (click_list(&mut a), click_list(&mut b));
                 let (fa, fb) = (flat(&mut a), flat(&mut b));
                 kept += fb.0.len();
                 clicks += cb.len();
@@ -5409,6 +5441,81 @@ mod tests {
         assert!(kept > 3000 && clicks > 5000, "too few kept events ({kept}) or clicks ({clicks}) to mean anything");
     }
 
+    // What the edge tests make their lines of.
+    // `YYYY-MM-DDTHH:MM:SS` of a second of January to April 2028
+    fn edge_civil(sec: i64) -> String {
+        let (mut d, s) = (sec.div_euclid(86_400), sec.rem_euclid(86_400));
+        let mut mo = 1;
+        for len in [31, 29, 31] {
+            if d < len {
+                break;
+            }
+            d -= len;
+            mo += 1;
+        }
+        format!("2028-{mo:02}-{:02}T{:02}:{:02}:{:02}", d + 1, s / 3600, s / 60 % 60, s % 60)
+    }
+    fn edge_b36(r: &mut Rng, n: usize) -> String {
+        (0..n).map(|_| char::from_digit(r.below(36) as u32, 36).unwrap()).collect()
+    }
+    fn edge_id(r: &mut Rng, c: char, dirty: bool) -> String {
+        match if dirty { r.below(12) } else { 6 + r.below(54) } {
+            0 => String::new(),
+            1 => format!("{c}{}", edge_b36(r, 6)),
+            2 => format!("{c}{}", edge_b36(r, 9)),
+            3 => format!("{c}{} ", edge_b36(r, 7)),
+            4 => format!("{c}{}\u{7f}", edge_b36(r, 7)),
+            5 => format!("{c}{}é", edge_b36(r, 6)),
+            6..=20 => format!("{c}{}", edge_b36(r, 7)),
+            _ => format!("{c}{}", edge_b36(r, 8)),
+        }
+    }
+    // a ts for the second `sec` (from 2028-01-01) in one of the three forms, now and then off its rules
+    fn edge_ts(r: &mut Rng, jan1: i64, sec: i64, dirty: bool) -> String {
+        let mut v = match r.below(10) {
+            0..=3 => format!("{}Z", edge_civil(sec)),
+            4..=6 => format!("{}{:03}", jan1 + sec, r.below(1000)),
+            _ => {
+                let (h, m) = match r.below(8) {
+                    0 => (0, 0),
+                    1 => (23, 59),
+                    2 => (12, 0),
+                    _ => (r.below(13) as i64, [0, 30, 45][r.below(3)]),
+                };
+                let off = h * 3600 + m * 60;
+                if r.below(2) == 0 {
+                    format!("{}+{h:02}:{m:02}", edge_civil(sec + off))
+                } else {
+                    format!("{}-{h:02}:{m:02}", edge_civil(sec - off))
+                }
+            }
+        };
+        match if dirty { r.below(10) } else { 99 } {
+            0 if v.len() >= 19 => v.replace_range(11..19, r.pick(&["24:00:00", "23:60:00", "23:59:60", "23:59:59", "00:00:00", "29:59:59", "19:5a:00", "1:00:000"])),
+            1 if v.len() == 25 => v.replace_range(19..25, r.pick(&["+24:00", "+23:60", "-23:59", "+05:6 ", " 05:30", "Z05:30", "+0530 ", "+29:00", "-9:300", "+05-30", "+05:3a"])),
+            2 if v.len() >= 10 => v.replace_range(5..10, r.pick(&["02-30", "02-29", "13-01", "00-10", "03-00", "03-32", "1a-01", "03 01"])),
+            3 => {
+                let k = r.below(v.len());
+                v.replace_range(k..k + 1, r.pick(&["0", "9", ":", "-", "T", "Z", "z", "x", "/", " ", "+", "\u{7f}", "\r"]));
+            }
+            4 => v.push_str(r.pick(&["0", "Z", " ", "\r"])),
+            5 => {
+                v.pop();
+            }
+            6 => v.insert(0, '0'),
+            _ => {}
+        }
+        v
+    }
+    fn edge_quote(r: &mut Rng, v: String, dirty: bool) -> String {
+        match r.below(if dirty { 26 } else { 100 }) {
+            0..=19 => format!("\"{v}\""),
+            20 => format!("\"{v}"),
+            21 => format!("{v}\""),
+            22 => "\"".to_string(),
+            _ => v,
+        }
+    }
     /// Lines of the generator's shape with every field on its edges, in the order that makes the eight-line
     /// parser's lanes differ: timestamps of all three forms across ten weeks (two months share a day of the month),
     /// times and offsets at and past their limits, events ingested exactly 24 hours late and a second more, IDs
@@ -5419,80 +5526,6 @@ mod tests {
         let c = ctx();
         let mut r = Rng(0x0123_4567_89ab_cdef);
         let jan1 = parse_ts(b"2028-01-01T00:00:00Z").unwrap() / 1000;
-        // `YYYY-MM-DDTHH:MM:SS` of a second of January to April 2028
-        fn civil(sec: i64) -> String {
-            let (mut d, s) = (sec.div_euclid(86_400), sec.rem_euclid(86_400));
-            let mut mo = 1;
-            for len in [31, 29, 31] {
-                if d < len {
-                    break;
-                }
-                d -= len;
-                mo += 1;
-            }
-            format!("2028-{mo:02}-{:02}T{:02}:{:02}:{:02}", d + 1, s / 3600, s / 60 % 60, s % 60)
-        }
-        fn b36(r: &mut Rng, n: usize) -> String {
-            (0..n).map(|_| char::from_digit(r.below(36) as u32, 36).unwrap()).collect()
-        }
-        fn id(r: &mut Rng, c: char, dirty: bool) -> String {
-            match if dirty { r.below(12) } else { 6 + r.below(54) } {
-                0 => String::new(),
-                1 => format!("{c}{}", b36(r, 6)),
-                2 => format!("{c}{}", b36(r, 9)),
-                3 => format!("{c}{} ", b36(r, 7)),
-                4 => format!("{c}{}\u{7f}", b36(r, 7)),
-                5 => format!("{c}{}é", b36(r, 6)),
-                6..=20 => format!("{c}{}", b36(r, 7)),
-                _ => format!("{c}{}", b36(r, 8)),
-            }
-        }
-        // a ts for the second `sec` (from 2028-01-01) in one of the three forms, now and then off its rules
-        fn ts(r: &mut Rng, jan1: i64, sec: i64, dirty: bool) -> String {
-            let mut v = match r.below(10) {
-                0..=3 => format!("{}Z", civil(sec)),
-                4..=6 => format!("{}{:03}", jan1 + sec, r.below(1000)),
-                _ => {
-                    let (h, m) = match r.below(8) {
-                        0 => (0, 0),
-                        1 => (23, 59),
-                        2 => (12, 0),
-                        _ => (r.below(13) as i64, [0, 30, 45][r.below(3)]),
-                    };
-                    let off = h * 3600 + m * 60;
-                    if r.below(2) == 0 {
-                        format!("{}+{h:02}:{m:02}", civil(sec + off))
-                    } else {
-                        format!("{}-{h:02}:{m:02}", civil(sec - off))
-                    }
-                }
-            };
-            match if dirty { r.below(10) } else { 99 } {
-                0 if v.len() >= 19 => v.replace_range(11..19, r.pick(&["24:00:00", "23:60:00", "23:59:60", "23:59:59", "00:00:00", "29:59:59", "19:5a:00", "1:00:000"])),
-                1 if v.len() == 25 => v.replace_range(19..25, r.pick(&["+24:00", "+23:60", "-23:59", "+05:6 ", " 05:30", "Z05:30", "+0530 ", "+29:00", "-9:300", "+05-30", "+05:3a"])),
-                2 if v.len() >= 10 => v.replace_range(5..10, r.pick(&["02-30", "02-29", "13-01", "00-10", "03-00", "03-32", "1a-01", "03 01"])),
-                3 => {
-                    let k = r.below(v.len());
-                    v.replace_range(k..k + 1, r.pick(&["0", "9", ":", "-", "T", "Z", "z", "x", "/", " ", "+", "\u{7f}", "\r"]));
-                }
-                4 => v.push_str(r.pick(&["0", "Z", " ", "\r"])),
-                5 => {
-                    v.pop();
-                }
-                6 => v.insert(0, '0'),
-                _ => {}
-            }
-            v
-        }
-        fn quote(r: &mut Rng, v: String, dirty: bool) -> String {
-            match r.below(if dirty { 26 } else { 100 }) {
-                0..=19 => format!("\"{v}\""),
-                20 => format!("\"{v}"),
-                21 => format!("{v}\""),
-                22 => "\"".to_string(),
-                _ => v,
-            }
-        }
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
         let usual0 = wide::USUAL.load(Relaxed);
         let (mut lines, mut kept) = (0, 0);
@@ -5512,15 +5545,15 @@ mod tests {
                 // one line in four is dirty in its IDs, its ts, its type or its quotes
                 let dirty = r.below(4) == 0;
                 let f = [
-                    id(&mut r, 'e', dirty),
-                    id(&mut r, 'u', dirty),
-                    ts(&mut r, jan1, sec, dirty),
-                    if r.below(25) == 0 { ts(&mut r, jan1, ing, true) } else { format!("{}Z", civil(ing)) },
+                    edge_id(&mut r, 'e', dirty),
+                    edge_id(&mut r, 'u', dirty),
+                    edge_ts(&mut r, jan1, sec, dirty),
+                    if r.below(25) == 0 { edge_ts(&mut r, jan1, ing, true) } else { format!("{}Z", edge_civil(ing)) },
                     r.pick(&["view", "view", "view", "view", "view", "cart", "cart", "purchase", "purchase", "purchase", "Purchase", "views", "cart ", "", "purchas", "purchased"][..if dirty { 16 } else { 10 }]).to_string(),
                     r.pick(&["p1", "p2", "p2", "p39594", "p17893", "p8823", "p310", "", "P1"]).to_string(),
                     r.pick(&["", "", "", "41607", "720", "0", "10000000", "10000001", "0250", "-5", "1.5", "12\r", "00000000000000000000000001"]).to_string(),
                 ];
-                let mut l = f.map(|v| quote(&mut r, v, dirty)).join(",");
+                let mut l = f.map(|v| edge_quote(&mut r, v, dirty)).join(",");
                 match if dirty { r.below(15) } else { 99 } {
                     0 => {
                         let k = r.below(l.len());
@@ -5582,6 +5615,105 @@ mod tests {
             let took = wide::USUAL.load(Relaxed) - usual0;
             eprintln!("the eight-line parser took {took} of {lines} lines itself; {kept} events kept");
             assert!(took * 5 > lines, "the eight-line parser took {took} of {lines} lines itself");
+        }
+    }
+
+    /// `edge_lines_match_reference` for clicks: every click parser of the build against the field parser on click
+    /// lines with the same IDs, timestamps and quotes, the click window's two ends (seven days before window_start
+    /// counts, window_end does not), campaigns in the file and not, of 0 to 9 bytes.
+    #[test]
+    fn edge_clicks_match_reference() {
+        let mut c = ctx();
+        let camps: Vec<(Bytes, u16)> = (0..40u16).map(|i| (&*Box::leak(format!("c_{}", i * 37).into_bytes().into_boxed_slice()), i)).collect();
+        c.campaigns = IdMap::new(&camps).with_short(&camps);
+        c.ncamp = camps.len();
+        let mut r = Rng(0x0fed_cba9_8765_4321);
+        let jan1 = parse_ts(b"2028-01-01T00:00:00Z").unwrap() / 1000;
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+        let usual0 = wide::USUAL.load(Relaxed);
+        let (mut lines, mut kept) = (0, 0);
+        for round in 0..300 {
+            let mut ck = String::from("click_id,user_id,campaign_id,ts\n");
+            for _ in 0..r.below(200) {
+                // 2028-02-05 .. 2028-03-20; the click window is 2028-02-13 .. 2028-03-05
+                let sec = if r.below(3) == 0 { 35 * 86_400 + r.below(45 * 86_400) as i64 } else { 43 * 86_400 + r.below(21 * 86_400) as i64 };
+                let sec = match r.below(30) {
+                    0 => 43 * 86_400,     // seven days before window_start
+                    1 => 43 * 86_400 - 1, // a second before
+                    2 => 64 * 86_400,     // window_end
+                    3 => 64 * 86_400 - 1,
+                    _ => sec,
+                };
+                let dirty = r.below(4) == 0;
+                let camp = match r.below(24) {
+                    0 => String::new(),
+                    1 => "c_99999".to_string(),
+                    2 => "C_37".to_string(),
+                    3 => "c_37 ".to_string(),
+                    4 => "c_123456".to_string(),
+                    5 => "c_1234567".to_string(),
+                    _ => format!("c_{}", r.below(45) * 37),
+                };
+                let f = [edge_id(&mut r, 'k', dirty), edge_id(&mut r, 'u', dirty), camp, edge_ts(&mut r, jan1, sec, dirty)];
+                let mut l = f.map(|v| edge_quote(&mut r, v, dirty)).join(",");
+                match if dirty { r.below(15) } else { 99 } {
+                    0 => {
+                        let k = r.below(l.len());
+                        if l.is_char_boundary(k) && l.is_char_boundary(k + 1) {
+                            l.replace_range(k..k + 1, r.pick(&["\"", ",", "\r", "\u{1}", " ", "\u{0}"]));
+                        }
+                    }
+                    1 => l.push_str(",x"),
+                    2 => l = l.replacen(',', "", 1),
+                    3 => l.push_str(&" ".repeat(r.below(80))),
+                    _ => {}
+                }
+                ck += &l;
+                ck.push('\n');
+                lines += 1;
+            }
+            if round % 3 == 0 {
+                ck.pop();
+            }
+            let len = ck.len();
+            let mut padded = ck.clone().into_bytes();
+            padded.extend_from_slice(&[b'\n'; PAD]);
+            let file: Bytes = Box::leak(ck.into_bytes().into_boxed_slice());
+            let mut cuts = vec![0, len];
+            for _ in 0..r.below(4) {
+                cuts.push(r.below(len + 1));
+            }
+            cuts.sort();
+            let mut b = Shard::new(16, 16);
+            for w in cuts.windows(2) {
+                for_records::<4>(file, w[0], w[1], |f| click_fields(&c, f, &mut b));
+                b.drain::<false>(&c);
+            }
+            let cb = click_list(&mut b);
+            kept += cb.len();
+            for (name, parse) in click_parsers() {
+                let mut a = Shard::new(16, 16);
+                for w in cuts.windows(2) {
+                    unsafe { parse(&c, padded.as_ptr(), w[0], w[1], len, &mut a) };
+                }
+                let ca = click_list(&mut a);
+                if ca != cb {
+                    let (sa, sb): (std::collections::BTreeSet<_>, std::collections::BTreeSet<_>) = (ca.iter().collect(), cb.iter().collect());
+                    panic!(
+                        "round {round}: {name} differs: clicks only here {:x?}, only in the reference {:x?}\n{}",
+                        sa.difference(&sb).take(5).collect::<Vec<_>>(),
+                        sb.difference(&sa).take(5).collect::<Vec<_>>(),
+                        String::from_utf8_lossy(file)
+                    );
+                }
+            }
+        }
+        assert!(kept > 3000, "too few kept clicks ({kept} of {lines} lines) to mean anything");
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+        if wide::available() {
+            let took = wide::USUAL.load(Relaxed) - usual0;
+            eprintln!("the eight-line parser took {took} of {lines} click lines itself; {kept} clicks kept");
+            assert!(took * 5 > lines, "the eight-line parser took {took} of {lines} click lines itself");
         }
     }
 

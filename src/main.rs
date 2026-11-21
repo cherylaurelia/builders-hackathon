@@ -2227,14 +2227,25 @@ fn main() {
                             break;
                         }
                         partition_work(cx, shards, order[i].1, &mut w);
+                        // the rows so far become pages of the thread's file while they are in the cache
+                        if w.rows.len() >= FLUSH_ROWS {
+                            w.file.add(&w.rows, cat_names, &cx.names);
+                            w.rows.clear();
+                        }
                     }
                     tx.send((std::mem::take(&mut w.cred), std::mem::take(&mut w.rev), std::mem::take(&mut w.assist))).unwrap_or_else(|_| die("campaign merger gone"));
-                    // thread 0 writes even with no rows: the table needs at least one file
-                    if t == 0 || !w.rows.is_empty() {
-                        write_users(&ud.join(format!("part-{t}.parquet")), &w.rows, cat_names, &cx.names)
-                            .unwrap_or_else(|e| die(&format!("write user_daily: {e}")));
+                    if !w.rows.is_empty() {
+                        w.file.add(&w.rows, cat_names, &cx.names);
+                        w.rows.clear();
                     }
-                    n_rows.fetch_add(w.rows.len(), Relaxed);
+                    let path = ud.join(format!("part-{t}.parquet"));
+                    if w.file.n > 0 {
+                        w.file.write(&path).unwrap_or_else(|e| die(&format!("write user_daily: {e}")));
+                    } else if t == 0 {
+                        // thread 0 writes even with no rows: the table needs at least one file
+                        write_users(&path, &[], cat_names, &cx.names).unwrap_or_else(|e| die(&format!("write user_daily: {e}")));
+                    }
+                    n_rows.fetch_add(w.file.n, Relaxed);
                     w
                 })
             })
@@ -2946,6 +2957,7 @@ struct Sess {
 /// One sessions thread: its results, and scratch reused across partitions.
 struct Work {
     rows: Vec<UserRow>,
+    file: UserFile,
     cred: Vec<Cred>,
     rev: Vec<i64>, // revenue of the credited sessions, per cell of `cred`
     assist: Vec<u32>,
@@ -2978,7 +2990,8 @@ impl Work {
         let cells = (cx.ncamp + 1) * cx.ndays;
         let local = (1usize << cx.pshift) + 1;
         Work {
-            rows: huge_vec(rows_cap),
+            rows: Vec::new(),
+            file: UserFile::new(),
             cred: vec![Cred::default(); cells],
             rev: filled(cells, 0),
             assist: filled(cells + 4, 0), // + cells for the unused steps of the vector window
@@ -3742,6 +3755,13 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
         }
         chunks.push((start, off - start, dict_off, data_off));
     }
+    out.extend_from_slice(&parquet_footer(cols, n, &chunks, off - 4));
+    f.write_all(&out)
+}
+
+/// The Thrift FileMetaData of a file with one row group of `n` rows, followed by its length and the magic.
+/// `chunks`: per column (offset, size, dictionary page offset, first data page offset); `total`: bytes of all chunks.
+fn parquet_footer(cols: &[ColSpec], n: usize, chunks: &[(i64, i64, Option<i64>, i64)], total: i64) -> Vec<u8> {
     let mut t = Thrift::new();
     t.begin();
     t.i32(1, 1); // version
@@ -3768,7 +3788,7 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
     t.list(4, Thrift::STRUCT, 1);
     t.begin();
     t.list(1, Thrift::STRUCT, cols.len());
-    for (c, &(o, size, dict_off, data_off)) in cols.iter().zip(&chunks) {
+    for (c, &(o, size, dict_off, data_off)) in cols.iter().zip(chunks) {
         t.begin();
         t.i64(2, o); // file_offset
         t.sub(3); // ColumnMetaData
@@ -3800,7 +3820,7 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
         t.end();
         t.end();
     }
-    t.i64(2, off - 4); // total_byte_size
+    t.i64(2, total); // total_byte_size
     t.i64(3, n as i64);
     t.end();
     t.str(6, "sessions");
@@ -3808,8 +3828,7 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
     let len = t.b.len() as u32;
     t.b.extend_from_slice(&len.to_le_bytes());
     t.b.extend_from_slice(b"PAR1");
-    out.extend_from_slice(&t.b);
-    f.write_all(&out)
+    t.b
 }
 
 fn plain_bytes<'a>(buf: &mut Vec<u8>, vals: impl Iterator<Item = &'a [u8]>) {
@@ -4018,6 +4037,148 @@ fn write_users(path: &Path, rows: &[UserRow], cat_names: &[Bytes], names: &Inter
         }
         0
     })
+}
+
+/// Rows a sessions thread gathers before it encodes them as a page of each column (`UserFile::add`): the rows are
+/// still in the core's cache, and no thread keeps all its rows.
+const FLUSH_ROWS: usize = 4096;
+
+/// One thread's user_daily file, built a page per column at a time while the sessions run; `write` puts the column
+/// chunks together. The encodings are those of `write_users`, which still writes a file without rows.
+struct UserFile {
+    cols: [Vec<u8>; 6], // each column's data pages so far, headers included
+    dict: Vec<u8>,      // the body of the user_id dictionary page: one entry per run of equal IDs
+    entries: usize,
+    last: Option<u64>, // the name of the last row
+    n: usize,          // rows
+    page: Vec<u8>,
+    vals: Vec<i64>,
+    run: Vec<u8>,
+    tmp: Vec<u8>,
+}
+
+impl UserFile {
+    fn new() -> UserFile {
+        UserFile { cols: Default::default(), dict: Vec::new(), entries: 0, last: None, n: 0, page: Vec::new(), vals: Vec::new(), run: Vec::new(), tmp: Vec::with_capacity(64) }
+    }
+
+    /// Encodes `rows` as data pages of at most PAGE_ROWS rows.
+    fn add(&mut self, rows: &[UserRow], cat_names: &[Bytes], names: &Interner) {
+        for part in rows.chunks(PAGE_ROWS) {
+            self.add_page(part, cat_names, names);
+        }
+    }
+
+    fn add_page(&mut self, rows: &[UserRow], cat_names: &[Bytes], names: &Interner) {
+        let UserFile { cols, dict, entries, last, n, page, vals, run, tmp } = self;
+        *n += rows.len();
+        for c in 0..6 {
+            page.clear();
+            page.resize(HDR_ROOM, 0);
+            let b = &mut *page;
+            match c {
+                0 => {
+                    // the runs first (the index width is known after them): (count, index) pairs
+                    vals.clear();
+                    for r in rows {
+                        if *last != Some(r.name) {
+                            put_name(dict, names, r.name, tmp);
+                            *entries += 1;
+                            *last = Some(r.name);
+                        } else if let Some(v) = vals.last_mut() {
+                            *v += 1 << 32;
+                            continue;
+                        }
+                        // a new entry, or the previous page's last ID going on: a run of the newest entry
+                        vals.push(1 << 32 | (*entries as i64 - 1));
+                    }
+                    if *entries > u32::MAX as usize {
+                        die("too many user IDs in one user_daily file");
+                    }
+                    let w = (usize::BITS - ((*entries).max(2) - 1).leading_zeros()) as usize;
+                    b.push(w as u8);
+                    for &v in vals.iter() {
+                        put_run(b, (v >> 32) as usize, v as u32, w.div_ceil(8));
+                    }
+                }
+                1..=4 => {
+                    vals.clear();
+                    vals.extend(rows.iter().map(|r| match c {
+                        1 => r.day as i64,
+                        2 => r.sessions as i64,
+                        3 => r.events as i64,
+                        _ => r.revenue,
+                    }));
+                    put_delta(b, vals);
+                }
+                _ => {
+                    // definition levels: one bit-packed run of ceil(rows / 8) groups of 8 bits (1 = present)
+                    let groups = rows.len().div_ceil(8);
+                    run.clear();
+                    let mut v = ((groups as u64) << 1) | 1;
+                    while v >= 0x80 {
+                        run.push(v as u8 | 0x80);
+                        v >>= 7;
+                    }
+                    run.push(v as u8);
+                    let (mut cur, mut k) = (0u8, 0);
+                    for r in rows {
+                        cur |= ((r.top != NO_CAT) as u8) << k;
+                        k += 1;
+                        if k == 8 {
+                            run.push(cur);
+                            (cur, k) = (0, 0);
+                        }
+                    }
+                    if k > 0 {
+                        run.push(cur);
+                    }
+                    b.extend_from_slice(&((run.len()) as u32).to_le_bytes());
+                    b.extend_from_slice(run);
+                    for r in rows {
+                        if r.top != NO_CAT {
+                            let v = cat_names[r.top as usize];
+                            b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                            b.extend_from_slice(v);
+                        }
+                    }
+                }
+            }
+            if i32::try_from(page.len() - HDR_ROOM).is_err() {
+                die("page over 2 GiB");
+            }
+            let at = page_header(page, false, rows.len(), if c == 0 { 8 } else if USER_COLS[c].delta { 5 } else { 0 }); // RLE_DICTIONARY, DELTA_BINARY_PACKED, PLAIN
+            cols[c].extend_from_slice(&page[at..]);
+        }
+    }
+
+    /// Writes the file (at least one row was added): the dictionary page and the data pages of user_id, the pages
+    /// of the other columns, the footer; one write(2), as `write_parquet`.
+    fn write(&mut self, path: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        i32::try_from(self.dict.len()).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
+        let mut dpage = vec![0u8; HDR_ROOM + self.dict.len()];
+        dpage[HDR_ROOM..].copy_from_slice(&self.dict);
+        let at = page_header(&mut dpage, true, self.entries, 0);
+        let mut out: Vec<u8> = Vec::with_capacity(self.cols.iter().map(|c| c.len()).sum::<usize>() + dpage.len() + 4096);
+        out.extend_from_slice(b"PAR1");
+        let mut chunks = Vec::with_capacity(6);
+        for (c, pages) in self.cols.iter().enumerate() {
+            let start = out.len() as i64;
+            let mut dict_off = None;
+            if c == 0 {
+                out.extend_from_slice(&dpage[at..]);
+                dict_off = Some(start);
+            }
+            let data_off = out.len() as i64;
+            out.extend_from_slice(pages);
+            chunks.push((start, out.len() as i64 - start, dict_off, data_off));
+        }
+        let total = out.len() as i64 - 4;
+        out.extend_from_slice(&parquet_footer(&USER_COLS, self.n, &chunks, total));
+        f.write_all(&out)
+    }
 }
 
 fn write_camps(path: &Path, rows: &[CampRow]) -> std::io::Result<()> {

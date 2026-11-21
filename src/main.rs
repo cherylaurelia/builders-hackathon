@@ -1199,9 +1199,10 @@ fn read_span(f: &InFile, s: usize, e: usize, buf: &mut Vec<u8>) -> (usize, usize
     (len, s - bs, e - bs)
 }
 
-/// Calls `fast(st, line, e, commas, quotes)` for every line that starts in [start, end) of the `len` bytes at `buf`
-/// and has its `\n` in its first 128 bytes (line[e]; the masks cover line[..e]); a longer line goes whole to `slow`.
-/// The header line is skipped. `buf` must be readable for 144 bytes past `len`, and buf[len] must be `\n`.
+/// Calls `fast(st, line, e, [c0, c1, q0, q1])` for every line that starts in [start, end) of the `len` bytes at
+/// `buf` and has its `\n` in its first 128 bytes: line[e], and the comma bits c0 (bytes 0..64) and c1 (64..128)
+/// and quote bits q0, q1 of line[..e]. A longer line goes whole to `slow`. The header line is skipped. `buf` must
+/// be readable for 144 bytes past `len`, and buf[len] must be `\n`.
 #[inline(always)]
 unsafe fn scan_lines<S>(
     buf: *const u8,
@@ -1209,7 +1210,7 @@ unsafe fn scan_lines<S>(
     end: usize,
     len: usize,
     st: &mut S,
-    fast: impl Fn(&mut S, *const u8, usize, u128, u128),
+    fast: impl Fn(&mut S, *const u8, usize, [u64; 4]),
     slow: impl Fn(&mut S, Bytes),
 ) {
     let file = std::slice::from_raw_parts(buf, len);
@@ -1219,52 +1220,127 @@ unsafe fn scan_lines<S>(
     while p < end && p < len {
         let line = buf.add(p);
         let [c0, q0, n0] = masks64(line);
-        let [c1, q1, n1] = masks64(line.add(64));
-        let n = n0 as u128 | (n1 as u128) << 64;
-        if n != 0 {
-            let e = n.trailing_zeros() as usize;
-            let lm = (1u128 << e) - 1;
-            fast(st, line, e, (c0 as u128 | (c1 as u128) << 64) & lm, (q0 as u128 | (q1 as u128) << 64) & lm);
-            p += e + 1;
+        // x & -x is the lowest bit of x: the newline; less 1, the bits below it: the line
+        let (e, m) = if n0 != 0 {
+            let lm = (n0 & n0.wrapping_neg()) - 1;
+            (n0.trailing_zeros() as usize, [c0 & lm, 0, q0 & lm, 0])
         } else {
-            let e = memchr::memchr(b'\n', &file[p..]).map_or(len, |i| p + i);
-            slow(st, std::mem::transmute::<&[u8], Bytes>(&file[p..e]));
-            p = e + 1;
-        }
+            let [c1, q1, n1] = masks64(line.add(64));
+            if n1 == 0 {
+                let e = memchr::memchr(b'\n', &file[p..]).map_or(len, |i| p + i);
+                slow(st, std::mem::transmute::<&[u8], Bytes>(&file[p..e]));
+                p = e + 1;
+                continue;
+            }
+            let lm = (n1 & n1.wrapping_neg()) - 1;
+            (64 + n1.trailing_zeros() as usize, [c0, c1 & lm, q0, q1 & lm])
+        };
+        fast(st, line, e, m);
+        p += e + 1;
     }
 }
 
-/// The N fields of the line of `e` (< 128) bytes at `line` as (start, length), quotes removed, given its comma and
-/// quote bits; None when the line is malformed (`split::<N>` says the same).
+/// The bits of `x` at the set bits of `mask`, packed into the low bits.
 #[inline(always)]
-unsafe fn fast_split<const N: usize>(line: *const u8, e: usize, c: u128, q: u128) -> Option<[(usize, usize); N]> {
-    if c.count_ones() as usize != N - 1 {
+fn pext(x: u64, mask: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        return std::arch::x86_64::_pext_u64(x, mask);
+    }
+    #[allow(unreachable_code)]
+    {
+        let (mut m, mut out, mut k) = (mask, 0u64, 0);
+        while m != 0 {
+            out |= ((x >> m.trailing_zeros()) & 1) << k;
+            k += 1;
+            m &= m - 1;
+        }
+        out
+    }
+}
+
+/// The low bits of `x` spread onto the set bits of `mask`.
+#[inline(always)]
+fn pdep(x: u64, mask: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        return std::arch::x86_64::_pdep_u64(x, mask);
+    }
+    #[allow(unreachable_code)]
+    {
+        let (mut m, mut out, mut k) = (mask, 0u64, 0);
+        while m != 0 {
+            out |= ((x >> k) & 1) << m.trailing_zeros();
+            k += 1;
+            m &= m - 1;
+        }
+        out
+    }
+}
+
+/// The fields of a line of under 128 bytes: byte i of `at` is the offset of field i and byte i of `len` its
+/// length, quotes removed.
+#[derive(Clone, Copy)]
+struct Fields {
+    at: u64,
+    len: u64,
+}
+
+impl Fields {
+    #[inline(always)]
+    fn at(self, i: usize) -> usize {
+        (self.at >> (8 * i)) as u8 as usize
+    }
+    #[inline(always)]
+    fn len(self, i: usize) -> usize {
+        (self.len >> (8 * i)) as u8 as usize
+    }
+}
+
+/// The N (<= 8) fields of the line of `e` (< 128) bytes, given its comma and quote bits (see `scan_lines`); None
+/// when the line is malformed (`split::<N>` says the same).
+#[inline(always)]
+fn fast_split<const N: usize>(e: usize, [c0, c1, q0, q1]: [u64; 4]) -> Option<Fields> {
+    const { assert!(N >= 1 && N <= 8) };
+    let n0 = c0.count_ones();
+    if (n0 + c1.count_ones()) as usize != N - 1 {
         return None;
     }
     // Well quoted <=> every quote sits at a field's first or last byte (s, ends), none is both (a lone `"`), and
     // per field a first-byte quote (x) comes with a last-byte quote (y, moved onto the boundary after it). Then
     // y - x borrows across exactly the quoted fields' bytes, so a field with only one of the two leaves a bit on
-    // the boundary that ends it (or the first such field does).
-    let b = c | (1u128 << e);
-    let s = (b << 1) | 1;
-    let ends = b >> 1;
-    let x = q & s;
-    let y = (q << 1) & b;
-    if (q & !(s | ends)) | (x & ends) | (y.wrapping_sub(x) & b) != 0 {
+    // the boundary that ends it (or the first such field does). All of it on 128 bits held as two words.
+    let (nl0, nl1) = if e < 64 { (1u64 << e, 0) } else { (0, 1u64 << (e - 64)) };
+    let (b0, b1) = (c0 | nl0, c1 | nl1);
+    let (s0, s1) = ((b0 << 1) | 1, (b1 << 1) | (b0 >> 63));
+    let (ends0, ends1) = ((b0 >> 1) | (b1 << 63), b1 >> 1);
+    let (x0, x1) = (q0 & s0, q1 & s1);
+    let (y0, y1) = ((q0 << 1) & b0, ((q1 << 1) | (q0 >> 63)) & b1);
+    let (d0, borrow) = y0.overflowing_sub(x0);
+    let d1 = y1.wrapping_sub(x1).wrapping_sub(borrow as u64);
+    if (q0 & !(s0 | ends0)) | (x0 & ends0) | (d0 & b0) | (q1 & !(s1 | ends1)) | (x1 & ends1) | (d1 & b1) != 0 {
         return None;
     }
-    let mut f = [(0usize, 0usize); N];
-    let mut cc = c;
-    let mut at = 0;
-    for i in 0..N {
-        let k = if i + 1 == N { e } else { cc.trailing_zeros() as usize };
-        cc &= cc.wrapping_sub(1);
-        // a quoted field starts with `"` (an empty unquoted field starts on its `,` or `\n`)
-        let qd = (*line.add(at) == b'"') as usize;
-        f[i] = (at + qd, k - at - 2 * qd);
-        at = k + 1;
+    // The comma offsets, one a byte: N - 1 slots from each word (a slot past a word's last comma holds 64 or
+    // 128), the second word's moved up behind the first word's n0. Byte N - 1 is the newline: the field ends.
+    let (mut a, mut b) = (c0, c1);
+    let (mut p0, mut p1) = (0u64, 0u64);
+    for j in 0..N - 1 {
+        p0 |= (a.trailing_zeros() as u64) << (8 * j);
+        a &= a.wrapping_sub(1);
+        p1 |= (64 + b.trailing_zeros() as u64) << (8 * j);
+        b &= b.wrapping_sub(1);
     }
-    Some(f)
+    let commas = ((p0 & ((1u64 << (8 * n0)) - 1)) | (p1 << (8 * n0))) & ((1u64 << (8 * (N - 1))) - 1);
+    let ends = commas | (e as u64) << (8 * (N - 1));
+    // a field starts after the comma before it; the first at 0
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    let starts = (ends << 8).wrapping_add(ONES << 8);
+    // field i is quoted when the i-th field start holds a quote: 1 in byte i of `quoted`
+    let quoted = pdep(pext(x0, s0) | pext(x1, s1) << s0.count_ones(), ONES);
+    // no byte borrows from the one above: a quoted field has its two quotes inside it
+    let at = starts.wrapping_add(quoted);
+    Some(Fields { at, len: ends.wrapping_sub(at).wrapping_sub(quoted) })
 }
 
 /// (user + sys CPU seconds, instructions retired) of this process so far; instructions only on macOS
@@ -1971,31 +2047,31 @@ fn event_fields(cx: &Ctx, [eid, uid, ts, ingest, etype, pid, price]: [Bytes; 7],
 /// `split::<7>` + `event_fields` for the line of `e` (< 128) bytes at `line`, given its comma and quote bits;
 /// line[e] is its `\n` and line[..144] is readable.
 #[inline(always)]
-unsafe fn fast_event(cx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, st: &mut Shard) {
-    let Some(f) = fast_split::<7>(line, e, c, q) else { return };
-    let (ep, el) = (line.add(f[0].0), f[0].1);
+unsafe fn fast_event(cx: &Ctx, line: *const u8, e: usize, m: [u64; 4], st: &mut Shard) {
+    let Some(f) = fast_split::<7>(e, m) else { return };
+    let (ep, el) = (line.add(f.at(0)), f.len(0));
     if el == 0 {
         return;
     }
-    let Some(ingest) = ts_memo(line.add(f[3].0), f[3].1, &mut st.days) else { return };
+    let Some(ingest) = ts_memo(line.add(f.at(3)), f.len(3), &mut st.days) else { return };
     let ekey = cx.names.key_at(ep, el);
-    let (ul, pl) = (f[1].1, f[5].1);
-    let ts = match ts_memo(line.add(f[2].0), f[2].1, &mut st.days) {
+    let (ul, pl) = (f.len(1), f.len(5));
+    let ts = match ts_memo(line.add(f.at(2)), f.len(2), &mut st.days) {
         Some(t) if ul != 0 && pl != 0 && t >= cx.ws && t < cx.we && ingest - t <= DAY => t,
         _ => return st.log(cx, ekey, ingest, 0),
     };
-    let (kp, kl) = (line.add(f[4].0), f[4].1);
+    let (kp, kl) = (line.add(f.at(4)), f.len(4));
     let w = (kp as *const u64).read_unaligned();
     let pay = match kl {
         4 if w as u32 == u32::from_le_bytes(*b"view") || w as u32 == u32::from_le_bytes(*b"cart") => 0,
         8 if w == u64::from_le_bytes(*b"purchase") => {
-            let Some(p) = parse_price(std::slice::from_raw_parts(line.add(f[6].0), f[6].1)) else { return st.log(cx, ekey, ingest, 0) };
-            let cat = cx.products.get_at(line.add(f[5].0), pl).unwrap_or(cx.unknown_cat);
+            let Some(p) = parse_price(std::slice::from_raw_parts(line.add(f.at(6)), f.len(6))) else { return st.log(cx, ekey, ingest, 0) };
+            let cat = cx.products.get_at(line.add(f.at(5)), pl).unwrap_or(cx.unknown_cat);
             (cat as u32) << 24 | p
         }
         _ => return st.log(cx, ekey, ingest, 0),
     };
-    let ukey = cx.names.key_at(line.add(f[1].0), ul);
+    let ukey = cx.names.key_at(line.add(f.at(1)), ul);
     st.keep(cx, ekey, ingest, ukey, ts, pay);
 }
 
@@ -2007,7 +2083,7 @@ unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
         end,
         len,
         st,
-        |st, line, e, c, q| fast_event(cx, line, e, c, q, st),
+        |st, line, e, m| fast_event(cx, line, e, m, st),
         |st, l| {
             if let Some(f) = split::<7>(l) {
                 event_fields(cx, f, st);
@@ -2032,17 +2108,17 @@ fn click_fields(cx: &Ctx, [cid, uid, camp, ts]: [Bytes; 4], st: &mut Shard) {
 }
 
 #[inline(always)]
-unsafe fn fast_click(cx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, st: &mut Shard) {
-    let Some(f) = fast_split::<4>(line, e, c, q) else { return };
-    if f[0].1 == 0 || f[1].1 == 0 {
+unsafe fn fast_click(cx: &Ctx, line: *const u8, e: usize, m: [u64; 4], st: &mut Shard) {
+    let Some(f) = fast_split::<4>(e, m) else { return };
+    if f.len(0) == 0 || f.len(1) == 0 {
         return;
     }
-    let t = match ts_memo(line.add(f[3].0), f[3].1, &mut st.days) {
+    let t = match ts_memo(line.add(f.at(3)), f.len(3), &mut st.days) {
         Some(t) if t >= cx.base && t < cx.we => t,
         _ => return,
     };
-    let Some(camp) = cx.campaigns.get_at(line.add(f[2].0), f[2].1) else { return };
-    st.click(cx, cx.names.key_at(line.add(f[0].0), f[0].1), cx.names.key_at(line.add(f[1].0), f[1].1), t, camp);
+    let Some(camp) = cx.campaigns.get_at(line.add(f.at(2)), f.len(2)) else { return };
+    st.click(cx, cx.names.key_at(line.add(f.at(0)), f.len(0)), cx.names.key_at(line.add(f.at(1)), f.len(1)), t, camp);
 }
 
 unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: usize, st: &mut Shard) {
@@ -2052,7 +2128,7 @@ unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
         end,
         len,
         st,
-        |st, line, e, c, q| fast_click(cx, line, e, c, q, st),
+        |st, line, e, m| fast_click(cx, line, e, m, st),
         |st, l| {
             if let Some(f) = split::<4>(l) {
                 click_fields(cx, f, st);
@@ -3559,6 +3635,75 @@ mod tests {
             assert!(fa == fb, "round {round}: fast parse differs\n{}", std::str::from_utf8(file).unwrap());
         }
         assert!(kept > 1000, "too few kept events ({kept}) to mean anything");
+    }
+
+    /// `fast_split` against `split` on lines of every length under 128, their separators and quotes on every side
+    /// of the 64-byte boundary.
+    #[test]
+    fn fast_split_matches_split() {
+        fn check<const N: usize>(r: &mut Rng, rounds: usize) -> usize {
+            let mut good = 0;
+            for _ in 0..rounds {
+                let nf = if r.below(12) == 0 { r.below(10) } else { N };
+                let total = r.below(127);
+                let mut line = String::new();
+                for i in 0..nf {
+                    if i > 0 {
+                        line.push(',');
+                    }
+                    let room = total.saturating_sub(line.len());
+                    let most = if r.below(3) == 0 { 70 } else { 12 };
+                    let v = "x".repeat(r.below(room.min(most) + 1));
+                    line += &match r.below(16) {
+                        0..=4 => format!("\"{v}\""),
+                        5 => format!("\"{v}"),
+                        6 => format!("{v}\""),
+                        7 => r.pick(&["\"", "\"\"", "\"\"\"", "a\"b", "\"a\"b\"", "\"\"a"]).to_string(),
+                        _ => v,
+                    };
+                }
+                if line.len() > 127 {
+                    continue;
+                }
+                let mut buf = format!("header\n{line}").into_bytes();
+                buf.extend_from_slice(&[b'\n'; PAD]);
+                let text: Bytes = Box::leak(line.clone().into_bytes().into_boxed_slice());
+                let want = split::<N>(text).map(|f| f.map(|x| (x.as_ptr() as usize - text.as_ptr() as usize, x.len())));
+                let mut got = None;
+                let mut seen = 0;
+                unsafe {
+                    scan_lines(
+                        buf.as_ptr(),
+                        0,
+                        usize::MAX,
+                        7 + line.len() + 1,
+                        &mut (&mut got, &mut seen),
+                        |st, _, e, m| {
+                            if *st.1 == 0 {
+                                assert_eq!(e, line.len());
+                                *st.0 = fast_split::<N>(e, m).map(|f| std::array::from_fn::<_, N, _>(|i| (f.at(i), f.len(i))));
+                            }
+                            *st.1 += 1;
+                        },
+                        |_, _| panic!("a line under 128 bytes went the slow way"),
+                    );
+                }
+                // an empty field keeps its place but `split` gives it no address of its own: compare lengths then
+                let same = match (&got, &want) {
+                    (Some(g), Some(w)) => g.iter().zip(w.iter()).all(|(g, w)| g.1 == w.1 && (w.1 == 0 || g.0 == w.0)),
+                    (None, None) => true,
+                    _ => false,
+                };
+                assert!(same && seen == 1, "{line:?}: {got:?} vs {want:?}");
+                good += want.is_some() as usize;
+            }
+            good
+        }
+        let mut r = Rng(0x0dd_ba11_5eed);
+        assert!(check::<7>(&mut r, 400_000) > 50_000);
+        assert!(check::<4>(&mut r, 400_000) > 50_000);
+        assert!(check::<1>(&mut r, 20_000) > 1_000);
+        assert!(check::<8>(&mut r, 100_000) > 10_000);
     }
 
     #[test]

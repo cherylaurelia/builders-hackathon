@@ -2101,7 +2101,7 @@ fn main() {
     let n_rows = AtomicUsize::new(0);
     // A thread that has emptied the queue hands its campaign cells to this thread, then writes its user file; this
     // thread merges the cells and writes campaign_daily meanwhile instead of after the last file.
-    let (tx, rx) = std::sync::mpsc::channel::<(Vec<Cred>, Vec<u32>)>();
+    let (tx, rx) = std::sync::mpsc::channel::<(Vec<Cred>, Vec<i64>, Vec<u32>)>();
     let (camp_rows, _results) = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..threads)
             .map(|t| {
@@ -2116,7 +2116,7 @@ fn main() {
                         }
                         partition_work(cx, shards, order[i].1, &mut w);
                     }
-                    tx.send((std::mem::take(&mut w.cred), std::mem::take(&mut w.assist))).unwrap_or_else(|_| die("campaign merger gone"));
+                    tx.send((std::mem::take(&mut w.cred), std::mem::take(&mut w.rev), std::mem::take(&mut w.assist))).unwrap_or_else(|_| die("campaign merger gone"));
                     // thread 0 writes even with no rows: the table needs at least one file
                     if t == 0 || !w.rows.is_empty() {
                         write_users(&ud.join(format!("part-{t}.parquet")), &w.rows, cat_names, &cx.names)
@@ -2132,11 +2132,11 @@ fn main() {
         let mut cred = vec![[0i64; 3]; (ncamp + 1) * width];
         let mut assist = filled((ncamp + 1) * width, 0i64);
         for _ in 0..threads {
-            let (c, a) = rx.recv().unwrap_or_else(|_| die("a worker ended without its campaign cells"));
-            for (x, y) in cred.iter_mut().zip(&c) {
+            let (c, r, a) = rx.recv().unwrap_or_else(|_| die("a worker ended without its campaign cells"));
+            for ((x, y), r) in cred.iter_mut().zip(&c).zip(&r) {
                 x[0] += y.sessions as i64;
                 x[1] += y.purchasing as i64;
-                x[2] += y.revenue;
+                x[2] += r;
             }
             for (x, y) in assist.iter_mut().zip(&a) {
                 *x += *y as i64;
@@ -2796,7 +2796,6 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
 struct Cred {
     sessions: u32,
     purchasing: u32,
-    revenue: i64,
 }
 
 /// A click of the person at hand: `k` = ts << 32 | campaign.
@@ -2836,6 +2835,7 @@ struct Sess {
 struct Work {
     rows: Vec<UserRow>,
     cred: Vec<Cred>,
+    rev: Vec<i64>, // revenue of the credited sessions, per cell of `cred`
     assist: Vec<u32>,
     stamp: Vec<bool>,
     iv: Vec<(i64, i64)>,
@@ -2868,6 +2868,7 @@ impl Work {
         Work {
             rows: Vec::new(),
             cred: vec![Cred::default(); cells],
+            rev: filled(cells, 0),
             assist: filled(cells + 4, 0), // + cells for the unused steps of the vector window
             stamp: vec![false; cx.ncamp + 1],
             iv: vec![(0, 0); cx.ncamp + 1],
@@ -3181,7 +3182,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
 fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
     let width = cx.ndays;
     let organic = cx.ncamp;
-    let Work { rows, cred, assist, stamp, iv, seen, sctr, sessions, day_groups, cats, touched, small, bins, bits, bin_sess, purch, sess_day, days, dcats, .. } = w;
+    let Work { rows, cred, rev, assist, stamp, iv, seen, sctr, sessions, day_groups, cats, touched, small, bins, bits, bin_sess, purch, sess_day, days, dcats, .. } = w;
 
     // sessions + user_daily rows: the events go into their 30-minute bins, and the bins in order are the sessions
     for &e in evs {
@@ -3253,7 +3254,10 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
         let a = &mut cred[camp * width + s.d];
         a.sessions += 1;
         a.purchasing += s.purchased as u32;
-        a.revenue += s.revenue;
+        if s.purchased {
+            // apart from the counts: most sessions buy nothing, and the cells every session touches stay half as big
+            rev[camp * width + s.d] += s.revenue;
+        }
     };
     // the campaign of the latest click among cs[lo..hi] (all at or before the session start); tie -> smallest click_id
     let latest = |lo: usize, hi: usize| -> usize {

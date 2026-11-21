@@ -2337,7 +2337,7 @@ fn main() {
                 let (cx, shards, order, next, n_rows, ud, cat_names) = (&cx, &shards, &order, &next, &n_rows, &ud, &cat_names);
                 let tx = tx.clone();
                 sc.spawn(move || {
-                    let mut w = Work::new(cx);
+                    let mut w = Work::new(cx, n_ev);
                     loop {
                         let i = next.fetch_add(1, Relaxed);
                         if i >= order.len() {
@@ -2347,7 +2347,6 @@ fn main() {
                     }
                     tx.send((std::mem::take(&mut w.cred), std::mem::take(&mut w.assist))).unwrap_or_else(|_| die("campaign merger gone"));
                     // thread 0 writes even with no rows: the table needs at least one file
-                    w.cols.seal();
                     if t == 0 || w.cols.n > 0 {
                         write_users(&ud.join(format!("part-{t}.parquet")), &w.cols, cat_names, cx.day0, cx.ndays)
                             .unwrap_or_else(|e| die(&format!("write user_daily: {e}")));
@@ -3106,11 +3105,12 @@ struct Work {
 }
 
 impl Work {
-    fn new(cx: &Ctx) -> Work {
+    /// `rows`: the most `user_daily` rows the thread can have.
+    fn new(cx: &Ctx, rows: usize) -> Work {
         let cells = (cx.ncamp + 1) * cx.ndays;
         let local = (1usize << cx.pshift) + 1;
         Work {
-            cols: Cols::default(),
+            cols: Cols::new(rows),
             tmp: Vec::with_capacity(64),
             cred: vec![Cred::default(); cells],
             assist: filled(cells + 4, 0), // + cells for the unused steps of the vector window
@@ -3328,7 +3328,9 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     if w.ev.len() < n {
         w.ev.resize(n, 0);
     }
-    w.cols.reserve(n); // a row has at least one event
+    if w.cols.n + n > w.cols.cap {
+        die("more user rows than events"); // a row has at least one event of its own
+    }
     for s in shards {
         for blk in s.ev[p].slices(EV_BLOCK) {
             for r in blk {
@@ -3485,7 +3487,7 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
             cats.extend(dcats.iter().filter(|c| c.0 == g as u32).map(|c| (c.1, c.2)));
         }
         let top = top_category(cats, &cx.cat_rank);
-        // SAFETY: `partition_work` reserved a row per event of the partition, and every row has an event of its own
+        // SAFETY: `partition_work` saw room for a row per event of the partition, and every row has an event of its own
         unsafe { cols.put(x.d as u8, x.sessions as u8, x.events, x.revenue, top) };
     }
     cols.runs.push(days.len() as u8);
@@ -3993,59 +3995,59 @@ fn le_bytes<T: Copy>(v: &[T]) -> &[u8] {
 }
 
 /// The `user_daily` rows of one thread, a column each, in the form `write_users` puts in the file: the rows of a
-/// person are consecutive.
-#[derive(Default)]
+/// person are consecutive. The row columns are address space for `cap` rows, never moved or copied: a page of
+/// memory is taken when a row first lands in it.
 struct Cols {
-    n: usize,         // rows; the row vectors below hold at least n (their len is set by `seal`)
-    names: Vec<u8>,   // the dictionary page of user_id: every person's name once, as PLAIN byte arrays, in row order
-    runs: Vec<u8>,    // rows of each person
-    day: Vec<u8>,     // day - day0
-    sess: Vec<u8>,    // at most 49 start in a day (30-minute bins)
-    events: Vec<u32>,
-    rev: Vec<i64>,
-    top: Vec<u16>, // category, NO_CAT without a purchase
+    n: usize,       // rows
+    cap: usize,     // rows the row columns have room for (the one-byte ones for 8 more: zeros, the padding of a group)
+    names: Vec<u8>, // the dictionary page of user_id: every person's name once, as PLAIN byte arrays, in row order
+    runs: Vec<u8>,  // rows of each person
+    day: *mut u8,   // day - day0
+    sess: *mut u8,  // at most 49 start in a day (30-minute bins)
+    events: *mut u32,
+    rev: *mut i64,
+    top: *mut u16, // category, NO_CAT without a purchase
 }
+// SAFETY: the columns are owned memory (`map_anon`), used by one thread at a time
+unsafe impl Send for Cols {}
 
 impl Cols {
-    /// Room for `more` rows past the n so far.
-    fn reserve(&mut self, more: usize) {
-        // SAFETY: n rows of each vector are written (`put`), and n <= capacity
-        unsafe {
-            self.day.set_len(self.n);
-            self.sess.set_len(self.n);
-            self.events.set_len(self.n);
-            self.rev.set_len(self.n);
-            self.top.set_len(self.n);
+    fn new(cap: usize) -> Cols {
+        let room = |bytes: usize| map_anon((cap + 8) * bytes);
+        Cols {
+            n: 0,
+            cap,
+            names: Vec::new(),
+            runs: Vec::new(),
+            day: room(1),
+            sess: room(1),
+            events: room(4) as *mut u32,
+            rev: room(8) as *mut i64,
+            top: room(2) as *mut u16,
         }
-        self.day.reserve(more + 8); // + the padding of `seal`
-        self.sess.reserve(more + 8);
-        self.events.reserve(more);
-        self.rev.reserve(more);
-        self.top.reserve(more);
     }
 
-    /// One more row. SAFETY: the caller has reserved room for it (`reserve`).
+    /// One more row. SAFETY: n < cap.
     #[inline(always)]
     unsafe fn put(&mut self, day: u8, sess: u8, events: u32, rev: i64, top: u16) {
         let n = self.n;
-        *self.day.as_mut_ptr().add(n) = day;
-        *self.sess.as_mut_ptr().add(n) = sess;
-        *self.events.as_mut_ptr().add(n) = events;
-        *self.rev.as_mut_ptr().add(n) = rev;
-        *self.top.as_mut_ptr().add(n) = top;
+        *self.day.add(n) = day;
+        *self.sess.add(n) = sess;
+        *self.events.add(n) = events;
+        *self.rev.add(n) = rev;
+        *self.top.add(n) = top;
         self.n = n + 1;
     }
 
-    /// After the last row: the lengths, and the one-byte columns padded with zeros to whole groups of eight rows.
-    fn seal(&mut self) {
-        self.reserve(0);
-        let n8 = self.n.div_ceil(8) * 8;
-        self.day.resize(n8, 0);
-        self.sess.resize(n8, 0);
+    /// The first `n` values of a row column.
+    fn col<T>(&self, p: *mut T, n: usize) -> &[T] {
+        assert!(n <= self.cap + 8 * (std::mem::size_of::<T>() == 1) as usize);
+        // SAFETY: n values of the column's mapping, which starts as zeros and is written only through `put`
+        unsafe { std::slice::from_raw_parts(p, n) }
     }
 }
 
-/// `user_daily` from the sealed columns of one thread. user_id is dictionary encoded with one entry per person and
+/// `user_daily` from the columns of one thread. user_id is dictionary encoded with one entry per person and
 /// runs of that entry's index (a person's days are consecutive rows); day and sessions are dictionary encoded with
 /// one-byte indices (the window's days; the numbers 0..=255), so their column in memory is the page body;
 /// events and revenue_cents are PLAIN straight from memory; top_category is the index of the category in a
@@ -4079,7 +4081,7 @@ fn write_users(path: &Path, c: &Cols, cat_names: &[Bytes], day0: i64, ndays: usi
     put_varint(&mut defs, (n8 as u64 / 8) << 1 | 1);
     let mut idx: Vec<u8> = vec![0; n8 + 8];
     let mut k = 0;
-    for ch in c.top[..n].chunks(8) {
+    for ch in c.col(c.top, n).chunks(8) {
         let mut m = 0u8;
         for (i, &t) in ch.iter().enumerate() {
             let has = t != NO_CAT;
@@ -4096,10 +4098,10 @@ fn write_users(path: &Path, c: &Cols, cat_names: &[Bytes], day0: i64, ndays: usi
     let top_run = if k == 0 { vec![8] } else { bytes_run(k) };
     let chunks = [
         Chunk { dict: Some((entries, vec![&c.names])), body: vec![&runs] },
-        Chunk { dict: Some((ndays, vec![&day_dict])), body: vec![&run8, &c.day[..n8]] },
-        Chunk { dict: Some((256, vec![&num_dict])), body: vec![&run8, &c.sess[..n8]] },
-        Chunk { dict: None, body: vec![le_bytes(&c.events[..n])] },
-        Chunk { dict: None, body: vec![le_bytes(&c.rev[..n])] },
+        Chunk { dict: Some((ndays, vec![&day_dict])), body: vec![&run8, c.col(c.day, n8)] },
+        Chunk { dict: Some((256, vec![&num_dict])), body: vec![&run8, c.col(c.sess, n8)] },
+        Chunk { dict: None, body: vec![le_bytes(c.col(c.events, n))] },
+        Chunk { dict: None, body: vec![le_bytes(c.col(c.rev, n))] },
         Chunk { dict: Some((cat_names.len(), vec![&cat_dict])), body: vec![&defs, &top_run, &idx[..k8]] },
     ];
     write_parquet(path, &USER_COLS, n, &chunks)

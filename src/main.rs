@@ -150,31 +150,62 @@ fn pack16(v: u128, len: usize) -> u64 {
     #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
     unsafe {
         use std::arch::x86_64::*;
-        let c = _mm_set_epi64x((v >> 64) as i64, v as i64);
-        let rng = |lo: u8, hi: u8| _mm_and_si128(_mm_cmpgt_epi8(c, _mm_set1_epi8(lo as i8 - 1)), _mm_cmpgt_epi8(_mm_set1_epi8(hi as i8 + 1), c));
-        let (dg, up, lw) = (rng(b'0', b'9'), rng(b'A', b'Z'), rng(b'a', b'z'));
-        let us = _mm_cmpeq_epi8(c, _mm_set1_epi8(b'_' as i8));
-        let valid = _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(dg, up), _mm_or_si128(us, lw))) as u32;
-        let need = (1u32 << len) - 1;
-        if valid & need != need {
-            return 0;
-        }
-        // digit = byte - offset of its class; the zero bytes past `len` are in no class and stay 0
-        let off = _mm_or_si128(
-            _mm_or_si128(_mm_and_si128(dg, _mm_set1_epi8(47)), _mm_and_si128(up, _mm_set1_epi8(54))),
-            _mm_or_si128(_mm_and_si128(us, _mm_set1_epi8(58)), _mm_and_si128(lw, _mm_set1_epi8(59))),
-        );
-        let d = _mm_sub_epi8(c, off);
-        let w = _mm_maddubs_epi16(d, _mm_set1_epi16(0x0140)); // two digits -> 12 bits
-        let l = _mm_madd_epi16(w, _mm_set1_epi32(0x0001_1000)); // four digits -> 24 bits
-        let lo = _mm_cvtsi128_si64(l) as u64;
-        let l2 = _mm_extract_epi32(l, 2) as u32 as u64;
-        return ((lo & 0xffff_ffff) << 36) | ((lo >> 32) << 12) | (l2 >> 12);
+        return pack_m128(_mm_set_epi64x((v >> 64) as i64, v as i64), len);
     }
     #[allow(unreachable_code)]
     {
         pack(&v.to_le_bytes()[..len])
     }
+}
+
+/// 16 x 0xFF then 16 x 0: the 16 bytes at 16 - len keep the first `len` bytes of a vector.
+static LEN_MASK: [u8; 32] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+/// `pack` of the `len` bytes at `p` (16 bytes must be readable).
+#[inline(always)]
+unsafe fn pack_at(p: *const u8, len: usize) -> u64 {
+    if len > 10 {
+        return 0;
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
+    {
+        use std::arch::x86_64::*;
+        let m = _mm_loadu_si128(LEN_MASK.as_ptr().add(16 - len) as *const __m128i);
+        return pack_m128(_mm_and_si128(_mm_loadu_si128(p as *const __m128i), m), len);
+    }
+    #[allow(unreachable_code)]
+    pack16(load16(p, len), len)
+}
+
+/// `pack` of the first `len` (<= 10) bytes of `c`, whose other bytes are 0.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
+#[inline(always)]
+unsafe fn pack_m128(c: std::arch::x86_64::__m128i, len: usize) -> u64 {
+    use std::arch::x86_64::*;
+    // [0-9A-Z_a-z] by nibbles: a byte packs when its low-nibble class bits meet its high-nibble class bit.
+    // high 3: low 0-9 (bit 0); high 4, 6: low 1-F (bit 1); high 5: low 0-A, F (bit 2); high 7: low 0-A (bit 3)
+    const LO: [i8; 16] = [0b1101, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1111, 0b1110, 2, 2, 2, 2, 0b0110];
+    const HI: [i8; 16] = [0, 0, 0, 1, 2, 4, 2, 8, 0, 0, 0, 0, 0, 0, 0, 0];
+    // digit = byte - offset of its high nibble (and 4 more for `_`); the zero bytes past `len` stay 0
+    const OFF: [i8; 16] = [0, 0, 0, 47, 54, 54, 59, 59, 0, 0, 0, 0, 0, 0, 0, 0];
+    let nib = _mm_set1_epi8(15);
+    let lo = _mm_and_si128(c, nib);
+    let hi = _mm_and_si128(_mm_srli_epi16(c, 4), nib);
+    let cls = _mm_and_si128(_mm_shuffle_epi8(_mm_loadu_si128(LO.as_ptr() as *const __m128i), lo), _mm_shuffle_epi8(_mm_loadu_si128(HI.as_ptr() as *const __m128i), hi));
+    let bad = _mm_movemask_epi8(_mm_cmpeq_epi8(cls, _mm_setzero_si128())) as u32;
+    if bad & ((1u32 << len) - 1) != 0 {
+        return 0;
+    }
+    let off = _mm_add_epi8(
+        _mm_shuffle_epi8(_mm_loadu_si128(OFF.as_ptr() as *const __m128i), hi),
+        _mm_and_si128(_mm_cmpeq_epi8(c, _mm_set1_epi8(b'_' as i8)), _mm_set1_epi8(4)),
+    );
+    let d = _mm_sub_epi8(c, off);
+    let w = _mm_maddubs_epi16(d, _mm_set1_epi16(0x0140)); // two digits -> 12 bits
+    let l = _mm_madd_epi16(w, _mm_set1_epi32(0x0001_1000)); // four digits -> 24 bits
+    let lo = _mm_cvtsi128_si64(l) as u64;
+    let l2 = _mm_extract_epi32(l, 2) as u32 as u64;
+    ((lo & 0xffff_ffff) << 36) | ((lo >> 32) << 12) | (l2 >> 12)
 }
 
 /// The IDs that do not pack (longer than 10 bytes, or a byte outside [0-9A-Z_a-z]): each gets a number, exact on
@@ -219,11 +250,9 @@ impl Interner {
     /// `key` of the `len` bytes at `p` (16 bytes must be readable).
     #[inline(always)]
     unsafe fn key_at(&self, p: *const u8, len: usize) -> u64 {
-        if len <= 10 {
-            let k = pack16(load16(p, len), len);
-            if k != 0 {
-                return k;
-            }
+        let k = pack_at(p, len);
+        if k != 0 {
+            return k;
         }
         self.intern(std::slice::from_raw_parts(p, len))
     }
@@ -1785,11 +1814,9 @@ impl IdMap {
     /// `get` of the `len` bytes at `p` (16 bytes must be readable).
     #[inline(always)]
     unsafe fn get_at(&self, p: *const u8, len: usize) -> Option<u16> {
-        if len <= 10 {
-            let k = pack16(load16(p, len), len);
-            if k != 0 {
-                return self.packed(k);
-            }
+        let k = pack_at(p, len);
+        if k != 0 {
+            return self.packed(k);
         }
         self.other.get(std::slice::from_raw_parts(p, len)).copied()
     }
@@ -3515,6 +3542,7 @@ mod tests {
             buf.extend((0..32).map(|_| r.next() as u8));
             let k = pack(&id);
             assert_eq!(pack16(unsafe { load16(buf.as_ptr(), len) }, len), k, "{id:?}");
+            assert_eq!(unsafe { pack_at(buf.as_ptr(), len) }, k, "{id:?}");
             if k == 0 {
                 continue;
             }

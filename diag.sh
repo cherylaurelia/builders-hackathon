@@ -14,10 +14,9 @@ echo "== kernel"; uname -r; cat /proc/loadavg; grep -E "MemTotal|MemFree|MemAvai
 echo "== thp"; cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null
 echo "== input"; du -sh $D/events $D/clicks $D/links 2>/dev/null; ls $D/events | wc -l
 echo "== page cache before (fincore)"; fincore -b $D/events/*.csv 2>/dev/null | awk 'NR>1{r+=$1; s+=$3} END{printf "resident %d of %d bytes (%.1f%%)\n", r, s, 100*r/(s+1)}' || echo "fincore unavailable"
-a=$(ms); cat $D/events/*.csv > /dev/null; b=$(ms); echo "== raw read of events: $((b-a)) ms"
-echo "== page cache after read"; fincore -b $D/events/*.csv 2>/dev/null | awk 'NR>1{r+=$1; s+=$3} END{printf "resident %.1f%%\n", 100*r/(s+1)}'
-echo "== full run (input now cached)"; a=$(ms); OUTPUT_DIR=$T/full /usr/local/bin/sessions; rc=$?; b=$(ms); echo "sessions rc=$rc wall=$((b-a)) ms"
-a=$(ms); OUTPUT_DIR=$T/full2 /usr/local/bin/sessions 2>/dev/null; b=$(ms); echo "second run wall=$((b-a)) ms"
+echo "== first full run, as scored (timed)"; a=$(ms); OUTPUT_DIR=$T/full /usr/local/bin/sessions; rc=$?; b=$(ms); echo "sessions rc=$rc wall=$((b-a)) ms"
+echo "== page cache after first run"; fincore -b $D/events/*.csv 2>/dev/null | awk 'NR>1{r+=$1; s+=$3} END{printf "resident %.1f%%\n", 100*r/(s+1)}'
+a=$(ms); OUTPUT_DIR=$T/full2 /usr/local/bin/sessions 2>/dev/null; b=$(ms); echo "== second run (warm) wall=$((b-a)) ms"
 echo "== now the deliberately incomplete run"
 mkdir -p $T/sub/events && for x in campaigns.csv products.csv manifest.json clicks links; do ln -s $D/$x $T/sub/$x; done
 for f in $(ls $D/events | sed 1d); do ln -s $D/events/$f $T/sub/events/$f; done

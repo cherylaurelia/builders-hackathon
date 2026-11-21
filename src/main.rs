@@ -2,11 +2,13 @@
 //!
 //! One shuffle, no pointers into the input. Every ID (event, user, click) becomes an exact 64-bit key: an ID of up
 //! to 10 bytes from [0-9A-Z_a-z] packs losslessly, any other ID is interned. The input is read with pread into a
-//! small per-thread buffer, so no input page is ever mapped.
+//! small per-thread buffer, so no input page is ever mapped; with a cold page cache a few extra threads ask the
+//! kernel for the whole input up front (`read_ahead`).
 //!
 //! Phases:
 //!   1. links  -> every link ID goes into one lock-free ID table; a lock-free union-find over its slots hangs the
-//!      larger name under the smaller, so the root of a person is their name (byte-wise smallest ID)
+//!      larger name under the smaller, so the root of a person is their name (byte-wise smallest ID). The table
+//!      never grows: when it fills up the program restarts itself with a larger one (`restart_bigger`)
 //!   2. events + clicks -> parsed from one chunk queue. A user ID is found (or added) in the ID table; its person's
 //!      slot number is the person. A valid event is a 12-byte record in its person partition; every event also
 //!      leaves (event key, ingest_ts, record address) in its event-key bucket. Clicks go to person partitions too

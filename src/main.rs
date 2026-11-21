@@ -54,6 +54,28 @@ fn hash_bytes(b: &[u8]) -> u64 {
     mix(h)
 }
 
+/// The `len` (<= 16) bytes at `p`, zero padded to 16; reads 16 bytes.
+#[inline(always)]
+unsafe fn load16(p: *const u8, len: usize) -> u128 {
+    let v = (p as *const u128).read_unaligned();
+    if len == 0 {
+        0
+    } else {
+        v & (u128::MAX >> (128 - 8 * len as u32))
+    }
+}
+
+/// `hash_bytes` of a key of `len` (<= 16) bytes given as `load16` of it.
+#[inline(always)]
+fn hash16(v: u128, len: usize) -> u64 {
+    const K: u64 = 0x9E3779B97F4A7C15;
+    let round = |h: u64, w: u64| (h ^ w).wrapping_mul(K).rotate_left(29);
+    let h0 = K ^ len as u64;
+    let h1 = round(h0, v as u64);
+    let h2 = round(h1, (v >> 64) as u64);
+    mix(if len > 8 { h2 } else if len > 0 { h1 } else { h0 })
+}
+
 /// Hasher for byte-string keys: one call to `write` carries the whole key.
 #[derive(Default)]
 struct BytesHasher(u64);
@@ -254,6 +276,56 @@ fn special_mask(b: &[u8]) -> u64 {
             m |= ((c == b',' || c == b'"' || c == b'\n') as u64) << k;
         }
         m
+    }
+}
+
+/// [commas, quotes, newlines]: bit k set when p[k] is that byte, for the 64 bytes at `p` (all must be readable).
+#[inline(always)]
+unsafe fn masks64(p: *const u8) -> [u64; 3] {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        let (a, b) = (_mm256_loadu_si256(p as *const __m256i), _mm256_loadu_si256(p.add(32) as *const __m256i));
+        let m = |c: u8| {
+            let k = _mm256_set1_epi8(c as i8);
+            (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, k)) as u32 as u64) | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, k)) as u32 as u64) << 32)
+        };
+        return [m(b','), m(b'"'), m(b'\n')];
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+    {
+        use std::arch::x86_64::*;
+        let v = [0, 16, 32, 48].map(|o| _mm_loadu_si128(p.add(o) as *const __m128i));
+        let m = |c: u8| {
+            let k = _mm_set1_epi8(c as i8);
+            (0..4).fold(0u64, |acc, i| acc | (_mm_movemask_epi8(_mm_cmpeq_epi8(v[i], k)) as u32 as u64) << (16 * i))
+        };
+        return [m(b','), m(b'"'), m(b'\n')];
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        let v = [vld1q_u8(p), vld1q_u8(p.add(16)), vld1q_u8(p.add(32)), vld1q_u8(p.add(48))];
+        let bits: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let bits = vld1q_u8(bits.as_ptr());
+        let m = |c: u8| {
+            let k = vdupq_n_u8(c);
+            let t = |x: uint8x16_t| vandq_u8(vceqq_u8(x, k), bits);
+            let s = vpaddq_u8(vpaddq_u8(t(v[0]), t(v[1])), vpaddq_u8(t(v[2]), t(v[3])));
+            vgetq_lane_u64(vreinterpretq_u64_u8(vpaddq_u8(s, s)), 0)
+        };
+        return [m(b','), m(b'"'), m(b'\n')];
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut r = [0u64; 3];
+        for k in 0..64 {
+            let c = *p.add(k);
+            r[0] |= ((c == b',') as u64) << k;
+            r[1] |= ((c == b'"') as u64) << k;
+            r[2] |= ((c == b'\n') as u64) << k;
+        }
+        r
     }
 }
 
@@ -460,6 +532,88 @@ fn parse_price(b: &[u8]) -> Option<u32> {
     } else {
         Some(v as u32)
     }
+}
+
+// Fast paths of `civil` / `parse_ts` for a field inside a line with 16+ readable bytes past its end (SWAR, no copies).
+
+const HI: u64 = 0x8080_8080_8080_8080;
+
+/// `civil` on the 19 bytes at `p` (reads 20).
+#[inline(always)]
+unsafe fn civil_at(p: *const u8) -> Option<i64> {
+    // x ^ pattern: a digit becomes 0..=9, a matching separator 0. Per byte, adding 0x76 (digit) or 0x7F (separator)
+    // sets the high bit exactly when the byte is out of range; a carry out of a byte only follows a byte whose own
+    // high bit is set, so it can never hide a bad byte.
+    let a = (p as *const u64).read_unaligned() ^ u64::from_le_bytes(*b"0000-00-");
+    let b = (p.add(8) as *const u64).read_unaligned() ^ u64::from_le_bytes(*b"00T00:00");
+    let c = ((p.add(16) as *const u32).read_unaligned() as u64 & 0xFF_FFFF) ^ u64::from_le_bytes(*b":00\0\0\0\0\0");
+    const AA: u64 = u64::from_le_bytes([0x76, 0x76, 0x76, 0x76, 0x7F, 0x76, 0x76, 0x7F]);
+    const AB: u64 = u64::from_le_bytes([0x76, 0x76, 0x7F, 0x76, 0x76, 0x7F, 0x76, 0x76]);
+    const AC: u64 = u64::from_le_bytes([0x7F, 0x76, 0x76, 0, 0, 0, 0, 0]);
+    if (a.wrapping_add(AA) | a | b.wrapping_add(AB) | b | c.wrapping_add(AC) | c) & HI != 0 {
+        return None;
+    }
+    // byte k of x * 10 + (x >> 8) = 10 * digit k + digit k+1
+    let pa = a * 10 + (a >> 8);
+    let pb = b * 10 + (b >> 8);
+    let y = (pa & 0xFF) * 100 + ((pa >> 16) & 0xFF);
+    let mo = (pa >> 40) & 0xFF;
+    let dd = pb & 0xFF;
+    let h = (pb >> 24) & 0xFF;
+    let mi = (pb >> 48) & 0xFF;
+    let sec = ((c >> 8) & 0xFF) * 10 + ((c >> 16) & 0xFF);
+    const DIM: [u64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if (mo.wrapping_sub(1) > 11) | (dd == 0) | (h > 23) | (mi > 59) | (sec > 59) {
+        return None;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    if dd > DIM[mo as usize] + ((mo == 2) & leap) as u64 {
+        return None;
+    }
+    let days = days_from_civil(y as i64, mo as i64, dd as i64);
+    Some(days * DAY + (h * 3_600_000 + mi * 60_000 + sec * 1000) as i64)
+}
+
+/// 8 digit values (byte 0 the most significant) as a number.
+#[inline(always)]
+fn swar8(d: u64) -> u64 {
+    let d = d * 10 + (d >> 8);
+    ((d & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32))).wrapping_add(((d >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32))) >> 32
+}
+
+/// `parse_ts` on the `len` bytes at `p`.
+#[inline(always)]
+unsafe fn ts_at(p: *const u8, len: usize) -> Option<i64> {
+    let at = |i: usize| *p.add(i);
+    if len == 20 && at(19) == b'Z' {
+        return civil_at(p);
+    }
+    if len == 25 && (at(19) == b'+' || at(19) == b'-') && at(22) == b':' {
+        let (h1, h2, m1, m2) = (at(20).wrapping_sub(b'0'), at(21).wrapping_sub(b'0'), at(23).wrapping_sub(b'0'), at(24).wrapping_sub(b'0'));
+        if h1 > 9 || h2 > 9 || m1 > 9 || m2 > 9 {
+            return None;
+        }
+        let (oh, om) = ((h1 * 10 + h2) as i64, (m1 * 10 + m2) as i64);
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        let off = (oh * 60 + om) * 60_000;
+        let t = civil_at(p)?;
+        return Some(if at(19) == b'+' { t - off } else { t + off });
+    }
+    if len == 0 || len > 16 {
+        return parse_ts(std::slice::from_raw_parts(p, len));
+    }
+    // F3 of 1..=16 bytes: right-align into 16 bytes behind leading '0's, check all digits, convert
+    let sh = 8 * (16 - len) as u32;
+    let zeros = u128::from_le_bytes([b'0'; 16]);
+    let v = ((p as *const u128).read_unaligned() << sh) | (zeros & ((1u128 << sh) - 1));
+    let d = v ^ zeros;
+    let (lo, hi) = (d as u64, (d >> 64) as u64);
+    if (lo.wrapping_add(0x7676_7676_7676_7676) | lo | hi.wrapping_add(0x7676_7676_7676_7676) | hi) & HI != 0 {
+        return None;
+    }
+    Some((swar8(lo) * 100_000_000 + swar8(hi)) as i64)
 }
 
 // ---------------------------------------------------------------- input files
@@ -775,33 +929,7 @@ fn main() {
         },
         |st, i| {
             let (f, s, e) = ev_chunks[i];
-            for_records::<7>(f, s, e, |fields| {
-                if let Some(r) = parse_event(&ctx, fields) {
-                    let loc = if r.keep {
-                        let uh = hash_bytes(r.uid.get());
-                        let u = uid_bucket(uh);
-                        let v = &mut st.ub[u];
-                        let loc = ((st.t as u64) << LOC_T) | ((u as u64) << LOC_B) | v.len() as u64;
-                        v.push(UEvent {
-                            uh,
-                            uid: SStr::new(r.uid.get()),
-                            eid: r.eid,
-                            ingest: r.ingest,
-                            ts: r.ts,
-                            price: r.price,
-                            cat: r.cat,
-                            kind: r.kind,
-                            dropped: AtomicBool::new(false),
-                        });
-                        loc
-                    } else {
-                        let loc = LOC_BAD | ((st.t as u64) << LOC_T) | st.bad.len() as u64;
-                        st.bad.push((r.eid, r.ingest));
-                        loc
-                    };
-                    st.eb[(r.h >> 56) as usize % EB].push(ERec { h: r.h, loc });
-                }
-            });
+            parse_events(&ctx, f, s, e, st);
         },
     );
     parsed.sort_by_key(|p| p.t); // locations name threads by t
@@ -1078,6 +1206,148 @@ fn parse_event(ctx: &Ctx, [eid, uid, ts, ingest, etype, pid, price]: [Bytes; 7])
     r.ts = t;
     r.keep = true;
     Some(r)
+}
+
+impl EvParse {
+    /// A valid, non-late event: into its user_id bucket, plus its (hash(event_id), location) record.
+    #[inline(always)]
+    fn keep(&mut self, h: u64, e: UEvent) {
+        let u = uid_bucket(e.uh);
+        let v = &mut self.ub[u];
+        let loc = ((self.t as u64) << LOC_T) | ((u as u64) << LOC_B) | v.len() as u64;
+        v.push(e);
+        self.eb[(h >> 56) as usize % EB].push(ERec { h, loc });
+    }
+
+    /// Any other parsed event: it still takes part in dedup.
+    #[inline(always)]
+    fn reject(&mut self, h: u64, eid: Packed, ingest: i64) {
+        let loc = LOC_BAD | ((self.t as u64) << LOC_T) | self.bad.len() as u64;
+        self.bad.push((eid, ingest));
+        self.eb[(h >> 56) as usize % EB].push(ERec { h, loc });
+    }
+
+    #[inline(always)]
+    fn add(&mut self, r: RawEvent) {
+        if r.keep {
+            let u = r.uid.get();
+            let e = UEvent { uh: hash_bytes(u), uid: SStr::new(u), eid: r.eid, ingest: r.ingest, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind, dropped: AtomicBool::new(false) };
+            self.keep(r.h, e);
+        } else {
+            self.reject(r.h, r.eid, r.ingest);
+        }
+    }
+}
+
+/// Parses the event lines that start in [start, end) of `file` (header skipped) into `st`. A line with its `\n`
+/// in its first 128 bytes and 144 readable bytes takes `fast_event`; any other goes through `split` + `parse_event`.
+fn parse_events(ctx: &Ctx, file: Bytes, start: usize, end: usize, st: &mut EvParse) {
+    let len = file.len();
+    let first = start.saturating_sub(1);
+    let Some(nl) = memchr::memchr(b'\n', &file[first..]) else { return };
+    let mut p = first + nl + 1;
+    let fast_end = len.saturating_sub(144);
+    while p < end && p < len {
+        if p < fast_end {
+            // SAFETY: p + 144 <= len
+            unsafe {
+                let line = file.as_ptr().add(p);
+                let [c0, q0, n0] = masks64(line);
+                let [c1, q1, n1] = masks64(line.add(64));
+                let n = n0 as u128 | (n1 as u128) << 64;
+                if n != 0 {
+                    let e = n.trailing_zeros() as usize;
+                    let lm = (1u128 << e) - 1;
+                    fast_event(ctx, line, e, (c0 as u128 | (c1 as u128) << 64) & lm, (q0 as u128 | (q1 as u128) << 64) & lm, st);
+                    p += e + 1;
+                    continue;
+                }
+            }
+        }
+        let e = memchr::memchr(b'\n', &file[p..]).map_or(len, |i| p + i);
+        if let Some(r) = split::<7>(&file[p..e]).and_then(|f| parse_event(ctx, f)) {
+            st.add(r);
+        }
+        p = e + 1;
+    }
+}
+
+/// `split::<7>` + `parse_event` + `EvParse::add` for the line of `e` (< 128) bytes at `line`, given its comma and
+/// quote bits `c` and `q`; line[e] is its `\n` and line[..144] is readable.
+#[inline(always)]
+unsafe fn fast_event(ctx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, st: &mut EvParse) {
+    if c.count_ones() != 6 {
+        return;
+    }
+    // Well quoted <=> every quote sits at a field's first or last byte (s, ends), none is both (a lone `"`), and
+    // per field a first-byte quote (x) comes with a last-byte quote (y, moved onto the boundary after it). Then
+    // y - x borrows across exactly the quoted fields' bytes, so a field with only one of the two leaves a bit on
+    // the boundary that ends it (or the first such field does).
+    let b = c | (1u128 << e);
+    let s = (b << 1) | 1;
+    let ends = b >> 1;
+    let x = q & s;
+    let y = (q << 1) & b;
+    if (q & !(s | ends)) | (x & ends) | (y.wrapping_sub(x) & b) != 0 {
+        return;
+    }
+    let mut fs = [0usize; 7];
+    let mut fe = [0usize; 7];
+    let mut cc = c;
+    let mut at = 0;
+    for i in 0..6 {
+        let k = cc.trailing_zeros() as usize;
+        cc &= cc - 1;
+        fs[i] = at;
+        fe[i] = k;
+        at = k + 1;
+    }
+    fs[6] = at;
+    fe[6] = e;
+    for i in 0..7 {
+        // a quoted field starts with `"` (an empty unquoted field starts on its `,` or `\n`)
+        let qd = (*line.add(fs[i]) == b'"') as usize;
+        fs[i] += qd;
+        fe[i] -= qd;
+    }
+    let f = |i: usize| (line.add(fs[i]), fe[i] - fs[i]);
+    let (ep, el) = f(0);
+    if el == 0 {
+        return;
+    }
+    let (ip, il) = f(3);
+    let Some(ingest) = ts_at(ip, il) else { return };
+    let h = if el <= 16 { hash16(load16(ep, el), el) } else { hash_bytes(std::slice::from_raw_parts(ep, el)) };
+    let eid = Packed::new(std::slice::from_raw_parts(ep, el));
+    let ((up, ul), (pp, pl)) = (f(1), f(5));
+    let (tp, tl) = f(2);
+    let ts = match ts_at(tp, tl) {
+        Some(t) if ul != 0 && pl != 0 && t >= ctx.ws && t < ctx.we && ingest - t <= DAY => t,
+        _ => return st.reject(h, eid, ingest),
+    };
+    let (kp, kl) = f(4);
+    let w = (kp as *const u64).read_unaligned();
+    let kind = match kl {
+        4 if w as u32 == u32::from_le_bytes(*b"view") => VIEW,
+        4 if w as u32 == u32::from_le_bytes(*b"cart") => CART,
+        8 if w == u64::from_le_bytes(*b"purchase") => PURCHASE,
+        _ => return st.reject(h, eid, ingest),
+    };
+    let (mut price, mut cat) = (0, 0);
+    if kind == PURCHASE {
+        let (rp, rl) = f(6);
+        let Some(p) = parse_price(std::slice::from_raw_parts(rp, rl)) else { return st.reject(h, eid, ingest) };
+        price = p;
+        cat = ctx.products.get(std::slice::from_raw_parts(pp, pl)).copied().unwrap_or(ctx.unknown_cat);
+    }
+    let (uh, uid) = if ul <= 15 {
+        let v = load16(up, ul);
+        (hash16(v, ul), SStr((v | (ul as u128) << 120).to_le_bytes()))
+    } else {
+        let u = std::slice::from_raw_parts(up, ul);
+        (hash_bytes(u), SStr::new(u))
+    };
+    st.keep(h, UEvent { uh, uid, eid, ingest, ts, price, cat, kind, dropped: AtomicBool::new(false) });
 }
 
 #[inline]
@@ -1426,4 +1696,212 @@ fn write_camps(path: &Path, rows: &[CampRow]) -> parquet::errors::Result<()> {
     rg.close()?;
     w.close()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        fn pick<'a>(&mut self, v: &[&'a str]) -> &'a str {
+            v[self.below(v.len())]
+        }
+    }
+
+    fn ts_value(r: &mut Rng) -> String {
+        let good = ["2028-02-20T00:00:00Z", "2028-02-29T23:59:59Z", "2028-03-01T12:30:00+05:30", "2028-02-21T01:00:00-00:00", "2028-02-25T10:00:00-10:00"];
+        let bad = ["", "2027-02-29T00:00:00Z", "2028-02-30T00:00:00Z", "2028-13-01T00:00:00Z", "2028-02-21T24:00:00Z", "2028-02-21T23:60:00Z", "2028-02-21T23:59:60Z", "2028-02-21t00:00:00Z", "2028-02-21T00:00:00z", "2028-02-21 00:00:00Z", "2028-02-21T00:00:00", "2028-02-21T00:00:00.5Z", "2028-02-21T00:00:00+24:00", "2028-02-21T00:00:00+05:60", "2028-02-21T00:00:00+0500", "1.79e12", "-5", "1835000000000.0", "00000000000000000000001835000000000", "99999999999999999999", "2028-00-10T00:00:00Z", "2028-02-00T00:00:00Z", "0000-01-01T00:00:00Z", "9999-12-31T23:59:59Z"];
+        match r.below(6) {
+            0 => r.pick(&good).to_string(),
+            1 => r.pick(&bad).to_string(),
+            2 => {
+                // F3 of any length, sometimes with leading zeros or a stray byte
+                let ms = 1835049600000u64 + r.below(20 * 86_400_000) as u64;
+                let mut s = format!("{}{}", "0".repeat(r.below(4)), ms);
+                if r.below(4) == 0 {
+                    s.truncate(1 + r.below(s.len()));
+                }
+                if r.below(8) == 0 {
+                    let k = r.below(s.len());
+                    s.replace_range(k..k + 1, r.pick(&["a", "/", ":", " ", "٢", "\r"]));
+                }
+                s
+            }
+            _ => {
+                // F1 / F2 near the window, sometimes with one byte changed
+                let (y, mo, d, h, mi, s) = (2028, 2 + r.below(2), 1 + r.below(31), r.below(25), r.below(61), r.below(61));
+                let mut v = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}");
+                v += &match r.below(3) {
+                    0 => "Z".to_string(),
+                    1 => format!("{}{:02}:{:02}", if r.below(2) == 0 { '+' } else { '-' }, r.below(25), r.below(61)),
+                    _ => r.pick(&["Z\r", "", "+05:30\r", "z"]).to_string(),
+                };
+                if r.below(10) == 0 {
+                    let k = r.below(v.len());
+                    v.replace_range(k..k + 1, r.pick(&["0", "9", ":", "-", "T", "x", "/", "\u{7f}"]));
+                }
+                v
+            }
+        }
+    }
+
+    fn line(r: &mut Rng) -> String {
+        if r.below(200) == 0 {
+            return String::new();
+        }
+        let id = |r: &mut Rng, c: char| -> String {
+            match r.below(12) {
+                0 => String::new(),
+                1 => format!("{c}{}", "x".repeat(r.below(40))),
+                2 => format!(" {c}{}", r.below(1000)),
+                _ => format!("{c}{:x}", r.next() % (1u64 << (4 * (4 + r.below(8))))),
+            }
+        };
+        let dirty = r.below(3) == 0;
+        let mut f: Vec<String> = vec![
+            id(r, 'e'),
+            id(r, 'u'),
+            ts_value(r),
+            if r.below(10) == 0 { ts_value(r) } else { "2028-02-22T00:00:00Z".to_string() },
+            r.pick(&["view", "cart", "purchase", "view", "cart", "purchase", "Purchase", "cart ", "", "views", "purchas"]).to_string(),
+            r.pick(&["p1", "p2", "p3", "P1", "", "p9999", "p2\r"]).to_string(),
+            r.pick(&["", "100", "0250", "0", "10000000", "10000001", "-5", "1.5", "12\r", "٢٥٠", "00000000000000000000000000001"]).to_string(),
+        ];
+        if !dirty {
+            let ms = 1835049600000u64 + r.below(14 * 86_400_000) as u64;
+            f[2] = r.pick(&[&ms.to_string()[..], "2028-02-21T05:00:00Z", "2028-03-01T12:30:00+05:30", "2028-02-29T23:59:59Z"]).to_string();
+            f[4] = r.pick(&["view", "cart", "purchase"]).to_string();
+            f[5] = r.pick(&["p1", "p2", "p3"]).to_string();
+        }
+        if r.below(3) == 0 {
+            f[2] = r.pick(&["2028-02-21T05:00:00Z", "2028-02-20T00:00:00Z"]).to_string();
+            f[3] = r.pick(&["2028-02-22T05:00:00Z", "2028-02-22T05:00:01Z", "2028-02-21T04:00:00Z", "2028-03-10T00:00:00Z"]).to_string();
+        }
+        for v in f.iter_mut() {
+            *v = match if dirty { r.below(14) } else { [0, 1, 2, 3, 8, 9, 10, 11, 12, 13][r.below(10)] } {
+                0..=3 => format!("\"{v}\""),
+                4 => format!("\"{v}"),
+                5 => format!("{v}\""),
+                6 if !v.is_empty() => {
+                    let k = r.below(v.len() + 1);
+                    let mut w = v.clone();
+                    if w.is_char_boundary(k) {
+                        w.insert(k, '"');
+                    }
+                    w
+                }
+                7 => r.pick(&["\"", "\"\"", "\"\"\"", "\"\"\"\"", "\"a\"b\"", "a\"\"b"]).to_string(),
+                _ => v.clone(),
+            };
+        }
+        match if dirty { r.below(40) } else { 99 } {
+            0 => {
+                f.pop();
+            }
+            1 => f.push(String::new()),
+            2 => f.insert(r.below(7), "x".to_string()),
+            3 => f[r.below(7)] = "x".repeat(100 + r.below(60)),
+            _ => {}
+        }
+        f.join(",")
+    }
+
+    fn ctx() -> Ctx {
+        let mut products = BytesMap::default();
+        products.insert(&b"p1"[..], 0u16);
+        products.insert(&b"p2"[..], 1u16);
+        Ctx {
+            ws: parse_ts(b"2028-02-20T00:00:00Z").unwrap(),
+            we: parse_ts(b"2028-03-05T00:00:00Z").unwrap(),
+            day0: 0,
+            ndays: 14,
+            ncamp: 0,
+            products,
+            campaigns: BytesMap::default(),
+            unknown_cat: 2,
+            cat_rank: vec![0, 1, 2],
+        }
+    }
+
+    fn fresh() -> EvParse {
+        EvParse { t: 3, ub: (0..UB).map(|_| Vec::new()).collect(), bad: Vec::new(), eb: (0..EB).map(|_| Vec::new()).collect() }
+    }
+
+    type Flat = (Vec<(u64, Vec<u8>, Vec<u8>, i64, i64, u32, u16, u8)>, Vec<(Vec<u8>, i64)>, Vec<(u64, u64)>);
+    fn flat(st: &EvParse) -> Flat {
+        (
+            st.ub.iter().flatten().map(|e| (e.uh, e.uid.get().to_vec(), e.eid.get().to_vec(), e.ingest, e.ts, e.price, e.cat, e.kind)).collect(),
+            st.bad.iter().map(|(e, i)| (e.get().to_vec(), *i)).collect(),
+            st.eb.iter().flatten().map(|r| (r.h, r.loc)).collect(),
+        )
+    }
+
+    #[test]
+    fn fast_parse_matches_reference() {
+        let c = ctx();
+        let mut r = Rng(0x1234_5678_9abc_def1);
+        let mut kept = 0;
+        for round in 0..300 {
+            let mut text = String::from("event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n");
+            for _ in 0..r.below(400) {
+                text += &line(&mut r);
+                text.push('\n');
+            }
+            if round % 3 == 0 {
+                text += &line(&mut r); // no trailing newline
+            }
+            let file: Bytes = Box::leak(text.into_bytes().into_boxed_slice());
+            // the same random chunking for both
+            let mut cuts = vec![0, file.len()];
+            for _ in 0..r.below(4) {
+                cuts.push(r.below(file.len() + 1));
+            }
+            cuts.sort();
+            let (mut a, mut b) = (fresh(), fresh());
+            for w in cuts.windows(2) {
+                parse_events(&c, file, w[0], w[1], &mut a);
+                for_records::<7>(file, w[0], w[1], |f| {
+                    if let Some(e) = parse_event(&c, f) {
+                        b.add(e);
+                    }
+                });
+            }
+            let (fa, fb) = (flat(&a), flat(&b));
+            kept += fb.0.len();
+            assert!(fa == fb, "round {round}: fast parse differs\n{}", std::str::from_utf8(file).unwrap());
+        }
+        assert!(kept > 1000, "too few kept events ({kept}) to mean anything");
+    }
+
+    #[test]
+    fn ts_at_matches_parse_ts() {
+        let mut r = Rng(0xfeed_beef_1357_9bdf);
+        for _ in 0..200_000 {
+            let s = ts_value(&mut r);
+            let mut buf = s.clone().into_bytes();
+            buf.extend_from_slice(&[b'7'; 32]);
+            assert_eq!(unsafe { ts_at(buf.as_ptr(), s.len()) }, parse_ts(s.as_bytes()), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn hash16_matches_hash_bytes() {
+        let mut r = Rng(42);
+        for len in 0..=16 {
+            for _ in 0..1000 {
+                let buf: Vec<u8> = (0..32).map(|_| r.next() as u8).collect();
+                assert_eq!(hash16(unsafe { load16(buf.as_ptr(), len) }, len), hash_bytes(&buf[..len]));
+            }
+        }
+    }
 }

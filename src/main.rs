@@ -173,6 +173,43 @@ unsafe fn pack_at(p: *const u8, len: usize) -> u64 {
     }
 }
 
+/// (`pack_at(p1, l1)`, `pack_at(p2, l2)`): the two IDs of a line in the two halves of one 256-bit register.
+#[inline(always)]
+unsafe fn pack2_at(p1: *const u8, l1: usize, p2: *const u8, l2: usize) -> (u64, u64) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if l1 <= 10 && l2 <= 10 {
+        use std::arch::x86_64::*;
+        // the tables of `pack_at`, once per half
+        const LO: [u8; 16] = [0x15, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1E, 0x0A, 0x0A, 0x0A, 0x0A, 0x0E];
+        const HI: [u8; 16] = [0, 0, 0, 1, 2, 4, 8, 16, 0, 0, 0, 0, 0, 0, 0, 0];
+        const OFF: [u8; 16] = [0, 0, 0, 47, 54, 54, 59, 59, 0, 0, 0, 0, 0, 0, 0, 0];
+        let lut = |t: &[u8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr() as *const __m128i));
+        let c = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(_mm_loadu_si128(p1 as *const __m128i)), _mm_loadu_si128(p2 as *const __m128i));
+        let nib = _mm256_set1_epi8(0x0F);
+        let hi = _mm256_and_si256(_mm256_srli_epi16(c, 4), nib);
+        let ok = _mm256_and_si256(_mm256_shuffle_epi8(lut(&LO), _mm256_and_si256(c, nib)), _mm256_shuffle_epi8(lut(&HI), hi));
+        let bad = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ok, _mm256_setzero_si256())) as u32;
+        let us = _mm256_and_si256(_mm256_cmpeq_epi8(c, _mm256_set1_epi8(b'_' as i8)), _mm256_set1_epi8(4));
+        let d = _mm256_and_si256(_mm256_sub_epi8(c, _mm256_add_epi8(_mm256_shuffle_epi8(lut(&OFF), hi), us)), _mm256_set1_epi8(63));
+        let w = _mm256_maddubs_epi16(d, _mm256_set1_epi16(0x0140));
+        let l = _mm256_madd_epi16(w, _mm256_set1_epi32(0x0001_1000));
+        let key = |lo: u64, l2: u64, bad: u32, len: usize| {
+            let k = ((lo & 0xffff_ffff) << 36) | ((lo >> 32) << 12) | (l2 >> 12);
+            if bad & ((1u32 << len) - 1) != 0 {
+                0
+            } else {
+                k & (u64::MAX << (60 - 6 * len))
+            }
+        };
+        let (a, b) = (_mm256_castsi256_si128(l), _mm256_extracti128_si256::<1>(l));
+        return (
+            key(_mm_cvtsi128_si64(a) as u64, _mm_extract_epi32::<2>(a) as u32 as u64, bad, l1),
+            key(_mm_cvtsi128_si64(b) as u64, _mm_extract_epi32::<2>(b) as u32 as u64, bad >> 16, l2),
+        );
+    }
+    (pack_at(p1, l1), pack_at(p2, l2))
+}
+
 /// The IDs that do not pack (longer than 10 bytes, or a byte outside [0-9A-Z_a-z]): each gets a number, exact on
 /// its bytes. Locked and slow; generated data never comes here.
 struct Interner {
@@ -212,14 +249,15 @@ impl Interner {
         }
     }
 
-    /// `key` of the `len` bytes at `p` (16 bytes must be readable).
+    /// (`key` of the `l1` bytes at `p1`, `pack_at(p2, l2)`): a second ID that does not pack comes back as 0, for
+    /// the caller to intern if it turns out to be needed. 16 bytes must be readable at both.
     #[inline(always)]
-    unsafe fn key_at(&self, p: *const u8, len: usize) -> u64 {
-        let k = pack_at(p, len);
-        if k != 0 {
-            return k;
+    unsafe fn key2_at(&self, p1: *const u8, l1: usize, p2: *const u8, l2: usize) -> (u64, u64) {
+        let (mut a, b) = pack2_at(p1, l1, p2, l2);
+        if a == 0 {
+            a = self.intern(std::slice::from_raw_parts(p1, l1));
         }
-        self.intern(std::slice::from_raw_parts(p, len))
+        (a, b)
     }
 
     /// Appends the ID of `key` to `out`.
@@ -2054,8 +2092,10 @@ unsafe fn fast_event(cx: &Ctx, line: *const u8, e: usize, m: [u64; 4], st: &mut 
         return;
     }
     let Some(ingest) = ts_memo(line.add(f.at(3)), f.len(3), &mut st.days) else { return };
-    let ekey = cx.names.key_at(ep, el);
     let (ul, pl) = (f.len(1), f.len(5));
+    let up = line.add(f.at(1));
+    // the user ID's key comes with the event ID's; 0 = it does not pack (interned below, if the event is kept)
+    let (ekey, upacked) = cx.names.key2_at(ep, el, up, ul);
     let ts = match ts_memo(line.add(f.at(2)), f.len(2), &mut st.days) {
         Some(t) if ul != 0 && pl != 0 && t >= cx.ws && t < cx.we && ingest - t <= DAY => t,
         _ => return st.log(cx, ekey, ingest, 0),
@@ -2071,7 +2111,7 @@ unsafe fn fast_event(cx: &Ctx, line: *const u8, e: usize, m: [u64; 4], st: &mut 
         }
         _ => return st.log(cx, ekey, ingest, 0),
     };
-    let ukey = cx.names.key_at(line.add(f.at(1)), ul);
+    let ukey = if upacked != 0 { upacked } else { cx.names.intern(std::slice::from_raw_parts(up, ul)) };
     st.keep(cx, ekey, ingest, ukey, ts, pay);
 }
 
@@ -2118,7 +2158,10 @@ unsafe fn fast_click(cx: &Ctx, line: *const u8, e: usize, m: [u64; 4], st: &mut 
         _ => return,
     };
     let Some(camp) = cx.campaigns.get_at(line.add(f.at(2)), f.len(2)) else { return };
-    st.click(cx, cx.names.key_at(line.add(f.at(0)), f.len(0)), cx.names.key_at(line.add(f.at(1)), f.len(1)), t, camp);
+    let (up, ul) = (line.add(f.at(1)), f.len(1));
+    let (cid, upacked) = cx.names.key2_at(line.add(f.at(0)), f.len(0), up, ul);
+    let ukey = if upacked != 0 { upacked } else { cx.names.intern(std::slice::from_raw_parts(up, ul)) };
+    st.click(cx, cid, ukey, t, camp);
 }
 
 unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: usize, st: &mut Shard) {
@@ -3460,7 +3503,7 @@ mod tests {
             ndays: 14,
             ncamp: 0,
             products,
-            campaigns: IdMap::new(&[]),
+            campaigns: IdMap::new(&[(&b"c_1"[..], 0u16), (&b"c_22"[..], 1u16), (&b"campaign-three"[..], 2u16)]),
             unknown_cat: 2,
             cat_rank: vec![0, 1, 2],
             ids: IdTable::new(16),
@@ -3706,6 +3749,80 @@ mod tests {
         assert!(check::<8>(&mut r, 100_000) > 10_000);
     }
 
+    /// `parse_clicks` against `for_records` + `click_fields`.
+    #[test]
+    fn fast_clicks_match_reference() {
+        let c = ctx();
+        let mut r = Rng(0x0c11_c5_5eed);
+        let mut kept = 0;
+        for round in 0..300 {
+            let mut text = String::from("click_id,user_id,campaign_id,ts\n");
+            for _ in 0..r.below(400) {
+                let id = |r: &mut Rng, c: char| -> String {
+                    match r.below(14) {
+                        0 => String::new(),
+                        1 => format!("{c}{}", "x".repeat(r.below(40))),
+                        2 => format!(" {c}{}", r.below(1000)),
+                        3 => format!("{c}-{}", r.below(1000)),
+                        _ => format!("{c}{:x}", r.next() % (1u64 << (4 * (4 + r.below(7))))),
+                    }
+                };
+                let mut f = vec![
+                    id(&mut r, 'k'),
+                    id(&mut r, 'u'),
+                    r.pick(&["c_1", "c_22", "campaign-three", "c_3", "C_1", "", "c_1 ", "c_22", "c_1"]).to_string(),
+                    if r.below(4) == 0 { ts_value(&mut r) } else { r.pick(&["2028-02-13T00:00:00Z", "2028-02-12T23:59:59Z", "2028-03-04T23:59:59-00:00", "1835049600000", "2028-02-25T10:00:00+05:30"]).to_string() },
+                ];
+                for v in f.iter_mut() {
+                    *v = match r.below(24) {
+                        0..=5 => format!("\"{v}\""),
+                        6 => format!("\"{v}"),
+                        7 => format!("{v}\""),
+                        8 => r.pick(&["\"", "\"\"", "\"\"\"", "a\"b"]).to_string(),
+                        _ => v.clone(),
+                    };
+                }
+                match r.below(60) {
+                    0 => {
+                        f.pop();
+                    }
+                    1 => f.push(String::new()),
+                    2 => f[r.below(4)] = "x".repeat(100 + r.below(60)),
+                    _ => {}
+                }
+                text += &f.join(",");
+                text.push('\n');
+            }
+            if round % 3 == 0 {
+                text += "k1,u1,c_1,2028-02-25T10:00:00Z"; // no trailing newline
+            }
+            let len = text.len();
+            let mut padded = text.clone().into_bytes();
+            padded.extend_from_slice(&[b'\n'; PAD]);
+            let file: Bytes = Box::leak(text.into_bytes().into_boxed_slice());
+            let mut cuts = vec![0, len];
+            for _ in 0..r.below(4) {
+                cuts.push(r.below(len + 1));
+            }
+            cuts.sort();
+            let (mut a, mut b) = (Shard::new(16, 16), Shard::new(16, 16));
+            for w in cuts.windows(2) {
+                unsafe { parse_clicks(&c, padded.as_ptr(), w[0], w[1], len, &mut a) };
+                for_records::<4>(file, w[0], w[1], |f| click_fields(&c, f, &mut b));
+                b.flush(&c, false);
+            }
+            let clicks = |st: &Shard| {
+                let mut v: Vec<_> = st.ck.iter().flat_map(|s| s.slices(CK_BLOCK)).flatten().map(|r| (r.cid, r.person, r.ts, r.camp)).collect();
+                v.sort();
+                v
+            };
+            let (ca, cb) = (clicks(&a), clicks(&b));
+            kept += cb.len();
+            assert!(ca == cb, "round {round}: fast clicks differ\n{}", std::str::from_utf8(file).unwrap());
+        }
+        assert!(kept > 1000, "too few kept clicks ({kept}) to mean anything");
+    }
+
     #[test]
     fn ts_at_matches_parse_ts() {
         let mut r = Rng(0xfeed_beef_1357_9bdf);
@@ -3741,6 +3858,11 @@ mod tests {
             buf.extend((0..32).map(|_| r.next() as u8));
             let k = pack(&id);
             assert_eq!(unsafe { pack_at(buf.as_ptr(), len) }, k, "{id:?}");
+            // as either half of a pair, beside an ID of another length
+            let other: Vec<u8> = (0..32).map(|j| if j < i % 14 { alphabet[r.below(63)] } else { r.next() as u8 }).collect();
+            let ko = pack(&other[..i % 14]);
+            assert_eq!(unsafe { pack2_at(buf.as_ptr(), len, other.as_ptr(), i % 14) }, (k, ko), "{id:?}");
+            assert_eq!(unsafe { pack2_at(other.as_ptr(), i % 14, buf.as_ptr(), len) }, (ko, k), "{id:?}");
             if k == 0 {
                 continue;
             }
@@ -3771,7 +3893,12 @@ mod tests {
                             buf[at] = c;
                         }
                         buf.extend([tail; 32]);
-                        assert_eq!(unsafe { pack_at(buf.as_ptr(), len) }, pack(&buf[..len]), "{:?}", &buf[..len]);
+                        let want = pack(&buf[..len]);
+                        assert_eq!(unsafe { pack_at(buf.as_ptr(), len) }, want, "{:?}", &buf[..len]);
+                        let peer = b"u_9Zz\xFF,,,,,,,,,,,,,,,,,,,,,,,,,,";
+                        let pl = (at + c as usize) % 7;
+                        assert_eq!(unsafe { pack2_at(buf.as_ptr(), len, peer.as_ptr(), pl) }, (want, pack(&peer[..pl])), "{:?}", &buf[..len]);
+                        assert_eq!(unsafe { pack2_at(peer.as_ptr(), pl, buf.as_ptr(), len) }, (pack(&peer[..pl]), want), "{:?}", &buf[..len]);
                     }
                 }
             }

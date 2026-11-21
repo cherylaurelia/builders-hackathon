@@ -907,7 +907,9 @@ fn main() {
     let lap = |what: &str| {
         let (c, ins) = usage();
         let (c0, i0) = usage0.get();
-        eprintln!("[{:7.3}s wall, {:6.3}s cpu, {:6.2}G ins] {what}", t0.elapsed().as_secs_f64(), c - c0, (ins - i0) as f64 / 1e9);
+        // one write(2) per line: eprintln! issues one per formatted piece
+        let line = format!("[{:7.3}s wall, {:6.3}s cpu, {:6.2}G ins] {what}\n", t0.elapsed().as_secs_f64(), c - c0, (ins - i0) as f64 / 1e9);
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
         usage0.set((c, ins));
     };
 
@@ -921,7 +923,11 @@ fn main() {
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
 
-    // products -> categories; "unknown" is its own category, never one of the file's
+    // products -> categories and campaigns, on a side thread while the links are built (7 ms of serial start-up)
+    let tables = {
+        let data = data.clone();
+        std::thread::spawn(move || {
+    // "unknown" is its own category, never one of the file's
     let mut cat_names: Vec<Bytes> = Vec::new();
     let mut cat_idx: BytesMap<u16> = BytesMap::default();
     let mut products: BytesMap<u16> = BytesMap::default();
@@ -954,12 +960,16 @@ fn main() {
         camp_ids.push(c);
         camp_channel.push(ch);
     }
-    let ncamp = camp_ids.len();
-    lap("small tables");
+    (cat_names, products, unknown_cat, cat_rank, camp_ids, camp_channel, campaigns)
+        })
+    };
 
     // 1. links, on every thread before anything else: small, and a side thread would trail the event parse
     let links = build_links(&csv_files(&data.join("links")), threads);
     lap(&format!("links built: {} linked ids", links.iter().map(|m| m.len()).sum::<usize>()));
+    let (cat_names, products, unknown_cat, cat_rank, camp_ids, camp_channel, campaigns) = tables.join().unwrap_or_else(|_| die("tables thread panicked"));
+    let ncamp = camp_ids.len();
+    lap("small tables");
 
     let ctx = Ctx { ws, we, day0, ndays, ncamp, products, campaigns, unknown_cat, cat_rank };
 
@@ -2364,19 +2374,20 @@ struct ColSpec {
     ty: i32,
     optional: bool,
     converted: Option<i32>,
+    dict: bool, // dictionary encoded when the file has rows
 }
 
 const fn col(name: &'static str, ty: i32, converted: Option<i32>) -> ColSpec {
-    ColSpec { name, ty, optional: false, converted }
+    ColSpec { name, ty, optional: false, converted, dict: false }
 }
 
 const USER_COLS: [ColSpec; 6] = [
-    col("user_id", T_BYTES, Some(CT_UTF8)),
+    ColSpec { dict: true, ..col("user_id", T_BYTES, Some(CT_UTF8)) },
     col("day", T_INT32, Some(CT_DATE)),
     col("sessions", T_INT32, None),
     col("events", T_INT32, None),
     col("revenue_cents", T_INT64, None),
-    ColSpec { name: "top_category", ty: T_BYTES, optional: true, converted: Some(CT_UTF8) },
+    ColSpec { optional: true, ..col("top_category", T_BYTES, Some(CT_UTF8)) },
 ];
 
 const CAMP_COLS: [ColSpec; 7] = [
@@ -2394,40 +2405,71 @@ const PAGE_ROWS: usize = 16384;
 /// Room reserved in front of a page body for its Thrift page header, which is written backwards from here.
 const HDR_ROOM: usize = 48;
 
-/// Writes `path` with one row group of `n` rows. `fill(i, lo, hi, buf)` appends the PLAIN body of the data page of
-/// column i holding rows lo..hi to `buf` (for the optional column: the definition levels first, as a length-prefixed
-/// RLE/bit-packed run).
-fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(usize, usize, usize, &mut Vec<u8>)) -> std::io::Result<()> {
+/// `fill` is called with this `lo` for the dictionary page of a dictionary-encoded column.
+const DICT_PAGE: usize = usize::MAX;
+
+/// A Thrift PageHeader into `page[at..HDR_ROOM]`, written backwards from `HDR_ROOM`; returns `at`.
+/// `dict`: a dictionary page of `nvals` entries; else a data page of `nvals` values in encoding `enc`.
+fn page_header(page: &mut [u8], dict: bool, nvals: usize, enc: i32) -> usize {
+    let size = (page.len() - HDR_ROOM) as i32;
+    let mut h = Thrift::new();
+    h.begin();
+    h.i32(1, if dict { 2 } else { 0 }); // DICTIONARY_PAGE, DATA_PAGE
+    h.i32(2, size);
+    h.i32(3, size);
+    if dict {
+        h.sub(7);
+        h.i32(1, nvals as i32);
+        h.i32(2, 0); // PLAIN
+    } else {
+        h.sub(5);
+        h.i32(1, nvals as i32);
+        h.i32(2, enc);
+        h.i32(3, 3); // definition levels: RLE
+        h.i32(4, 3); // repetition levels: RLE
+    }
+    h.end();
+    h.end();
+    assert!(h.b.len() <= HDR_ROOM);
+    let at = HDR_ROOM - h.b.len();
+    page[at..HDR_ROOM].copy_from_slice(&h.b);
+    at
+}
+
+/// Writes `path` with one row group of `n` rows. `fill(i, lo, hi, buf)` appends the body of the data page of column i
+/// holding rows lo..hi to `buf` (PLAIN, or RLE_DICTIONARY for a dictionary column: bit width, then RLE/bit-packed
+/// indices); for the optional column the definition levels come first, as a length-prefixed RLE/bit-packed run.
+/// A dictionary column (`dict`, when n > 0) first gets `fill(i, DICT_PAGE, 0, buf)`: the PLAIN dictionary page, whose
+/// number of entries `fill` returns.
+fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(usize, usize, usize, &mut Vec<u8>) -> usize) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = std::fs::File::create(path)?;
     f.write_all(b"PAR1")?;
     let mut off = 4i64;
     let mut page = Vec::new();
-    let mut chunks = Vec::with_capacity(cols.len()); // (offset, size)
-    for i in 0..cols.len() {
-        let start = off;
+    let mut chunks = Vec::with_capacity(cols.len()); // (offset, size, dictionary page offset, first data page offset)
+    for (i, c) in cols.iter().enumerate() {
+        let (start, use_dict) = (off, c.dict && n > 0);
+        let (mut dict_off, mut data_off) = (None, off);
+        if use_dict {
+            page.clear();
+            page.resize(HDR_ROOM, 0);
+            let entries = fill(i, DICT_PAGE, 0, &mut page);
+            i32::try_from(page.len() - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
+            let at = page_header(&mut page, true, entries, 0);
+            f.write_all(&page[at..])?;
+            dict_off = Some(off);
+            off += (page.len() - at) as i64;
+            data_off = off;
+        }
         let mut lo = 0;
         loop {
             let hi = (lo + PAGE_ROWS).min(n);
             page.clear();
             page.resize(HDR_ROOM, 0);
             fill(i, lo, hi, &mut page);
-            let size = i32::try_from(page.len() - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
-            let mut h = Thrift::new();
-            h.begin();
-            h.i32(1, 0); // DATA_PAGE
-            h.i32(2, size);
-            h.i32(3, size);
-            h.sub(5);
-            h.i32(1, (hi - lo) as i32); // num_values
-            h.i32(2, 0); // PLAIN
-            h.i32(3, 3); // definition levels: RLE
-            h.i32(4, 3); // repetition levels: RLE
-            h.end();
-            h.end();
-            assert!(h.b.len() <= HDR_ROOM);
-            let at = HDR_ROOM - h.b.len();
-            page[at..HDR_ROOM].copy_from_slice(&h.b);
+            i32::try_from(page.len() - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
+            let at = page_header(&mut page, false, hi - lo, if use_dict { 8 } else { 0 }); // RLE_DICTIONARY, PLAIN
             f.write_all(&page[at..])?;
             off += (page.len() - at) as i64;
             lo = hi;
@@ -2435,7 +2477,7 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
                 break;
             }
         }
-        chunks.push((start, off - start));
+        chunks.push((start, off - start, dict_off, data_off));
     }
     let mut t = Thrift::new();
     t.begin();
@@ -2463,21 +2505,31 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
     t.list(4, Thrift::STRUCT, 1);
     t.begin();
     t.list(1, Thrift::STRUCT, cols.len());
-    for (c, &(o, size)) in cols.iter().zip(&chunks) {
+    for (c, &(o, size, dict_off, data_off)) in cols.iter().zip(&chunks) {
         t.begin();
         t.i64(2, o); // file_offset
         t.sub(3); // ColumnMetaData
         t.i32(1, c.ty);
-        t.list(2, Thrift::I32, 2);
-        t.elem_i32(0); // PLAIN
-        t.elem_i32(3); // RLE
+        if dict_off.is_some() {
+            t.list(2, Thrift::I32, 3);
+            t.elem_i32(0); // PLAIN: the dictionary page
+            t.elem_i32(3); // RLE
+            t.elem_i32(8); // RLE_DICTIONARY
+        } else {
+            t.list(2, Thrift::I32, 2);
+            t.elem_i32(0); // PLAIN
+            t.elem_i32(3); // RLE
+        }
         t.list(3, Thrift::BINARY, 1);
         t.elem_str(c.name);
         t.i32(4, 0); // UNCOMPRESSED
         t.i64(5, n as i64);
         t.i64(6, size);
         t.i64(7, size);
-        t.i64(9, o); // data_page_offset
+        t.i64(9, data_off); // data_page_offset
+        if let Some(d) = dict_off {
+            t.i64(11, d); // dictionary_page_offset
+        }
         t.end();
         t.end();
     }
@@ -2587,18 +2639,58 @@ fn put_fixed<const W: usize>(b: &mut Vec<u8>, part: &[&[UserRow]], f: impl Fn(&U
     }
 }
 
+/// One run of the RLE/bit-packed hybrid: `run` copies of the `vb`-byte value `idx`.
+fn put_run(b: &mut Vec<u8>, run: usize, idx: u32, vb: usize) {
+    let mut v = (run as u64) << 1;
+    while v >= 0x80 {
+        b.push(v as u8 | 0x80);
+        v >>= 7;
+    }
+    b.push(v as u8);
+    b.extend_from_slice(&idx.to_le_bytes()[..vb]);
+}
+
 fn write_users(path: &Path, segs: &[&[UserRow]], cat_names: &[Bytes]) -> std::io::Result<()> {
     let n: usize = segs.iter().map(|s| s.len()).sum();
     let mut part: Vec<&[UserRow]> = Vec::new();
     let mut run: Vec<u8> = Vec::new();
+    // user_id is dictionary encoded: one entry per run of equal IDs (a person's days are consecutive rows), and
+    // the data pages are runs of that entry's index
+    let (mut entries, mut idx, mut last): (usize, u32, Option<SStr>) = (0, u32::MAX, None);
     // sessions and events stay far below 2^31: main() refuses inputs with that many events
     write_parquet(path, &USER_COLS, n, |c, lo, hi, b| {
+        if c == 0 && lo == DICT_PAGE {
+            let mut prev: Option<SStr> = None;
+            for r in segs.iter().flat_map(|s| s.iter()) {
+                if prev != Some(r.name) {
+                    put_name(b, &r.name);
+                    entries += 1;
+                    prev = Some(r.name);
+                }
+            }
+            (idx, last) = (u32::MAX, None);
+            return entries;
+        }
         page_slices(segs, lo, hi, &mut part);
         match c {
             0 => {
-                b.reserve((hi - lo) * 20 + 64);
+                let w = (usize::BITS - (entries.max(2) - 1).leading_zeros()) as usize;
+                b.push(w as u8);
+                let mut count = 0;
                 for r in part.iter().flat_map(|s| s.iter()) {
-                    put_name(b, &r.name);
+                    if last == Some(r.name) {
+                        count += 1;
+                    } else {
+                        if count > 0 {
+                            put_run(b, count, idx, w.div_ceil(8));
+                        }
+                        idx = idx.wrapping_add(1);
+                        last = Some(r.name);
+                        count = 1;
+                    }
+                }
+                if count > 0 {
+                    put_run(b, count, idx, w.div_ceil(8));
                 }
             }
             1 => put_fixed(b, &part, |r| r.day.to_le_bytes()),
@@ -2638,6 +2730,7 @@ fn write_users(path: &Path, segs: &[&[UserRow]], cat_names: &[Bytes]) -> std::io
                 }
             }
         }
+        0
     })
 }
 
@@ -2653,6 +2746,7 @@ fn write_camps(path: &Path, rows: &[CampRow]) -> std::io::Result<()> {
             5 => plain_i64(b, rows.iter().map(|r| r.5)),
             _ => plain_i64(b, rows.iter().map(|r| r.6)),
         }
+        0
     })
 }
 

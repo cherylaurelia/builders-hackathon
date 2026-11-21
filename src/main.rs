@@ -12,7 +12,7 @@ use memmap2::Mmap;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
 type Bytes = &'static [u8];
@@ -163,9 +163,11 @@ impl Hasher for IdHasher {
 }
 type PreMap<V> = HashMap<PreHashed, V, BuildHasherDefault<IdHasher>>;
 
+/// The person bucket an unlinked ID would have: such events and clicks never move in phase 4b.
 #[inline]
 fn uid_bucket(h: u64) -> usize {
-    ((h >> 44) as usize) & (UB - 1)
+    const _: () = assert!(UB == PB);
+    person_bucket(h)
 }
 
 #[inline]
@@ -642,11 +644,15 @@ fn csv_files(dir: &Path) -> Vec<Bytes> {
 
 /// (file, start, end) pieces of about CHUNK bytes, largest files first.
 fn chunks(files: &[Bytes]) -> Vec<(Bytes, usize, usize)> {
+    chunks_of(files, CHUNK)
+}
+
+fn chunks_of(files: &[Bytes], size: usize) -> Vec<(Bytes, usize, usize)> {
     let mut out = Vec::new();
     for &f in files {
         let mut s = 0;
         while s < f.len() {
-            let e = (s + CHUNK).min(f.len());
+            let e = (s + size).min(f.len());
             out.push((f, s, e));
             s = e;
         }
@@ -683,7 +689,8 @@ fn die(msg: &str) -> ! {
 
 /// `n` empty vectors, each with room for about `total / (threads * n)` items (+25% for uneven shares).
 fn sized<T>(n: usize, total: usize, threads: usize) -> Vec<Vec<T>> {
-    let each = total / (threads * n).max(1) * 5 / 4 + 16;
+    // a multiple of 5 keeps a Vec<UEvent> buffer a whole number of PEvents (to_pevents); doubling preserves it
+    let each = (total / (threads * n).max(1) * 5 / 4 + 16).next_multiple_of(5);
     (0..n).map(|_| Vec::with_capacity(each)).collect()
 }
 
@@ -809,6 +816,30 @@ struct PEvent {
     kind: u8,
 }
 
+/// The PEvents `f` makes of the events of `v`, written over `v`'s own buffer when its byte size is a whole
+/// number of PEvents (a PEvent is smaller, so the write position never passes the read position).
+fn to_pevents(v: Vec<UEvent>, mut f: impl FnMut(&UEvent) -> Option<PEvent>) -> Vec<PEvent> {
+    use std::mem::{align_of, size_of};
+    const _: () = assert!(size_of::<PEvent>() <= size_of::<UEvent>() && align_of::<PEvent>() == align_of::<UEvent>());
+    let bytes = v.capacity() * size_of::<UEvent>();
+    if bytes % size_of::<PEvent>() != 0 {
+        return v.iter().filter_map(f).collect();
+    }
+    let mut v = std::mem::ManuallyDrop::new(v);
+    let (src, len) = (v.as_mut_ptr(), v.len());
+    let dst = src as *mut PEvent;
+    let mut k = 0;
+    for i in 0..len {
+        // event i is read whole before PEvent k <= i is written, and PEvent k ends before event i + 1 starts
+        let e = unsafe { std::ptr::read(src.add(i)) };
+        if let Some(p) = f(&e) {
+            unsafe { std::ptr::write(dst.add(k), p) };
+            k += 1;
+        }
+    }
+    unsafe { Vec::from_raw_parts(dst, k, bytes / size_of::<PEvent>()) }
+}
+
 /// A valid click, routed to its person's bucket.
 #[derive(Clone, Copy)]
 struct PClick {
@@ -905,9 +936,9 @@ fn main() {
     let ncamp = camp_ids.len();
     lap("small tables");
 
-    // 1. links, on their own thread: nothing needs them until phase 4b
-    let link_files = csv_files(&data.join("links"));
-    let links_job = std::thread::spawn(move || build_links(&link_files, (threads / 4).max(1)));
+    // 1. links, on every thread before anything else: small, and a side thread would trail the event parse
+    let links = build_links(&csv_files(&data.join("links")), threads);
+    lap(&format!("links built: {} linked ids", links.iter().map(|m| m.len()).sum::<usize>()));
 
     let ctx = Ctx { ws, we, day0, ndays, ncamp, products, campaigns, unknown_cat, cat_rank };
 
@@ -1031,39 +1062,90 @@ fn main() {
     );
     lap("clicks parsed");
 
-    let links = links_job.join().unwrap_or_else(|_| die("link builder panicked"));
-    lap(&format!("links joined: {} linked ids", links.iter().map(|m| m.len()).sum::<usize>()));
-
-    // 4b. per user_id bucket: user_id -> person through that bucket's slice of the link table
+    // 4b. per user_id bucket, which is also the person bucket of an unlinked ID: user_id -> person through that
+    //     bucket's slice of the link table. Events and clicks stay where they are, rewritten in place, unless
+    //     their person's name hashes to another bucket: only those are copied out.
     let n_ev: usize = parsed.iter().flat_map(|t| t.ub.iter()).map(|v| v.len()).sum();
     let n_ck: usize = clicks.iter().flatten().map(|v| v.len()).sum();
+    let nt = parsed.len();
+    let mut ev_in: Vec<Vec<Vec<UEvent>>> = (0..UB).map(|_| Vec::with_capacity(nt)).collect();
+    for t in &mut parsed {
+        for (u, v) in t.ub.drain(..).enumerate() {
+            ev_in[u].push(v);
+        }
+    }
+    let nc = clicks.len();
+    let mut ck_in: Vec<Vec<Vec<PClick>>> = (0..UB).map(|_| Vec::with_capacity(nc)).collect();
+    for t in clicks {
+        for (u, v) in t.into_iter().enumerate() {
+            ck_in[u].push(v);
+        }
+    }
+    let work: Vec<std::sync::Mutex<(Vec<Vec<UEvent>>, Vec<Vec<PClick>>)>> =
+        ev_in.into_iter().zip(ck_in).map(std::sync::Mutex::new).collect();
     let resolved = par(
         threads,
         UB,
-        || (sized::<PEvent>(PB, n_ev, threads), sized::<PClick>(PB, n_ck, threads)),
-        |(oe, oc), u| {
+        || (Vec::new(), sized::<PEvent>(PB, n_ev / 2, threads), sized::<PClick>(PB, n_ck / 2, threads)),
+        |(stay, oe, oc), u| {
+            let (evs, mut cks) = std::mem::take(&mut *work[u].lock().unwrap_or_else(|_| die("resolve poisoned")));
             let map = &links[u];
             let person = |h: u64, s: SStr| map.get(&PreHashed { h, s }).copied().unwrap_or((s, h));
-            for t in &parsed {
-                for e in &t.ub[u] {
-                    if e.dropped.load(Relaxed) {
-                        continue;
-                    }
-                    let (name, nh) = person(e.uh, e.uid);
-                    oe[person_bucket(nh)].push(PEvent { nh, name, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
-                }
-            }
-            for t in &clicks {
-                for c in &t[u] {
+            let evs: Vec<Vec<PEvent>> = evs
+                .into_iter()
+                .map(|v| {
+                    to_pevents(v, |e| {
+                        if e.dropped.load(Relaxed) {
+                            return None;
+                        }
+                        let (name, nh) = person(e.uh, e.uid);
+                        let pe = PEvent { nh, name, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind };
+                        let p = person_bucket(nh);
+                        if p == u {
+                            return Some(pe);
+                        }
+                        oe[p].push(pe);
+                        None
+                    })
+                })
+                .collect();
+            for v in &mut cks {
+                v.retain_mut(|c| {
                     let (name, nh) = person(c.nh, c.name);
-                    oc[person_bucket(nh)].push(PClick { nh, name, ..*c });
-                }
+                    let p = person_bucket(nh);
+                    if p == u {
+                        c.nh = nh;
+                        c.name = name;
+                        return true;
+                    }
+                    oc[p].push(PClick { nh, name, ..*c });
+                    false
+                });
             }
+            stay.push((u, evs, cks));
         },
     );
     drop(parsed);
-    drop(clicks);
-    let (routed, clicks): (Vec<_>, Vec<_>) = resolved.into_iter().unzip();
+    drop(work);
+    // sources for the sessions phase: what stayed, per parse thread, then what moved, per resolve thread
+    let mut stay_e: Vec<Vec<Vec<PEvent>>> = (0..nt).map(|_| (0..PB).map(|_| Vec::new()).collect()).collect();
+    let mut stay_c: Vec<Vec<Vec<PClick>>> = (0..nc).map(|_| (0..PB).map(|_| Vec::new()).collect()).collect();
+    let mut routed = Vec::new();
+    let mut clicks = Vec::new();
+    for (stay, oe, oc) in resolved {
+        for (u, evs, cks) in stay {
+            for (t, v) in evs.into_iter().enumerate() {
+                stay_e[t][u] = v;
+            }
+            for (t, v) in cks.into_iter().enumerate() {
+                stay_c[t][u] = v;
+            }
+        }
+        routed.push(oe);
+        clicks.push(oc);
+    }
+    let routed: Vec<Vec<Vec<PEvent>>> = stay_e.into_iter().chain(routed).collect();
+    let clicks: Vec<Vec<Vec<PClick>>> = stay_c.into_iter().chain(clicks).collect();
     lap("user ids resolved");
 
     // 5. per person bucket
@@ -1115,65 +1197,178 @@ fn main() {
     fast_exit(threads)
 }
 
+/// Per user_id bucket: every linked ID -> (its person's name, hash(name)). All stages run on `threads` threads.
+/// A node is (bucket, index in that bucket) packed as `bucket << 24 | index`; union-find runs on dense
+/// numbers `base[bucket] + index`, always linking the larger root under the smaller.
 fn build_links(files: &[Bytes], threads: usize) -> Vec<PreMap<(SStr, u64)>> {
-    let ch = chunks(files);
+    const IX: u32 = 24;
+    // A. parse: each ID goes to its bucket's list as (hash, ID); each line leaves two endpoints, (bucket, position)
+    struct LParse {
+        ends: Vec<u32>,
+        occ: Vec<Vec<(u64, SStr)>>,
+    }
+    let ch = chunks_of(files, 1 << 18);
+    let est = files.iter().map(|f| f.len()).sum::<usize>() / 10; // lines are ~20 bytes, two IDs each
     let parts = par(
         threads,
         ch.len(),
-        Vec::<(Bytes, Bytes)>::new,
-        |v, i| {
+        || LParse { ends: Vec::new(), occ: sized(UB, est, threads) },
+        |st, i| {
             let (f, s, e) = ch[i];
             for_records::<2>(f, s, e, |[a, b]| {
-                if !a.is_empty() && !b.is_empty() {
-                    v.push((a, b));
+                if a.is_empty() || b.is_empty() {
+                    return;
+                }
+                for id in [a, b] {
+                    let h = hash_bytes(id);
+                    let u = uid_bucket(h);
+                    if st.occ[u].len() >= 1 << IX {
+                        die("too many link lines");
+                    }
+                    st.ends.push(((u as u32) << IX) | st.occ[u].len() as u32);
+                    st.occ[u].push((h, SStr::new(id)));
                 }
             });
         },
     );
-    let mut ids: BytesMap<u32> = BytesMap::default();
-    let mut names: Vec<Bytes> = Vec::new();
-    let mut parent: Vec<u32> = Vec::new();
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            let g = parent[parent[x as usize] as usize];
-            parent[x as usize] = g;
+
+    // B. per bucket: number the distinct IDs (exact on the bytes). `local` holds the number of every listed ID,
+    //    thread lists in order, so endpoint (u, j) of thread t is local[u][off[u][t] + j]
+    let interned = par(
+        threads,
+        UB,
+        Vec::<(usize, PreMap<(SStr, u64)>, Vec<(SStr, u64)>, Vec<u32>)>::new,
+        |out, u| {
+            let n: usize = parts.iter().map(|p| p.occ[u].len()).sum();
+            let mut map: PreMap<(SStr, u64)> = PreMap::with_capacity_and_hasher(n, Default::default());
+            let mut ids: Vec<(SStr, u64)> = Vec::with_capacity(n);
+            let mut local: Vec<u32> = Vec::with_capacity(n);
+            for p in &parts {
+                for &(h, s) in &p.occ[u] {
+                    let li = map
+                        .entry(PreHashed { h, s })
+                        .or_insert_with(|| {
+                            ids.push((s, h));
+                            (s, (ids.len() - 1) as u64)
+                        })
+                        .1 as u32;
+                    local.push(li);
+                }
+            }
+            if ids.len() >= 1 << IX {
+                die("too many linked IDs in one bucket");
+            }
+            out.push((u, map, ids, local));
+        },
+    );
+    let mut by_bucket: Vec<Option<(PreMap<(SStr, u64)>, Vec<(SStr, u64)>, Vec<u32>)>> = (0..UB).map(|_| None).collect();
+    for (u, map, ids, local) in interned.into_iter().flatten() {
+        by_bucket[u] = Some((map, ids, local));
+    }
+    let (mut maps, mut ids, mut local) = (Vec::with_capacity(UB), Vec::with_capacity(UB), Vec::with_capacity(UB));
+    for (m, i, l) in by_bucket.into_iter().map(|x| x.unwrap_or_default()) {
+        maps.push(std::sync::Mutex::new(m));
+        ids.push(i);
+        local.push(l);
+    }
+    let nt = parts.len();
+    let mut base = vec![0u32; UB + 1];
+    let mut off = vec![0u32; UB * nt];
+    for u in 0..UB {
+        base[u + 1] = base[u] + ids[u].len() as u32;
+        let mut o = 0;
+        for (t, p) in parts.iter().enumerate() {
+            off[u * nt + t] = o;
+            o += p.occ[u].len() as u32;
+        }
+    }
+    let n = base[UB] as usize;
+    let dense = |t: usize, e: u32| {
+        let u = (e >> IX) as usize;
+        base[u] + local[u][(off[u * nt + t] + (e & ((1 << IX) - 1))) as usize]
+    };
+
+    // C. join: lock-free union-find; a parent is always smaller than its child, so links only go downhill
+    let parent: Vec<AtomicU32> = (0..n as u32).map(AtomicU32::new).collect();
+    let find = |mut x: u32| -> u32 {
+        loop {
+            let p = parent[x as usize].load(Relaxed);
+            if p == x {
+                return x;
+            }
+            let g = parent[p as usize].load(Relaxed);
+            if g != p {
+                let _ = parent[x as usize].compare_exchange_weak(p, g, Relaxed, Relaxed);
+            }
             x = g;
         }
-        x
-    }
-    let mut intern = |s: Bytes, names: &mut Vec<Bytes>, parent: &mut Vec<u32>| -> u32 {
-        *ids.entry(s).or_insert_with(|| {
-            names.push(s);
-            parent.push(parent.len() as u32);
-            (names.len() - 1) as u32
-        })
     };
-    for v in &parts {
-        for &(a, b) in v {
-            let x = intern(a, &mut names, &mut parent);
-            let y = intern(b, &mut names, &mut parent);
-            let (rx, ry) = (find(&mut parent, x), find(&mut parent, y));
-            if rx != ry {
-                parent[rx.max(ry) as usize] = rx.min(ry);
+    let jobs: Vec<(usize, usize)> = parts
+        .iter()
+        .enumerate()
+        .flat_map(|(t, p)| (0..p.ends.len()).step_by(1 << 16).map(move |s| (t, s)))
+        .collect();
+    par(
+        threads,
+        jobs.len(),
+        || (),
+        |_, j| {
+            let (t, s) = jobs[j];
+            let ends = &parts[t].ends;
+            for k in (s..(s + (1 << 16)).min(ends.len())).step_by(2) {
+                let (mut x, mut y) = (dense(t, ends[k]), dense(t, ends[k + 1]));
+                loop {
+                    x = find(x);
+                    y = find(y);
+                    if x == y {
+                        break;
+                    }
+                    let (lo, hi) = (x.min(y), x.max(y));
+                    if parent[hi as usize].compare_exchange(hi, lo, Relaxed, Relaxed).is_ok() {
+                        break;
+                    }
+                }
             }
-        }
-    }
-    let n = names.len();
-    let mut best: Vec<u32> = (0..n as u32).collect();
-    for i in 0..n {
-        let r = find(&mut parent, i as u32) as usize;
-        if names[i] < names[best[r] as usize] {
-            best[r] = i as u32;
-        }
-    }
-    let mut maps: Vec<PreMap<(SStr, u64)>> = (0..UB).map(|_| PreMap::default()).collect();
-    for i in 0..n {
-        let r = find(&mut parent, i as u32) as usize;
-        let name = names[best[r] as usize];
-        let h = hash_bytes(names[i]);
-        maps[uid_bucket(h)].insert(PreHashed { h, s: SStr::new(names[i]) }, (SStr::new(name), hash_bytes(name)));
-    }
-    maps
+        },
+    );
+
+    // D. name each person by the byte-wise smallest of their IDs
+    let best: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(u32::MAX)).collect();
+    let id_of = |p: u32| ids[(p >> IX) as usize][(p & ((1 << IX) - 1)) as usize];
+    par(
+        threads,
+        UB,
+        || (),
+        |_, u| {
+            for li in 0..ids[u].len() as u32 {
+                let me = ((u as u32) << IX) | li;
+                let r = find(base[u] + li) as usize;
+                let mine = id_of(me).0;
+                let mut cur = best[r].load(Relaxed);
+                while cur == u32::MAX || mine.get() < id_of(cur).0.get() {
+                    match best[r].compare_exchange_weak(cur, me, Relaxed, Relaxed) {
+                        Ok(_) => break,
+                        Err(v) => cur = v,
+                    }
+                }
+            }
+        },
+    );
+
+    // E. every linked ID -> its person's name
+    par(
+        threads,
+        UB,
+        || (),
+        |_, u| {
+            let mut map = maps[u].lock().unwrap_or_else(|_| die("link map poisoned"));
+            for v in map.values_mut() {
+                let r = find(base[u] + v.1 as u32) as usize;
+                *v = id_of(best[r].load(Relaxed));
+            }
+        },
+    );
+    maps.into_iter().map(|m| m.into_inner().unwrap_or_else(|_| die("link map poisoned"))).collect()
 }
 
 #[inline]

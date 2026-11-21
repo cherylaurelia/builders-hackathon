@@ -198,8 +198,9 @@ unsafe fn pack2(pa: *const u8, la: usize, pb: *const u8, lb: usize) -> (u64, u64
         use std::arch::x86_64::*;
         // the first `len` bytes of an ID's 16: KEEP read from 16 - len is `len` ones, then zeros
         static KEEP: [u8; 32] = [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let id = |p: *const u8, len: usize| _mm_and_si128(_mm_loadu_si128(p as *const __m128i), _mm_loadu_si128(KEEP.as_ptr().add(16 - len) as *const __m128i));
-        let c = _mm256_inserti128_si256(_mm256_castsi128_si256(id(pa, la)), id(pb, lb), 1);
+        let two = |pa: *const u8, pb: *const u8| _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128(pa as *const __m128i)), _mm_loadu_si128(pb as *const __m128i), 1);
+        let keep = two(KEEP.as_ptr().add(16 - la), KEEP.as_ptr().add(16 - lb));
+        let c = _mm256_and_si256(two(pa, pb), keep);
         // classes and offsets as in `pack16`
         const LO: [u8; 16] = [13, 15, 15, 15, 15, 15, 15, 15, 15, 15, 14, 2, 2, 2, 2, 6];
         const HI: [u8; 16] = [0, 0, 0, 1, 2, 4, 2, 8, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -207,22 +208,22 @@ unsafe fn pack2(pa: *const u8, la: usize, pb: *const u8, lb: usize) -> (u64, u64
         let tbl = |t: &[u8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr() as *const __m128i));
         let hi = _mm256_and_si256(_mm256_srli_epi16(c, 4), _mm256_set1_epi8(0x0F));
         let class = _mm256_and_si256(_mm256_shuffle_epi8(tbl(&LO), c), _mm256_shuffle_epi8(tbl(&HI), hi));
-        let invalid = _mm256_movemask_epi8(_mm256_cmpeq_epi8(class, _mm256_setzero_si256())) as u32;
-        if invalid & (((1u32 << la) - 1) | ((1u32 << lb) - 1) << 16) != 0 {
-            // one of them holds a byte outside the alphabet: each on its own
+        // a kept byte without a class is outside the alphabet
+        if _mm256_testz_si256(_mm256_cmpeq_epi8(class, _mm256_setzero_si256()), keep) == 0 {
+            // one of them holds such a byte: each on its own
             return (pack16(load16(pa, la), la), pack16(load16(pb, lb), lb));
         }
         let us = _mm256_cmpeq_epi8(c, _mm256_set1_epi8(b'_' as i8));
         let off = _mm256_add_epi8(_mm256_shuffle_epi8(tbl(&OFF), hi), _mm256_and_si256(us, _mm256_set1_epi8(4)));
         let d = _mm256_sub_epi8(c, off);
         let w = _mm256_maddubs_epi16(d, _mm256_set1_epi16(0x0140));
+        // per ID, three numbers of 24 bits: digits 0..4 in bytes 0..3, digits 4..8 in bytes 4..7, digits 8..10
+        // (above 12 zero bits) in bytes 8..11
         let l = _mm256_madd_epi16(w, _mm256_set1_epi32(0x0001_1000));
-        let key = |l: __m128i| {
-            let lo = _mm_cvtsi128_si64(l) as u64;
-            let l2 = _mm_extract_epi32(l, 2) as u32 as u64;
-            ((lo & 0xffff_ffff) << 36) | ((lo >> 32) << 12) | (l2 >> 12)
-        };
-        return (key(_mm256_castsi256_si128(l)), key(_mm256_extracti128_si256(l, 1)));
+        // their bytes side by side: bits 4.. are the key (the 4 below are zero bits of the third number)
+        const SIDE: [u8; 16] = [9, 10, 4, 5, 6, 0, 1, 2, 128, 128, 128, 128, 128, 128, 128, 128];
+        let k = _mm256_srli_epi64(_mm256_shuffle_epi8(l, tbl(&SIDE)), 4);
+        return (_mm256_extract_epi64(k, 0) as u64, _mm256_extract_epi64(k, 2) as u64);
     }
     #[allow(unreachable_code)]
     (pack16(load16(pa, la), la), pack16(load16(pb, lb), lb))
@@ -642,6 +643,19 @@ impl IdTable {
     fn slot_in_line(&self, home: u32, key: u64, ins: &mut usize) -> Option<u32> {
         // SAFETY: as in `slot_from`
         let s = unsafe { self.slots.as_ptr().add(home as usize) };
+        // the four keys compared at once: a slot is 16 bytes, its key the first 8, so the keys are the even
+        // 64-bit words of the line. A word read while another thread stores a key there is the key or zero.
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        unsafe {
+            use std::arch::x86_64::*;
+            let kv = _mm256_set1_epi64x(key as i64);
+            let a = _mm256_cmpeq_epi64(kv, _mm256_loadu_si256(s as *const __m256i));
+            let b = _mm256_cmpeq_epi64(kv, _mm256_loadu_si256(s.add(2) as *const __m256i));
+            let m = (_mm256_movemask_pd(_mm256_castsi256_pd(a)) | _mm256_movemask_pd(_mm256_castsi256_pd(b)) << 4) as u32 & 0x55;
+            if m != 0 {
+                return Some(home + m.trailing_zeros() / 2);
+            }
+        }
         let k = [0, 1, 2, 3].map(|j| unsafe { (*s.add(j)).key.load(Relaxed) });
         let m = (k[0] == key) as u32 | ((k[1] == key) as u32) << 1 | ((k[2] == key) as u32) << 2 | ((k[3] == key) as u32) << 3;
         if m != 0 {
@@ -1175,6 +1189,19 @@ fn swar8(d: u64) -> u64 {
     ((d & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32))).wrapping_add(((d >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32))) >> 32
 }
 
+/// `parse_ts` on the 13 bytes at `p`, F3 of today's length: its first five digits behind three zero bytes, and its
+/// last eight.
+#[inline(always)]
+unsafe fn ts13_at(p: *const u8) -> Option<i64> {
+    const Z: u64 = u64::from_le_bytes([b'0'; 8]);
+    let a = ((p as *const u64).read_unaligned() << 24) ^ (Z << 24);
+    let b = (p.add(5) as *const u64).read_unaligned() ^ Z;
+    if (a.wrapping_add(0x7676_7676_7676_7676) | a | b.wrapping_add(0x7676_7676_7676_7676) | b) & HI != 0 {
+        return None;
+    }
+    Some((swar8(a) * 100_000_000 + swar8(b)) as i64)
+}
+
 /// `parse_ts` on the `len` bytes at `p`.
 #[inline(always)]
 unsafe fn ts_at(p: *const u8, len: usize) -> Option<i64> {
@@ -1199,14 +1226,7 @@ unsafe fn ts_at(p: *const u8, len: usize) -> Option<i64> {
         return parse_ts(std::slice::from_raw_parts(p, len));
     }
     if len == 13 {
-        // F3 of today's length: its first five digits behind three zero bytes, and its last eight
-        const Z: u64 = u64::from_le_bytes([b'0'; 8]);
-        let a = ((p as *const u64).read_unaligned() << 24) ^ (Z << 24);
-        let b = (p.add(5) as *const u64).read_unaligned() ^ Z;
-        if (a.wrapping_add(0x7676_7676_7676_7676) | a | b.wrapping_add(0x7676_7676_7676_7676) | b) & HI != 0 {
-            return None;
-        }
-        return Some((swar8(a) * 100_000_000 + swar8(b)) as i64);
+        return ts13_at(p);
     }
     // F3 of 1..=16 bytes: right-align into 16 bytes behind leading '0's, check all digits, convert
     let sh = 8 * (16 - len) as u32;
@@ -1230,17 +1250,27 @@ struct Day {
 const NO_DAY: Day = Day { a: 0, b: u32::MAX, ms: 0 };
 
 /// `ts_at` that remembers the dates it has checked (by day of month), so an F1 or F2 timestamp of a known date
-/// costs two compares and the time of day.
+/// costs two compares and the time of day. A 13-digit F3 goes straight to `ts13_at`.
 #[inline(always)]
-unsafe fn ts_memo(p: *const u8, len: usize, days: &mut [Day; 32]) -> Option<i64> {
+unsafe fn ts_memo(p: *const u8, len: usize, days: &mut [Day; 64]) -> Option<i64> {
     let at = |i: usize| *p.add(i);
     let f1 = len == 20 && at(19) == b'Z';
-    if !f1 && !(len == 25 && (at(19) == b'+' || at(19) == b'-') && at(22) == b':') {
-        return ts_at(p, len);
+    if !f1 {
+        if len == 13 {
+            return ts13_at(p);
+        }
+        if !(len == 25 && (at(19) == b'+' || at(19) == b'-') && at(22) == b':') {
+            return ts_at(p, len);
+        }
     }
     let a = (p as *const u64).read_unaligned();
     let b = (p.add(8) as *const u32).read_unaligned() & 0xFF_FFFF;
-    let day = &mut days[(((b & 15) * 10 + ((b >> 8) & 15)) & 31) as usize];
+    // the slot: the low two bits of the day's tens digit and the low four of its units digit, apart for 01..=31
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    let slot = std::arch::x86_64::_pext_u32(b, 0x0F03);
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    let slot = (b & 3) | ((b >> 6) & 0x3C);
+    let day = &mut days[(slot & 63) as usize];
     if day.a != a || day.b != b {
         // a date not seen yet, or a bad one: the full check; a good one is remembered
         let t = ts_at(p, len)?;
@@ -1250,13 +1280,11 @@ unsafe fn ts_memo(p: *const u8, len: usize, days: &mut [Day; 32]) -> Option<i64>
     // HH:MM:SS as in `civil_at`
     let x = (p.add(11) as *const u64).read_unaligned() ^ u64::from_le_bytes(*b"00:00:00");
     const ADD: u64 = u64::from_le_bytes([0x76, 0x76, 0x7F, 0x76, 0x76, 0x7F, 0x76, 0x76]);
-    if (x.wrapping_add(ADD) | x) & HI != 0 {
-        return None;
-    }
-    // hours in byte 0, minutes in byte 3, seconds in byte 6, each 0..=99
-    let pb = (x * 10 + (x >> 8)) & 0x00FF_0000_FF00_00FF;
-    // adding 127 - 23 (127 - 59) carries an hour over 23 (a minute or second over 59) into its byte's high bit
-    if pb.wrapping_add(0x0044_0000_4400_0068) & 0x0080_0000_8000_0080 != 0 {
+    // hours in byte 0, minutes in byte 3, seconds in byte 6, each 0..=99 when x is all digits
+    let pb = (x.wrapping_mul(10).wrapping_add(x >> 8)) & 0x00FF_0000_FF00_00FF;
+    // adding 127 - 23 (127 - 59) carries an hour over 23 (a minute or second over 59) into its byte's high bit:
+    // one test for the digits and the three ranges
+    if ((x.wrapping_add(ADD) | x) & HI) | (pb.wrapping_add(0x0044_0000_4400_0068) & 0x0080_0000_8000_0080) != 0 {
         return None;
     }
     // one multiply: h * 3600 + mi * 60 + sec (17 bits) lands at bit 48 of the product; the other terms end below
@@ -1775,7 +1803,7 @@ struct Shard {
     ins: usize,
     ring: [Pend; RING],
     head: usize, // events or clicks put in the ring since the last flush
-    days: [Day; 32],
+    days: [Day; 64],
 }
 // SAFETY: the streams own their blocks; after the parse they are only read, except for `ERec::person` of distinct
 // records written by the dedup phase while nothing reads them
@@ -1820,18 +1848,20 @@ impl Shard {
             ins: 0,
             ring: [Pend::default(); RING],
             head: 0,
-            days: [NO_DAY; 32],
+            days: [NO_DAY; 64],
         }
     }
 
     /// Queues `p`; returns the one queued RING entries ago, whose slot is in the cache by now.
     #[inline(always)]
     fn queue(&mut self, p: Pend) -> Option<Pend> {
-        let i = self.head & (RING - 1);
-        let old = if self.head >= RING { Some(self.ring[i]) } else { None };
-        self.ring[i] = p;
+        let old = std::mem::replace(&mut self.ring[self.head & (RING - 1)], p);
         self.head += 1;
-        old
+        if self.head > RING {
+            Some(old)
+        } else {
+            None
+        }
     }
 
     /// Finishes everything still queued: events when `events`, else clicks. Call at the end of every chunk.
@@ -1866,7 +1896,8 @@ impl Shard {
     #[inline(always)]
     fn log(&mut self, cx: &Ctx, ekey: u64, ingest: i64, loc: u64) {
         let q = (spread(ekey) >> cx.qshift) as usize;
-        self.lg[q].push(&mut self.arena, LG_BLOCK, LRec { key: ekey, ingest, loc });
+        // SAFETY: q < 2^qbits, the number of streams (`Shard::new`)
+        unsafe { self.lg.get_unchecked_mut(q) }.push(&mut self.arena, LG_BLOCK, LRec { key: ekey, ingest, loc });
     }
 
     /// A valid, non-late event: into its person's partition, plus its dedup record, once its user ID is at hand.
@@ -1881,7 +1912,8 @@ impl Shard {
 
     #[inline(always)]
     fn put_event(&mut self, cx: &Ctx, p: Pend, person: u32) {
-        let rec = self.ev[(person >> cx.pshift) as usize].push(&mut self.arena, EV_BLOCK, ERec { person, ts: p.ts, pay: p.x });
+        // SAFETY: a person is a slot number, below 2^id_bits; shifted, below 2^pbits, the number of streams
+        let rec = unsafe { self.ev.get_unchecked_mut((person >> cx.pshift) as usize) }.push(&mut self.arena, EV_BLOCK, ERec { person, ts: p.ts, pay: p.x });
         self.log(cx, p.a, p.b, rec as u64);
     }
 
@@ -1897,7 +1929,8 @@ impl Shard {
 
     #[inline(always)]
     fn put_click(&mut self, cx: &Ctx, p: Pend, person: u32) {
-        self.ck[(person >> cx.pshift) as usize].push(&mut self.arena, CK_BLOCK, CRec::new(p.a, person & ((1 << cx.pshift) - 1), p.ts, p.x));
+        // SAFETY: as in `put_event`
+        unsafe { self.ck.get_unchecked_mut((person >> cx.pshift) as usize) }.push(&mut self.arena, CK_BLOCK, CRec::new(p.a, person & ((1 << cx.pshift) - 1), p.ts, p.x));
     }
 }
 
@@ -4110,7 +4143,7 @@ mod tests {
     #[test]
     fn timestamps_match_general_parser() {
         let mut r = Rng(7);
-        let mut days = [NO_DAY; 32];
+        let mut days = [NO_DAY; 64];
         for _ in 0..300_000 {
             let mut s: Vec<u8> = match r.below(4) {
                 0 => format!("2028-0{}-{:02}T{:02}:{:02}:{:02}Z", 2 + r.below(2), r.below(32), r.below(25), r.below(61), r.below(61)).into_bytes(),
@@ -4215,7 +4248,7 @@ mod tests {
     #[test]
     fn ts_at_matches_parse_ts() {
         let mut r = Rng(0xfeed_beef_1357_9bdf);
-        let mut days = [NO_DAY; 32];
+        let mut days = [NO_DAY; 64];
         let mut hits = 0;
         for _ in 0..200_000 {
             let s = ts_value(&mut r);

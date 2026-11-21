@@ -1152,7 +1152,7 @@ const NO_DAY: Day = Day { a: 0, b: u32::MAX, ms: 0 };
 /// `ts_at` that remembers the dates it has checked (by day of month), so an F1 or F2 timestamp of a known date
 /// costs two compares and the time of day.
 #[inline(always)]
-unsafe fn ts_memo(p: *const u8, len: usize, days: &mut [Day; 32]) -> Option<i64> {
+unsafe fn ts_memo(p: *const u8, len: usize, days: &mut [Day; 64]) -> Option<i64> {
     let at = |i: usize| *p.add(i);
     let f1 = len == 20 && at(19) == b'Z';
     if !f1 && !(len == 25 && (at(19) == b'+' || at(19) == b'-') && at(22) == b':') {
@@ -1160,7 +1160,12 @@ unsafe fn ts_memo(p: *const u8, len: usize, days: &mut [Day; 32]) -> Option<i64>
     }
     let a = (p as *const u64).read_unaligned();
     let b = (p.add(8) as *const u32).read_unaligned() & 0xFF_FFFF;
-    let day = &mut days[(((b & 15) * 10 + ((b >> 8) & 15)) & 31) as usize];
+    // the slot: the low two bits of the tens digit and the four of the units digit, apart for the days 01..=31
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    let slot = std::arch::x86_64::_pext_u32(b, 0x0F03);
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    let slot = (b & 3) | ((b >> 6) & 0x3C);
+    let day = &mut days[(slot & 63) as usize];
     if day.a != a || day.b != b {
         // a date not seen yet, or a bad one: the full check; a good one is remembered
         let t = ts_at(p, len)?;
@@ -1170,15 +1175,16 @@ unsafe fn ts_memo(p: *const u8, len: usize, days: &mut [Day; 32]) -> Option<i64>
     // HH:MM:SS as in `civil_at`
     let x = (p.add(11) as *const u64).read_unaligned() ^ u64::from_le_bytes(*b"00:00:00");
     const ADD: u64 = u64::from_le_bytes([0x76, 0x76, 0x7F, 0x76, 0x76, 0x7F, 0x76, 0x76]);
-    if (x.wrapping_add(ADD) | x) & HI != 0 {
+    // bytes 0, 3, 6 of pb: hour, minute, second, each under 100 when x is all digits; adding 0x7F - max sets a
+    // byte's high bit when it is over max, so one test covers the digits and the three ranges
+    let pb = x.wrapping_mul(10).wrapping_add(x >> 8);
+    const OVER: u64 = u64::from_le_bytes([0x7F - 23, 0, 0, 0x7F - 59, 0, 0, 0x7F - 59, 0]);
+    const OVER_AT: u64 = u64::from_le_bytes([0x80, 0, 0, 0x80, 0, 0, 0x80, 0]);
+    if ((x.wrapping_add(ADD) | x) & HI) | (pb.wrapping_add(OVER) & OVER_AT) != 0 {
         return None;
     }
-    let pb = x * 10 + (x >> 8);
     let (h, mi, sec) = (pb & 0xFF, (pb >> 24) & 0xFF, (pb >> 48) & 0xFF);
-    if (h > 23) | (mi > 59) | (sec > 59) {
-        return None;
-    }
-    let t = day.ms + (h * 3_600_000 + mi * 60_000 + sec * 1000) as i64;
+    let t = day.ms + ((h * 3600 + mi * 60 + sec) * 1000) as i64;
     if f1 {
         return Some(t);
     }
@@ -1449,7 +1455,8 @@ fn fast_split<const N: usize>(e: usize, [c0, c1, q0, q1]: [u64; 4]) -> Option<Fi
     let (y0, y1) = ((q0 << 1) & b0, ((q1 << 1) | (q0 >> 63)) & b1);
     let (d0, borrow) = y0.overflowing_sub(x0);
     let d1 = y1.wrapping_sub(x1).wrapping_sub(borrow as u64);
-    if (q0 & !(s0 | ends0)) | (x0 & ends0) | (d0 & b0) | (q1 & !(s1 | ends1)) | (x1 & ends1) | (d1 & b1) != 0 {
+    // a quote is in place when it is a start or an end and not both: s ^ ends
+    if (q0 & !(s0 ^ ends0)) | (d0 & b0) | (q1 & !(s1 ^ ends1)) | (d1 & b1) != 0 {
         return None;
     }
     // The comma offsets, one a byte: N - 1 slots from each word (a slot past a word's last comma holds 64 or
@@ -1605,7 +1612,7 @@ struct Shard {
     ins: usize,
     ring: [Pend; RING],
     head: usize, // events or clicks put in the ring since the last flush
-    days: [Day; 32],
+    days: [Day; 64],
 }
 // SAFETY: the streams own their blocks; after the parse they are only read, except for `ERec::person` of distinct
 // records written by the dedup phase while nothing reads them
@@ -1650,18 +1657,20 @@ impl Shard {
             ins: 0,
             ring: [Pend::default(); RING],
             head: 0,
-            days: [NO_DAY; 32],
+            days: [NO_DAY; 64],
         }
     }
 
     /// Queues `p`; returns the one queued RING entries ago, whose slot is in the cache by now.
     #[inline(always)]
     fn queue(&mut self, p: Pend) -> Option<Pend> {
-        let i = self.head & (RING - 1);
-        let old = if self.head >= RING { Some(self.ring[i]) } else { None };
-        self.ring[i] = p;
+        let old = std::mem::replace(&mut self.ring[self.head & (RING - 1)], p);
         self.head += 1;
-        old
+        if self.head > RING {
+            Some(old)
+        } else {
+            None
+        }
     }
 
     /// Finishes everything still queued: events when `events`, else clicks. Call at the end of every chunk.
@@ -2207,14 +2216,15 @@ unsafe fn fast_event(cx: &Ctx, line: *const u8, e: usize, m: [u64; 4], st: &mut 
     };
     let (kp, kl) = (line.add(f.at(4)), f.len(4));
     let w = (kp as *const u64).read_unaligned();
-    let pay = match kl {
-        4 if w as u32 == u32::from_le_bytes(*b"view") || w as u32 == u32::from_le_bytes(*b"cart") => 0,
-        8 if w == u64::from_le_bytes(*b"purchase") => {
-            let Some(p) = parse_price(std::slice::from_raw_parts(line.add(f.at(6)), f.len(6))) else { return st.log(cx, ekey, ingest, 0) };
-            let cat = cx.products.get_at(line.add(f.at(5)), pl).unwrap_or(cx.unknown_cat);
-            (cat as u32) << 24 | p
-        }
-        _ => return st.log(cx, ekey, ingest, 0),
+    // view or cart, as one test: which of the two it is has no pattern for a branch to learn
+    let pay = if (kl == 4) & ((w as u32 == u32::from_le_bytes(*b"view")) | (w as u32 == u32::from_le_bytes(*b"cart"))) {
+        0
+    } else if kl == 8 && w == u64::from_le_bytes(*b"purchase") {
+        let Some(p) = parse_price(std::slice::from_raw_parts(line.add(f.at(6)), f.len(6))) else { return st.log(cx, ekey, ingest, 0) };
+        let cat = cx.products.get_at(line.add(f.at(5)), pl).unwrap_or(cx.unknown_cat);
+        (cat as u32) << 24 | p
+    } else {
+        return st.log(cx, ekey, ingest, 0);
     };
     let ukey = if upacked != 0 { upacked } else { cx.names.intern(std::slice::from_raw_parts(up, ul)) };
     st.keep(cx, ekey, ingest, ukey, ts, pay);
@@ -4060,10 +4070,50 @@ mod tests {
         assert!(kept > 1000, "too few kept clicks ({kept}) to mean anything");
     }
 
+    /// Every one-byte change of F1 and F2 timestamps through `ts_memo`, their dates remembered or not; then random
+    /// values with the memo kept across them.
+    #[test]
+    fn ts_memo_matches_parse_ts() {
+        let seeds = ["2028-02-29T23:59:59Z", "2027-12-31T00:00:00Z", "2028-03-01T12:34:56+05:30", "2026-10-03T19:58:10-04:00", "2028-02-21T09:08:07Z"];
+        for warm in [false, true] {
+            let mut days = [NO_DAY; 64];
+            for seed in seeds {
+                for i in 0..seed.len() {
+                    for c in 0..=255u8 {
+                        if warm {
+                            // the date of the changed value, if it is one, and the seed's own are remembered first
+                            let mut b = seed.as_bytes().to_vec();
+                            b[i] = c;
+                            b.splice(10.., *b"T00:00:00Z");
+                            b.extend_from_slice(&[b'7'; 32]);
+                            unsafe { ts_memo(b.as_ptr(), 20, &mut days) };
+                            let mut b = seed.as_bytes().to_vec();
+                            b.extend_from_slice(&[b'7'; 32]);
+                            unsafe { ts_memo(b.as_ptr(), seed.len(), &mut days) };
+                        }
+                        let mut b = seed.as_bytes().to_vec();
+                        b[i] = c;
+                        let want = parse_ts(&b);
+                        b.extend_from_slice(&[b'7'; 32]);
+                        assert_eq!(unsafe { ts_memo(b.as_ptr(), seed.len(), &mut days) }, want, "{:?} warm {warm}", String::from_utf8_lossy(&b[..seed.len()]));
+                    }
+                }
+            }
+        }
+        let mut r = Rng(0x5eed_0f_da75);
+        let mut days = [NO_DAY; 64];
+        for _ in 0..300_000 {
+            let s = ts_value(&mut r);
+            let mut buf = s.clone().into_bytes();
+            buf.extend_from_slice(&[b'7'; 32]);
+            assert_eq!(unsafe { ts_memo(buf.as_ptr(), s.len(), &mut days) }, parse_ts(s.as_bytes()), "{s:?}");
+        }
+    }
+
     #[test]
     fn ts_at_matches_parse_ts() {
         let mut r = Rng(0xfeed_beef_1357_9bdf);
-        let mut days = [NO_DAY; 32];
+        let mut days = [NO_DAY; 64];
         let mut hits = 0;
         for _ in 0..200_000 {
             let s = ts_value(&mut r);

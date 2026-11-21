@@ -62,17 +62,6 @@ fn hash_bytes(b: &[u8]) -> u64 {
     mix(h)
 }
 
-/// The `len` (<= 16) bytes at `p`, zero padded to 16; reads 16 bytes.
-#[inline(always)]
-unsafe fn load16(p: *const u8, len: usize) -> u128 {
-    let v = (p as *const u128).read_unaligned();
-    if len == 0 {
-        0
-    } else {
-        v & (u128::MAX >> (128 - 8 * len as u32))
-    }
-}
-
 /// Hasher for byte-string keys: one call to `write` carries the whole key.
 #[derive(Default)]
 struct BytesHasher(u64);
@@ -141,39 +130,46 @@ fn pack(b: &[u8]) -> u64 {
     v << (6 * (10 - b.len()))
 }
 
-/// `pack` of the `len` (<= 16) bytes whose `load16` is `v`.
+/// `pack` of the `len` bytes at `p`, for any `len`; 16 bytes must be readable.
+///
+/// The class of a byte comes from its two nibbles. With rows 3..=7 the high nibbles of the 63 bytes that pack, a
+/// byte packs when its low nibble is one the row of its high nibble allows: `LO[low] & HI[high] != 0`, one bit a
+/// row. Its digit is the byte less its row's offset (`_`, alone in its row, 4 more). The bytes past `len` may be
+/// anything: each digit is cut to its 6 bits, so it stays in its own place, and the places past `len` are cleared
+/// at the end.
 #[inline(always)]
-fn pack16(v: u128, len: usize) -> u64 {
+unsafe fn pack_at(p: *const u8, len: usize) -> u64 {
     if len > 10 {
         return 0;
     }
     #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
-    unsafe {
+    {
         use std::arch::x86_64::*;
-        let c = _mm_set_epi64x((v >> 64) as i64, v as i64);
-        let rng = |lo: u8, hi: u8| _mm_and_si128(_mm_cmpgt_epi8(c, _mm_set1_epi8(lo as i8 - 1)), _mm_cmpgt_epi8(_mm_set1_epi8(hi as i8 + 1), c));
-        let (dg, up, lw) = (rng(b'0', b'9'), rng(b'A', b'Z'), rng(b'a', b'z'));
-        let us = _mm_cmpeq_epi8(c, _mm_set1_epi8(b'_' as i8));
-        let valid = _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(dg, up), _mm_or_si128(us, lw))) as u32;
-        let need = (1u32 << len) - 1;
-        if valid & need != need {
+        // rows 3 4 5 6 7 = bits 1 2 4 8 16; allowed low nibbles: 0..=9 | 1..=15 | 0..=10, 15 | 1..=15 | 0..=10
+        const LO: [u8; 16] = [0x15, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1E, 0x0A, 0x0A, 0x0A, 0x0A, 0x0E];
+        const HI: [u8; 16] = [0, 0, 0, 1, 2, 4, 8, 16, 0, 0, 0, 0, 0, 0, 0, 0];
+        const OFF: [u8; 16] = [0, 0, 0, 47, 54, 54, 59, 59, 0, 0, 0, 0, 0, 0, 0, 0];
+        let lut = |t: &[u8; 16]| _mm_loadu_si128(t.as_ptr() as *const __m128i);
+        let c = _mm_loadu_si128(p as *const __m128i);
+        let nib = _mm_set1_epi8(0x0F);
+        let hi = _mm_and_si128(_mm_srli_epi16(c, 4), nib);
+        let ok = _mm_and_si128(_mm_shuffle_epi8(lut(&LO), _mm_and_si128(c, nib)), _mm_shuffle_epi8(lut(&HI), hi));
+        let bad = _mm_movemask_epi8(_mm_cmpeq_epi8(ok, _mm_setzero_si128())) as u32;
+        if bad & ((1u32 << len) - 1) != 0 {
             return 0;
         }
-        // digit = byte - offset of its class; the zero bytes past `len` are in no class and stay 0
-        let off = _mm_or_si128(
-            _mm_or_si128(_mm_and_si128(dg, _mm_set1_epi8(47)), _mm_and_si128(up, _mm_set1_epi8(54))),
-            _mm_or_si128(_mm_and_si128(us, _mm_set1_epi8(58)), _mm_and_si128(lw, _mm_set1_epi8(59))),
-        );
-        let d = _mm_sub_epi8(c, off);
+        let us = _mm_and_si128(_mm_cmpeq_epi8(c, _mm_set1_epi8(b'_' as i8)), _mm_set1_epi8(4));
+        let d = _mm_and_si128(_mm_sub_epi8(c, _mm_add_epi8(_mm_shuffle_epi8(lut(&OFF), hi), us)), _mm_set1_epi8(63));
         let w = _mm_maddubs_epi16(d, _mm_set1_epi16(0x0140)); // two digits -> 12 bits
         let l = _mm_madd_epi16(w, _mm_set1_epi32(0x0001_1000)); // four digits -> 24 bits
         let lo = _mm_cvtsi128_si64(l) as u64;
         let l2 = _mm_extract_epi32(l, 2) as u32 as u64;
-        return ((lo & 0xffff_ffff) << 36) | ((lo >> 32) << 12) | (l2 >> 12);
+        let k = ((lo & 0xffff_ffff) << 36) | ((lo >> 32) << 12) | (l2 >> 12);
+        return k & (u64::MAX << (60 - 6 * len)); // len 0: only bits never set are kept
     }
     #[allow(unreachable_code)]
     {
-        pack(&v.to_le_bytes()[..len])
+        pack(std::slice::from_raw_parts(p, len))
     }
 }
 
@@ -219,11 +215,9 @@ impl Interner {
     /// `key` of the `len` bytes at `p` (16 bytes must be readable).
     #[inline(always)]
     unsafe fn key_at(&self, p: *const u8, len: usize) -> u64 {
-        if len <= 10 {
-            let k = pack16(load16(p, len), len);
-            if k != 0 {
-                return k;
-            }
+        let k = pack_at(p, len);
+        if k != 0 {
+            return k;
         }
         self.intern(std::slice::from_raw_parts(p, len))
     }
@@ -1785,11 +1779,9 @@ impl IdMap {
     /// `get` of the `len` bytes at `p` (16 bytes must be readable).
     #[inline(always)]
     unsafe fn get_at(&self, p: *const u8, len: usize) -> Option<u16> {
-        if len <= 10 {
-            let k = pack16(load16(p, len), len);
-            if k != 0 {
-                return self.packed(k);
-            }
+        let k = pack_at(p, len);
+        if k != 0 {
+            return self.packed(k);
         }
         self.other.get(std::slice::from_raw_parts(p, len)).copied()
     }
@@ -3499,7 +3491,7 @@ mod tests {
     }
 
     #[test]
-    fn pack16_matches_pack_and_keeps_order() {
+    fn pack_at_matches_pack_and_keeps_order() {
         let mut r = Rng(42);
         let alphabet: Vec<u8> = (0u8..=255).filter(|&c| PACK[c as usize] != 0).collect();
         assert_eq!(alphabet.len(), 63);
@@ -3514,7 +3506,7 @@ mod tests {
             let mut buf = id.clone();
             buf.extend((0..32).map(|_| r.next() as u8));
             let k = pack(&id);
-            assert_eq!(pack16(unsafe { load16(buf.as_ptr(), len) }, len), k, "{id:?}");
+            assert_eq!(unsafe { pack_at(buf.as_ptr(), len) }, k, "{id:?}");
             if k == 0 {
                 continue;
             }
@@ -3530,6 +3522,26 @@ mod tests {
         let (a, b, c) = (names.key(b"user-with-dash"), names.key(b"user-with-dash"), names.key(b" u1"));
         assert!(a == b && a != c && a & INTERNED != 0);
         assert!(names.less(c, pack(b"u1")) && names.less(pack(b"u1"), a) && !names.less(a, a));
+    }
+
+    /// Every byte value at every place of an ID of every length, among bytes that pack and before bytes that do not.
+    #[test]
+    fn pack_at_matches_pack() {
+        let mut r = Rng(7);
+        for len in 0..=16usize {
+            for at in 0..len.max(1) {
+                for c in 0..=255u8 {
+                    for tail in [0u8, b'a', 0xFF, b'_', b','] {
+                        let mut buf: Vec<u8> = (0..len).map(|_| b"09AZ_az5Qk"[r.below(10)]).collect();
+                        if len > 0 {
+                            buf[at] = c;
+                        }
+                        buf.extend([tail; 32]);
+                        assert_eq!(unsafe { pack_at(buf.as_ptr(), len) }, pack(&buf[..len]), "{:?}", &buf[..len]);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

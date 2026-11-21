@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
-use std::sync::Arc;
 use std::time::Instant;
 
 type Bytes = &'static [u8];
@@ -984,6 +983,8 @@ fn main() {
     let user_parts: Vec<&[UserRow]> = results.iter().map(|r| r.rows.as_slice()).collect();
     write_outputs(&out, &user_parts, &camp_rows, &cat_names, threads);
     lap(&format!("written: {} user rows, {} campaign rows", user_parts.iter().map(|p| p.len()).sum::<usize>(), camp_rows.len()));
+    // everything is on disk: no destructors, the memory is released in parallel
+    fast_exit(threads)
 }
 
 fn build_links(files: &[Bytes], threads: usize) -> Vec<PreMap<(SStr, u64)>> {
@@ -1293,28 +1294,226 @@ fn finish_row(mut r: UserRow, cats: &mut Vec<(u16, i64)>, rank: &[u32]) -> UserR
 }
 
 // ---------------------------------------------------------------- Parquet
-
-use parquet::basic::Compression;
-use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
-use parquet::file::properties::WriterProperties;
-use parquet::file::writer::SerializedFileWriter;
-use parquet::schema::parser::parse_message_type;
-
-fn props() -> Arc<WriterProperties> {
-    Arc::new(
-        WriterProperties::builder()
-            .set_compression(Compression::UNCOMPRESSED)
-            .set_dictionary_enabled(false)
-            .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
-            .build(),
-    )
-}
-
-fn ba(b: &[u8]) -> ByteArray {
-    ByteArray::from(b.to_vec())
-}
+//
+// Hand-written writer: one row group per file, one PLAIN page per column, no compression, no statistics.
+// The footer is Thrift compact protocol (FileMetaData).
 
 type CampRow = (Bytes, Bytes, i32, i64, i64, i64, i64);
+
+/// Thrift compact protocol writer for the few structs a Parquet footer needs.
+struct Thrift {
+    b: Vec<u8>,
+    last: i16,
+    stack: Vec<i16>,
+}
+
+impl Thrift {
+    const I32: u8 = 5;
+    const I64: u8 = 6;
+    const BINARY: u8 = 8;
+    const LIST: u8 = 9;
+    const STRUCT: u8 = 12;
+
+    fn new() -> Thrift {
+        Thrift { b: Vec::new(), last: 0, stack: Vec::new() }
+    }
+    fn varint(&mut self, mut v: u64) {
+        while v >= 0x80 {
+            self.b.push(v as u8 | 0x80);
+            v >>= 7;
+        }
+        self.b.push(v as u8);
+    }
+    fn field(&mut self, id: i16, ty: u8) {
+        let d = id - self.last;
+        if (1..=15).contains(&d) {
+            self.b.push((d as u8) << 4 | ty);
+        } else {
+            self.b.push(ty);
+            self.varint(((id << 1) ^ (id >> 15)) as u16 as u64);
+        }
+        self.last = id;
+    }
+    fn i32(&mut self, id: i16, v: i32) {
+        self.field(id, Self::I32);
+        self.varint(((v << 1) ^ (v >> 31)) as u32 as u64);
+    }
+    fn i64(&mut self, id: i16, v: i64) {
+        self.field(id, Self::I64);
+        self.varint(((v << 1) ^ (v >> 63)) as u64);
+    }
+    fn str(&mut self, id: i16, s: &str) {
+        self.field(id, Self::BINARY);
+        self.varint(s.len() as u64);
+        self.b.extend_from_slice(s.as_bytes());
+    }
+    /// List header; the elements follow (i32s via `elem_i32`, strings via `elem_str`, structs via `begin`..`end`).
+    fn list(&mut self, id: i16, elem: u8, n: usize) {
+        self.field(id, Self::LIST);
+        if n < 15 {
+            self.b.push((n as u8) << 4 | elem);
+        } else {
+            self.b.push(0xF0 | elem);
+            self.varint(n as u64);
+        }
+    }
+    fn elem_i32(&mut self, v: i32) {
+        self.varint(((v << 1) ^ (v >> 31)) as u32 as u64);
+    }
+    fn elem_str(&mut self, s: &str) {
+        self.varint(s.len() as u64);
+        self.b.extend_from_slice(s.as_bytes());
+    }
+    /// Starts a struct as field `id` of the current struct.
+    fn sub(&mut self, id: i16) {
+        self.field(id, Self::STRUCT);
+        self.begin();
+    }
+    /// Starts a struct (list element, or the top level).
+    fn begin(&mut self) {
+        self.stack.push(self.last);
+        self.last = 0;
+    }
+    fn end(&mut self) {
+        self.b.push(0);
+        self.last = self.stack.pop().unwrap();
+    }
+}
+
+const T_INT32: i32 = 1;
+const T_INT64: i32 = 2;
+const T_BYTES: i32 = 6;
+const CT_UTF8: i32 = 0;
+const CT_DATE: i32 = 6;
+
+struct ColSpec {
+    name: &'static str,
+    ty: i32,
+    optional: bool,
+    converted: Option<i32>,
+}
+
+const fn col(name: &'static str, ty: i32, converted: Option<i32>) -> ColSpec {
+    ColSpec { name, ty, optional: false, converted }
+}
+
+const USER_COLS: [ColSpec; 6] = [
+    col("user_id", T_BYTES, Some(CT_UTF8)),
+    col("day", T_INT32, Some(CT_DATE)),
+    col("sessions", T_INT64, None),
+    col("events", T_INT64, None),
+    col("revenue_cents", T_INT64, None),
+    ColSpec { name: "top_category", ty: T_BYTES, optional: true, converted: Some(CT_UTF8) },
+];
+
+const CAMP_COLS: [ColSpec; 7] = [
+    col("campaign_id", T_BYTES, Some(CT_UTF8)),
+    col("channel", T_BYTES, Some(CT_UTF8)),
+    col("day", T_INT32, Some(CT_DATE)),
+    col("sessions", T_INT64, None),
+    col("purchasing_sessions", T_INT64, None),
+    col("revenue_cents", T_INT64, None),
+    col("assisted_sessions", T_INT64, None),
+];
+
+/// Writes `path` with one row group of `n` rows. `fill(i, buf)` appends column i's PLAIN page body to `buf`
+/// (for the optional column: the definition levels first, as a length-prefixed RLE/bit-packed run).
+fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(usize, &mut Vec<u8>)) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::io::BufWriter::with_capacity(1 << 16, std::fs::File::create(path)?);
+    f.write_all(b"PAR1")?;
+    let mut off = 4i64;
+    let mut body = Vec::new();
+    let mut chunks = Vec::with_capacity(cols.len()); // (offset, size)
+    for i in 0..cols.len() {
+        body.clear();
+        fill(i, &mut body);
+        let size = i32::try_from(body.len()).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
+        let mut h = Thrift::new();
+        h.begin();
+        h.i32(1, 0); // DATA_PAGE
+        h.i32(2, size);
+        h.i32(3, size);
+        h.sub(5);
+        h.i32(1, n as i32); // num_values
+        h.i32(2, 0); // PLAIN
+        h.i32(3, 3); // definition levels: RLE
+        h.i32(4, 3); // repetition levels: RLE
+        h.end();
+        h.end();
+        f.write_all(&h.b)?;
+        f.write_all(&body)?;
+        let total = (h.b.len() + body.len()) as i64;
+        chunks.push((off, total));
+        off += total;
+    }
+    let mut t = Thrift::new();
+    t.begin();
+    t.i32(1, 1); // version
+    t.list(2, Thrift::STRUCT, cols.len() + 1);
+    t.begin();
+    t.str(4, "schema");
+    t.i32(5, cols.len() as i32);
+    t.end();
+    for c in cols {
+        t.begin();
+        t.i32(1, c.ty);
+        t.i32(3, c.optional as i32); // REQUIRED 0, OPTIONAL 1
+        t.str(4, c.name);
+        if let Some(ct) = c.converted {
+            t.i32(6, ct);
+            t.sub(10); // LogicalType: STRING = 1, DATE = 6
+            t.sub(if ct == CT_UTF8 { 1 } else { 6 });
+            t.end();
+            t.end();
+        }
+        t.end();
+    }
+    t.i64(3, n as i64);
+    t.list(4, Thrift::STRUCT, 1);
+    t.begin();
+    t.list(1, Thrift::STRUCT, cols.len());
+    for (c, &(o, size)) in cols.iter().zip(&chunks) {
+        t.begin();
+        t.i64(2, o); // file_offset
+        t.sub(3); // ColumnMetaData
+        t.i32(1, c.ty);
+        t.list(2, Thrift::I32, 2);
+        t.elem_i32(0); // PLAIN
+        t.elem_i32(3); // RLE
+        t.list(3, Thrift::BINARY, 1);
+        t.elem_str(c.name);
+        t.i32(4, 0); // UNCOMPRESSED
+        t.i64(5, n as i64);
+        t.i64(6, size);
+        t.i64(7, size);
+        t.i64(9, o); // data_page_offset
+        t.end();
+        t.end();
+    }
+    t.i64(2, off - 4); // total_byte_size
+    t.i64(3, n as i64);
+    t.end();
+    t.str(6, "sessions");
+    t.end();
+    f.write_all(&t.b)?;
+    f.write_all(&(t.b.len() as u32).to_le_bytes())?;
+    f.write_all(b"PAR1")?;
+    f.flush()
+}
+
+fn plain_bytes<'a>(buf: &mut Vec<u8>, vals: impl Iterator<Item = &'a [u8]>) {
+    for v in vals {
+        buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        buf.extend_from_slice(v);
+    }
+}
+
+fn plain_i64(buf: &mut Vec<u8>, vals: impl Iterator<Item = i64>) {
+    for v in vals {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+}
 
 fn write_outputs(out: &Path, users: &[&[UserRow]], camps: &[CampRow], cat_names: &[Bytes], threads: usize) {
     let ud = out.join("user_daily");
@@ -1322,20 +1521,26 @@ fn write_outputs(out: &Path, users: &[&[UserRow]], camps: &[CampRow], cat_names:
     for d in [&ud, &cd] {
         std::fs::create_dir_all(d).unwrap_or_else(|e| die(&format!("mkdir {}: {e}", d.display())));
     }
-    // split user rows into `threads` files of about equal size
+    // `threads` files of about equal size, each a list of row slices
     let total: usize = users.iter().map(|p| p.len()).sum();
     let per = total.div_ceil(threads).max(1);
-    let mut groups: Vec<Vec<&UserRow>> = vec![Vec::new()];
-    for p in users {
-        for r in p.iter() {
-            if groups.last().unwrap().len() >= per {
-                groups.push(Vec::new());
+    let mut files: Vec<Vec<&[UserRow]>> = vec![Vec::new()];
+    let mut room = per;
+    for &p in users {
+        let mut p = p;
+        while !p.is_empty() {
+            if room == 0 {
+                files.push(Vec::new());
+                room = per;
             }
-            groups.last_mut().unwrap().push(r);
+            let (a, b) = p.split_at(room.min(p.len()));
+            files.last_mut().unwrap().push(a);
+            room -= a.len();
+            p = b;
         }
     }
     std::thread::scope(|sc| {
-        for (gi, g) in groups.iter().enumerate() {
+        for (gi, g) in files.iter().enumerate() {
             let ud = &ud;
             sc.spawn(move || {
                 write_users(&ud.join(format!("part-{gi}.parquet")), g, cat_names)
@@ -1346,84 +1551,186 @@ fn write_outputs(out: &Path, users: &[&[UserRow]], camps: &[CampRow], cat_names:
     });
 }
 
-fn write_users(path: &Path, rows: &[&UserRow], cat_names: &[Bytes]) -> parquet::errors::Result<()> {
-    let schema = Arc::new(parse_message_type(
-        "message user_daily {
-            required binary user_id (STRING);
-            required int32 day (DATE);
-            required int64 sessions;
-            required int64 events;
-            required int64 revenue_cents;
-            optional binary top_category (STRING);
-        }",
-    )?);
-    let file = std::fs::File::create(path)?;
-    let mut w = SerializedFileWriter::new(std::io::BufWriter::with_capacity(1 << 20, file), schema, props())?;
-    let mut rg = w.next_row_group()?;
-    let mut col = 0;
-    while let Some(mut c) = rg.next_column()? {
-        match col {
-            0 => {
-                let v: Vec<ByteArray> = rows.iter().map(|r| ba(r.name.get())).collect();
-                c.typed::<ByteArrayType>().write_batch(&v, None, None)?;
-            }
-            1 => {
-                let v: Vec<i32> = rows.iter().map(|r| r.day).collect();
-                c.typed::<Int32Type>().write_batch(&v, None, None)?;
-            }
-            2..=4 => {
-                let v: Vec<i64> = rows.iter().map(|r| [r.sessions, r.events, r.revenue][col - 2]).collect();
-                c.typed::<Int64Type>().write_batch(&v, None, None)?;
-            }
-            _ => {
-                let v: Vec<ByteArray> = rows.iter().filter_map(|r| r.top.map(|t| ba(cat_names[t as usize]))).collect();
-                let def: Vec<i16> = rows.iter().map(|r| r.top.is_some() as i16).collect();
-                c.typed::<ByteArrayType>().write_batch(&v, Some(&def), None)?;
-            }
+fn write_users(path: &Path, segs: &[&[UserRow]], cat_names: &[Bytes]) -> std::io::Result<()> {
+    let n: usize = segs.iter().map(|s| s.len()).sum();
+    let rows = || segs.iter().flat_map(|s| s.iter());
+    write_parquet(path, &USER_COLS, n, |c, b| match c {
+        0 => {
+            b.reserve(n * 24);
+            plain_bytes(b, rows().map(|r| r.name.get()))
         }
-        c.close()?;
-        col += 1;
-    }
-    rg.close()?;
-    w.close()?;
-    Ok(())
+        1 => {
+            b.reserve(n * 4);
+            rows().for_each(|r| b.extend_from_slice(&r.day.to_le_bytes()))
+        }
+        2 => plain_i64(b, rows().map(|r| r.sessions)),
+        3 => plain_i64(b, rows().map(|r| r.events)),
+        4 => plain_i64(b, rows().map(|r| r.revenue)),
+        _ => {
+            // definition levels: one bit-packed run of ceil(n / 8) groups of 8 bits (1 = present)
+            let groups = n.div_ceil(8);
+            let mut run = Vec::with_capacity(groups + 5);
+            let mut v = ((groups as u64) << 1) | 1;
+            while v >= 0x80 {
+                run.push(v as u8 | 0x80);
+                v >>= 7;
+            }
+            run.push(v as u8);
+            let at = run.len();
+            run.resize(at + groups, 0);
+            for (i, r) in rows().enumerate() {
+                run[at + i / 8] |= (r.top.is_some() as u8) << (i % 8);
+            }
+            b.extend_from_slice(&(run.len() as u32).to_le_bytes());
+            b.extend_from_slice(&run);
+            plain_bytes(b, rows().filter_map(|r| r.top.map(|t| cat_names[t as usize])))
+        }
+    })
 }
 
-fn write_camps(path: &Path, rows: &[CampRow]) -> parquet::errors::Result<()> {
-    let schema = Arc::new(parse_message_type(
-        "message campaign_daily {
-            required binary campaign_id (STRING);
-            required binary channel (STRING);
-            required int32 day (DATE);
-            required int64 sessions;
-            required int64 purchasing_sessions;
-            required int64 revenue_cents;
-            required int64 assisted_sessions;
-        }",
-    )?);
-    let file = std::fs::File::create(path)?;
-    let mut w = SerializedFileWriter::new(std::io::BufWriter::new(file), schema, props())?;
-    let mut rg = w.next_row_group()?;
-    let mut col = 0;
-    while let Some(mut c) = rg.next_column()? {
-        match col {
-            0 | 1 => {
-                let v: Vec<ByteArray> = rows.iter().map(|r| ba(if col == 0 { r.0 } else { r.1 })).collect();
-                c.typed::<ByteArrayType>().write_batch(&v, None, None)?;
+fn write_camps(path: &Path, rows: &[CampRow]) -> std::io::Result<()> {
+    write_parquet(path, &CAMP_COLS, rows.len(), |c, b| match c {
+        0 => plain_bytes(b, rows.iter().map(|r| r.0)),
+        1 => plain_bytes(b, rows.iter().map(|r| r.1)),
+        2 => rows.iter().for_each(|r| b.extend_from_slice(&r.2.to_le_bytes())),
+        3 => plain_i64(b, rows.iter().map(|r| r.3)),
+        4 => plain_i64(b, rows.iter().map(|r| r.4)),
+        5 => plain_i64(b, rows.iter().map(|r| r.5)),
+        _ => plain_i64(b, rows.iter().map(|r| r.6)),
+    })
+}
+
+// ---------------------------------------------------------------- exit
+
+/// Ends the process once the outputs are on disk. Left to the kernel, freeing the GBs of heap and unmapping the
+/// input files runs on one thread (about 0.1 s); here every thread zaps a share first with MADV_DONTNEED.
+/// Nothing may be freed or dropped after the first zap: the heap, malloc state included, reads as zeros from then on.
+/// Never zapped: the threads' stacks (their TCBs sit in them), this thread's TLS block, every region under 1 MiB
+/// (libc state), `[heap]` and the other named regions. Any surprise before the zap falls back to a plain exit.
+#[cfg(target_os = "linux")]
+fn fast_exit(threads: usize) -> ! {
+    use std::sync::atomic::{AtomicUsize, Ordering::{Acquire, Release}};
+    const MAXP: usize = 2048;
+    const PIECE: usize = 16 << 20;
+    const MARGIN: usize = 64 << 10;
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else { std::process::exit(0) };
+    // shared state lives on this thread's stack: the heap is about to be zeroed
+    let reg = AtomicUsize::new(0);
+    let go = AtomicBool::new(false);
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let np = AtomicUsize::new(0);
+    let keep: [[AtomicUsize; 2]; 32] = std::array::from_fn(|_| [AtomicUsize::new(0), AtomicUsize::new(0)]);
+    let pieces: [[AtomicUsize; 2]; MAXP] = std::array::from_fn(|_| [AtomicUsize::new(0), AtomicUsize::new(0)]);
+    std::thread::scope(|sc| {
+        let mut n = 0;
+        while n < threads.clamp(1, 32) {
+            let (reg, go, next, done, np, keep, pieces) = (&reg, &go, &next, &done, &np, &keep, &pieces);
+            let k = n;
+            let spawned = std::thread::Builder::new().spawn_scoped(sc, move || {
+                // publish this thread's stack: never zap it
+                let (mut lo, mut hi) = (0usize, 0usize);
+                unsafe {
+                    let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+                    if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) == 0 {
+                        let mut addr = std::ptr::null_mut();
+                        let mut size = 0usize;
+                        libc::pthread_attr_getstack(&attr, &mut addr, &mut size);
+                        lo = addr as usize;
+                        hi = lo + size;
+                        libc::pthread_attr_destroy(&mut attr);
+                    }
+                }
+                keep[k][0].store(lo.saturating_sub(MARGIN), Relaxed);
+                keep[k][1].store(hi + MARGIN, Relaxed);
+                reg.fetch_add(1, Release);
+                while !go.load(Acquire) {
+                    unsafe { libc::sched_yield() };
+                }
+                loop {
+                    let i = next.fetch_add(1, Relaxed);
+                    if i >= np.load(Relaxed) {
+                        break;
+                    }
+                    unsafe { libc::madvise(pieces[i][0].load(Relaxed) as *mut libc::c_void, pieces[i][1].load(Relaxed), libc::MADV_DONTNEED) };
+                    done.fetch_add(1, Release);
+                }
+                // never return: thread exit would free into the zeroed heap
+                loop {
+                    unsafe { libc::sched_yield() };
+                }
+            });
+            if spawned.is_err() {
+                break;
             }
-            2 => {
-                let v: Vec<i32> = rows.iter().map(|r| r.2).collect();
-                c.typed::<Int32Type>().write_batch(&v, None, None)?;
+            n += 1;
+        }
+        if n == 0 {
+            std::process::exit(0);
+        }
+        while reg.load(Acquire) < n {
+            std::thread::yield_now();
+        }
+        // a thread that could not read its stack bounds publishes (0, MARGIN): nothing is zapped then
+        if (0..n).any(|k| keep[k][1].load(Relaxed) <= MARGIN) {
+            std::process::exit(0);
+        }
+        let me = unsafe { libc::pthread_self() } as usize;
+        let mut excl: Vec<(usize, usize)> = (0..n).map(|k| (keep[k][0].load(Relaxed), keep[k][1].load(Relaxed))).collect();
+        excl.push((me.saturating_sub(MARGIN), me + MARGIN));
+        let mut cnt = 0usize;
+        for line in maps.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            // anonymous heap (no name), or an input file mapped read-only and shared
+            let anon = f.len() == 5 && f[1] == "rw-p";
+            let file = f.len() == 6 && f[1] == "r--s" && f[5].starts_with('/') && !f[5].starts_with("/dev/");
+            if !anon && !file {
+                continue;
             }
-            _ => {
-                let v: Vec<i64> = rows.iter().map(|r| [r.3, r.4, r.5, r.6][col - 3]).collect();
-                c.typed::<Int64Type>().write_batch(&v, None, None)?;
+            let Some((a, b)) = f[0].split_once('-') else { continue };
+            let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) else { continue };
+            let mut segs = vec![(a, b)];
+            for &(x, y) in &excl {
+                let mut out = Vec::new();
+                for (s, e) in segs {
+                    if y <= s || x >= e {
+                        out.push((s, e));
+                    } else {
+                        if x > s {
+                            out.push((s, x & !4095));
+                        }
+                        if y < e {
+                            out.push(((y + 4095) & !4095, e));
+                        }
+                    }
+                }
+                segs = out;
+            }
+            for (s, e) in segs {
+                if e <= s || e - s < (1 << 20) {
+                    continue;
+                }
+                let mut p = s;
+                while p < e && cnt < MAXP {
+                    let l = PIECE.min(e - p);
+                    pieces[cnt][0].store(p, Relaxed);
+                    pieces[cnt][1].store(l, Relaxed);
+                    cnt += 1;
+                    p += l;
+                }
             }
         }
-        c.close()?;
-        col += 1;
-    }
-    rg.close()?;
-    w.close()?;
-    Ok(())
+        np.store(cnt, Relaxed);
+        go.store(true, Release);
+        while done.load(Acquire) < cnt {
+            std::thread::yield_now();
+        }
+        unsafe { libc::_exit(0) }
+    });
+    unreachable!()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fast_exit(_threads: usize) -> ! {
+    std::process::exit(0)
 }

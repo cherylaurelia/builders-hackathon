@@ -449,6 +449,36 @@ fn arena_chunk(bytes: usize) -> *mut u8 {
     p as *mut u8
 }
 
+/// Zeroed tables for one thread, carved from one piece of the arena range: huge pages where the kernel gives them,
+/// so that passes which write all over a table (the counting sorts of `partition_work`) miss the TLB less than
+/// on the allocator's 4 KiB pages.
+struct Carve {
+    at: usize,
+    end: usize,
+}
+
+impl Carve {
+    /// Room for `bytes` in all, plus a cache line of alignment per table.
+    fn new(bytes: usize, tables: usize) -> Carve {
+        let n = (bytes + 64 * tables).next_multiple_of(2 << 20);
+        let at = arena_chunk(n) as usize;
+        Carve { at, end: at + n }
+    }
+
+    /// `n` zeros of a type for which all-zero bytes are a value (plain integers).
+    fn take<T: Copy>(&mut self, n: usize) -> &'static mut [T] {
+        let at = self.at.next_multiple_of(64);
+        let bytes = n * std::mem::size_of::<T>();
+        if at + bytes > self.end {
+            die("thread tables larger than their memory");
+        }
+        self.at = at + bytes;
+        // SAFETY: a piece of a live, zeroed, never unmapped mapping that nothing else is given; 64 is a multiple
+        // of every integer's alignment
+        unsafe { std::slice::from_raw_parts_mut(at as *mut T, n) }
+    }
+}
+
 /// The address of an `ERec` in an arena as a number from 1 (0 = no record); `abase` = `arena_range().0`.
 #[inline(always)]
 fn loc_of(abase: usize, rec: *mut ERec) -> u32 {
@@ -2325,19 +2355,21 @@ fn main() {
     }
     let mut order: Vec<(usize, usize)> = (0..np).map(|p| (shards.iter().map(|s| s.ev[p].len(EV_BLOCK)).sum(), p)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
+    let max_ev = order.first().map_or(0, |x| x.0);
+    let max_ck = (0..np).map(|p| shards.iter().map(|s| s.ck[p].len(CK_BLOCK)).sum()).max().unwrap_or(0);
     let width = ndays;
     let next = AtomicUsize::new(0);
     let n_rows = AtomicUsize::new(0);
     // A thread that has emptied the queue hands its campaign cells to this thread, then writes its user file; this
     // thread merges the cells and writes campaign_daily meanwhile instead of after the last file.
-    let (tx, rx) = std::sync::mpsc::channel::<(Vec<Cell>, Vec<Paid>)>();
+    let (tx, rx) = std::sync::mpsc::channel::<(&'static [Cell], &'static [Paid])>();
     let (camp_rows, _results) = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..threads)
             .map(|t| {
                 let (cx, shards, order, next, n_rows, ud, cat_names) = (&cx, &shards, &order, &next, &n_rows, &ud, &cat_names);
                 let tx = tx.clone();
                 sc.spawn(move || {
-                    let mut w = Work::new(cx, n_ev);
+                    let mut w = Work::new(cx, n_ev, max_ev, max_ck);
                     loop {
                         let i = next.fetch_add(1, Relaxed);
                         if i >= order.len() {
@@ -2345,7 +2377,9 @@ fn main() {
                         }
                         partition_work(cx, shards, order[i].1, &mut w);
                     }
-                    tx.send((std::mem::take(&mut w.cells), std::mem::take(&mut w.paid))).unwrap_or_else(|_| die("campaign merger gone"));
+                    let (cells, paid): (&'static mut [Cell], &'static mut [Paid]) = (std::mem::take(&mut w.cells), std::mem::take(&mut w.paid));
+                    let done: (&'static [Cell], &'static [Paid]) = (cells, paid);
+                    tx.send(done).unwrap_or_else(|_| die("campaign merger gone"));
                     // thread 0 writes even with no rows: the table needs at least one file
                     if t == 0 || w.cols.n > 0 {
                         write_users(&ud.join(format!("part-{t}.parquet")), &w.cols, cat_names, cx.day0, cx.ndays)
@@ -2362,12 +2396,12 @@ fn main() {
         let mut assist = filled((ncamp + 1) * width, 0i64);
         for _ in 0..threads {
             let (c, a) = rx.recv().unwrap_or_else(|_| die("a worker ended without its campaign cells"));
-            for ((x, y), z) in cred.iter_mut().zip(&c).zip(&a) {
+            for ((x, y), z) in cred.iter_mut().zip(c).zip(a) {
                 x[0] += y.sessions as i64;
                 x[1] += z.purchasing as i64;
                 x[2] += z.revenue;
             }
-            for (x, y) in assist.iter_mut().zip(&c) {
+            for (x, y) in assist.iter_mut().zip(c) {
                 *x += y.assisted as i64;
             }
         }
@@ -3084,18 +3118,19 @@ struct Sess {
 struct Work {
     cols: Cols,
     tmp: Vec<u8>,
-    cells: Vec<Cell>, // + 4 past the last cell for the unused steps of the vector window
-    paid: Vec<Paid>,
+    cells: &'static mut [Cell], // + 4 past the last cell for the unused steps of the vector window
+    paid: &'static mut [Paid],
     stamp: Vec<bool>,
     iv: Vec<(u32, u32)>, // per campaign, the sessions a..b its clicks so far assist (`person_work`, many clicks)
     seen: Vec<u32>,
     sctr: u32,
-    start: Vec<u32>,
-    fill: Vec<u32>,
-    cstart: Vec<u32>,
-    cfill: Vec<u32>,
-    ev: Vec<u64>,
-    ck: Vec<Ck>,
+    // the counting sorts' tables; with the campaign cells above, in huge pages (`Carve`)
+    start: &'static mut [u32],
+    fill: &'static mut [u32],
+    cstart: &'static mut [u32],
+    cfill: &'static mut [u32],
+    ev: &'static mut [u64], // room for the events of the largest partition
+    ck: &'static mut [Ck],  // room for the clicks of the largest partition
     sessions: Vec<Sess>,
     day_groups: Vec<(usize, usize)>, // (d, first session index)
     cats: Vec<(u16, i64)>,
@@ -3113,25 +3148,27 @@ struct Work {
 }
 
 impl Work {
-    /// `rows`: the most `user_daily` rows the thread can have.
-    fn new(cx: &Ctx, rows: usize) -> Work {
+    /// `rows`: the most `user_daily` rows the thread can have; `max_ev`, `max_ck`: the most events and clicks a
+    /// person partition has.
+    fn new(cx: &Ctx, rows: usize, max_ev: usize, max_ck: usize) -> Work {
         let cells = (cx.ncamp + 1) * cx.ndays;
         let local = (1usize << cx.pshift) + 1;
+        let mut mem = Carve::new(4 * 4 * local + 8 * max_ev + 16 * max_ck + 8 * (cells + 4) + 16 * cells, 8);
         Work {
             cols: Cols::new(rows),
             tmp: Vec::with_capacity(64),
-            cells: filled(cells + 4, Cell::default()),
-            paid: filled(cells, Paid::default()),
+            cells: mem.take(cells + 4),
+            paid: mem.take(cells),
             stamp: vec![false; cx.ncamp + 1],
             iv: vec![(0, 0); cx.ncamp + 1],
             seen: filled(cx.ncamp + 1, 0),
             sctr: 0,
-            start: filled(local, 0),
-            fill: filled(local, 0),
-            cstart: filled(local, 0),
-            cfill: filled(local, 0),
-            ev: Vec::new(),
-            ck: Vec::new(),
+            start: mem.take(local),
+            fill: mem.take(local),
+            cstart: mem.take(local),
+            cfill: mem.take(local),
+            ev: mem.take(max_ev),
+            ck: mem.take(max_ck),
             sessions: Vec::new(),
             day_groups: Vec::new(),
             cats: Vec::new(),
@@ -3336,9 +3373,6 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     if n == 0 {
         return;
     }
-    if w.ev.len() < n {
-        w.ev.resize(n, 0);
-    }
     if w.cols.n + n > w.cols.cap {
         die("more user rows than events"); // a row has at least one event of its own
     }
@@ -3370,9 +3404,6 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
         w.cstart[l + 1] = sum;
         w.cfill[l] = w.cstart[l];
     }
-    if w.ck.len() < sum as usize {
-        w.ck.resize(sum as usize, Ck { k: 0, cid: 0 });
-    }
     for s in shards {
         for blk in s.ck[p].slices(CK_BLOCK) {
             for r in blk {
@@ -3387,7 +3418,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     }
 
     let ev = std::mem::take(&mut w.ev);
-    let mut ck = std::mem::take(&mut w.ck);
+    let ck = std::mem::take(&mut w.ck);
     for l in 0..local {
         if l & 3 == 0 {
             // the names come from the partition's part of the ID table, which was last read during the parse

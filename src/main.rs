@@ -291,6 +291,32 @@ impl<T> Stream<T> {
         }
     }
 
+    /// Calls `f` with every record, in order, asking for the record 512 bytes ahead as it goes: the blocks of a
+    /// stream lie apart, so at each block's end the hardware prefetcher would start over.
+    #[inline(always)]
+    fn each(&self, per: usize, mut f: impl FnMut(&T)) {
+        let ahead = (512 / std::mem::size_of::<T>()).clamp(1, per);
+        let n = self.blocks.len();
+        for (i, &b) in self.blocks.iter().enumerate() {
+            let len = if i + 1 == n { (unsafe { self.cur.offset_from(b) }) as usize } else { per };
+            // the last `ahead` records of a block look ahead into the next block (the last block: into itself)
+            let own = len.min(per - ahead);
+            let next = if i + 1 < n { self.blocks[i + 1] } else { b };
+            // SAFETY: j < len, the records written to this block; a prefetch may name any address
+            unsafe {
+                for j in 0..own {
+                    prefetch(b.add(j + ahead));
+                    f(&*b.add(j));
+                }
+                for j in own..len {
+                    prefetch(next.add(j - own));
+                    f(&*b.add(j));
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn slices(&self, per: usize) -> impl Iterator<Item = &[T]> {
         let n = self.blocks.len();
         self.blocks.iter().enumerate().map(move |(i, &b)| {
@@ -2082,24 +2108,20 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
                 ((h >> (64 - wb)) as usize, 1u64 << (2 * ((h >> (59 - wb)) & 31)) | 1u64 << (2 * ((h >> (54 - wb)) & 31)))
             };
             for s in shards {
-                for blk in s.lg[b].slices(LG_BLOCK) {
-                    for r in blk {
-                        let (w, m) = at(r.key);
-                        let f = &mut filter[w];
-                        *f |= if *f & m == m { m << 1 } else { m };
-                    }
-                }
+                s.lg[b].each(LG_BLOCK, |r| {
+                    let (w, m) = at(r.key);
+                    let f = &mut filter[w];
+                    *f |= if *f & m == m { m << 1 } else { m };
+                });
             }
             cand.clear();
             for s in shards {
-                for blk in s.lg[b].slices(LG_BLOCK) {
-                    for r in blk {
-                        let (w, m) = at(r.key);
-                        if (filter[w] >> 1) & m == m {
-                            cand.push((r.key, r.ingest, r.loc));
-                        }
+                s.lg[b].each(LG_BLOCK, |r| {
+                    let (w, m) = at(r.key);
+                    if (filter[w] >> 1) & m == m {
+                        cand.push((r.key, r.ingest, r.loc));
                     }
-                }
+                });
             }
             *total += cand.len();
             cand.sort_unstable_by_key(|c| c.0);
@@ -2225,13 +2247,11 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     // events: counting sort by person (the low bits of the slot number)
     w.start[..=local].fill(0);
     for s in shards {
-        for blk in s.ev[p].slices(EV_BLOCK) {
-            for r in blk {
-                if r.person != DROPPED {
-                    w.start[(r.person & lmask) as usize + 1] += 1;
-                }
+        s.ev[p].each(EV_BLOCK, |r| {
+            if r.person != DROPPED {
+                w.start[(r.person & lmask) as usize + 1] += 1;
             }
-        }
+        });
     }
     let mut sum = 0;
     for l in 0..local {
@@ -2247,26 +2267,22 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
         w.ev.resize(n, 0);
     }
     for s in shards {
-        for blk in s.ev[p].slices(EV_BLOCK) {
-            for r in blk {
-                if r.person != DROPPED {
-                    let f = &mut w.fill[(r.person & lmask) as usize];
-                    w.ev[*f as usize] = (r.ts as u64) << 32 | r.pay as u64;
-                    *f += 1;
-                }
+        s.ev[p].each(EV_BLOCK, |r| {
+            if r.person != DROPPED {
+                let f = &mut w.fill[(r.person & lmask) as usize];
+                w.ev[*f as usize] = (r.ts as u64) << 32 | r.pay as u64;
+                *f += 1;
             }
-        }
+        });
     }
 
     // clicks of the people with events, the same way
     w.cstart[..=local].fill(0);
     for s in shards {
-        for blk in s.ck[p].slices(CK_BLOCK) {
-            for r in blk {
-                let l = (r.person & lmask) as usize;
-                w.cstart[l + 1] += (w.start[l + 1] != w.start[l]) as u32;
-            }
-        }
+        s.ck[p].each(CK_BLOCK, |r| {
+            let l = (r.person & lmask) as usize;
+            w.cstart[l + 1] += (w.start[l + 1] != w.start[l]) as u32;
+        });
     }
     let mut sum = 0;
     for l in 0..local {
@@ -2278,16 +2294,14 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
         w.ck.resize(sum as usize, Ck { k: 0, cid: 0 });
     }
     for s in shards {
-        for blk in s.ck[p].slices(CK_BLOCK) {
-            for r in blk {
-                let l = (r.person & lmask) as usize;
-                if w.start[l + 1] != w.start[l] {
-                    let f = &mut w.cfill[l];
-                    w.ck[*f as usize] = Ck { k: (r.ts as u64) << 32 | r.camp as u64, cid: r.cid };
-                    *f += 1;
-                }
+        s.ck[p].each(CK_BLOCK, |r| {
+            let l = (r.person & lmask) as usize;
+            if w.start[l + 1] != w.start[l] {
+                let f = &mut w.cfill[l];
+                w.ck[*f as usize] = Ck { k: (r.ts as u64) << 32 | r.camp as u64, cid: r.cid };
+                *f += 1;
             }
-        }
+        });
     }
 
     let ev = std::mem::take(&mut w.ev);

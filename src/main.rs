@@ -3,16 +3,18 @@
 //! One shuffle. Every user_id is resolved to its person while its line is parsed, so a kept event is written
 //! once, 12 bytes, straight into the bucket of its person, and never moved again.
 //!
-//!   1. links -> one global ID table (open addressing, exact keys, filled concurrently) + a lock-free union-find
-//!      that always links the root with the larger ID under the one with the smaller ID, so every root is the
-//!      byte-wise smallest ID of its person. Each linked ID's slot then holds its person id = its root's slot.
-//!   2. events + clicks, one parallel parse. An ID not in the table is a person on its own: it gets a slot (and so a
-//!      person id) the first time any thread sees it. A kept event goes to person bucket `pid % 256` (12 B); every
-//!      parsed event also leaves (event_id, ingest_ts, where its record went) in its event_id bucket (24 B).
+//!   0. every input file is mapped at once and a read-ahead thread queues it from disk in consumption order.
+//!   1. links -> one global ID table (open addressing, exact 12-byte keys, filled concurrently) + a lock-free
+//!      union-find that always links the root with the larger ID under the one with the smaller ID, so every root
+//!      is the byte-wise smallest ID of its person. Each linked ID's slot then holds its person id = its root's slot.
+//!   2. events + clicks, one parallel parse (per-line SIMD split, prefetched table lookups in batches). An ID not in
+//!      the table is a person on its own: it gets a slot (and so a person id) the first time any thread sees it.
+//!      A kept event goes to person bucket `pid % 256` (12 B); every parsed event also leaves (event_id, hash bits,
+//!      ingest_ts, where its record went) in its event_id bucket (24 B). Appends use streaming stores.
 //!   3. per event_id bucket: copies of one event_id -> the kept copy is the one with the smallest ingest_ts; the
 //!      records of all other copies are listed as dropped for their person bucket.
 //!   4. per person bucket: counting sort by person, sort each person's events by ts, sessionize, credit, assist.
-//!   5. write Parquet.
+//!   5. write Parquet, release this program's own mappings on all threads, _exit.
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -198,8 +200,8 @@ fn map_anon(bytes: usize) -> *mut u8 {
     let a = (p as usize + HP - 1) & !(HP - 1);
     register(a, bytes);
     #[cfg(target_os = "linux")]
-    if std::env::var_os("C2_NOHP").is_none() {
-        unsafe { libc::madvise(a as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE) };
+    unsafe {
+        libc::madvise(a as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
     }
     a as *mut u8
 }

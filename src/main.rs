@@ -24,7 +24,7 @@ const WEEK: i64 = 7 * DAY;
 const CHUNK: usize = 4 << 20;
 const EB: usize = 256; // event_id buckets
 const PB: usize = 256; // person buckets
-const UB: usize = 1024; // user_id buckets: each holds a cache-sized slice of the link table
+const UB: usize = 256; // user_id buckets: each holds a cache-sized slice of the link table
 
 // ---------------------------------------------------------------- hashing
 
@@ -547,12 +547,30 @@ struct RawEvent {
     h: u64,
     ingest: i64,
     ts: i64,
-    eid: Bytes,
-    uid: Bytes,
+    eid: Packed,
+    uid: Packed,
     price: u32,
     cat: u16,
     kind: u8,
     keep: bool, // valid and not late
+}
+
+/// A byte slice in 8 bytes: address in the low 48 bits, length in the high 16.
+#[derive(Clone, Copy)]
+struct Packed(u64);
+impl Packed {
+    #[inline]
+    fn new(b: Bytes) -> Packed {
+        let p = b.as_ptr() as u64;
+        if p >> 48 != 0 || b.len() >= 1 << 16 {
+            die("field too long or address above 48 bits");
+        }
+        Packed(p | (b.len() as u64) << 48)
+    }
+    #[inline]
+    fn get(self) -> Bytes {
+        unsafe { std::slice::from_raw_parts((self.0 & ((1 << 48) - 1)) as *const u8, (self.0 >> 48) as usize) }
+    }
 }
 
 /// A surviving event, routed to its person's bucket.
@@ -591,7 +609,6 @@ struct Ctx {
     day0: i64,
     ndays: usize,
     ncamp: usize, // organic is index ncamp
-    links: Vec<PreMap<(Bytes, u64)>>, // by uid_bucket: linked ID -> (person name, its hash)
     products: BytesMap<u16>,
     campaigns: BytesMap<u16>,
     unknown_cat: u16,
@@ -663,11 +680,11 @@ fn main() {
     let ncamp = camp_ids.len();
     lap("small tables");
 
-    // 1. links
-    let links = build_links(&csv_files(&data.join("links")), threads);
-    lap(&format!("links: {} linked ids", links.iter().map(|m| m.len()).sum::<usize>()));
+    // 1. links, on their own thread: nothing needs them until phase 4b
+    let link_files = csv_files(&data.join("links"));
+    let links_job = std::thread::spawn(move || build_links(&link_files, (threads / 4).max(1)));
 
-    let ctx = Ctx { ws, we, day0, ndays, ncamp, links, products, campaigns, unknown_cat, cat_rank };
+    let ctx = Ctx { ws, we, day0, ndays, ncamp, products, campaigns, unknown_cat, cat_rank };
 
     // 2. events: parse into event_id buckets
     let ev_files = csv_files(&data.join("events"));
@@ -699,25 +716,29 @@ fn main() {
             for t in &parsed {
                 v.extend_from_slice(&t[b]);
             }
-            v.sort_unstable_by_key(|r| (r.h, r.ingest));
-            let mut seen: Vec<Bytes> = Vec::new();
+            v.sort_unstable_by_key(|r| r.h);
+            let mut seen: Vec<Bytes> = Vec::new(); // distinct event_ids among equal hashes
             let mut i = 0;
             while i < v.len() {
                 let mut j = i + 1;
                 while j < v.len() && v[j].h == v[i].h {
                     j += 1;
                 }
-                // sorted by ingest, so the first copy of each distinct event_id is the kept copy
+                // copies share a hash; ordered by ingest, the first copy of each distinct event_id is the kept copy
+                if j - i > 1 {
+                    v[i..j].sort_unstable_by_key(|r| r.ingest);
+                }
                 seen.clear();
                 for r in &v[i..j] {
-                    if seen.contains(&r.eid) {
+                    if seen.contains(&r.eid.get()) {
                         continue;
                     }
-                    seen.push(r.eid);
+                    seen.push(r.eid.get());
                     if r.keep {
                         // routed by user_id for now; phase 4b swaps in the person
-                        let uh = hash_bytes(r.uid);
-                        out[uid_bucket(uh)].push(PEvent { nh: uh, name: r.uid, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind });
+                        let uid = r.uid.get();
+                        let uh = hash_bytes(uid);
+                        out[uid_bucket(uh)].push(PEvent { nh: uh, name: uid, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind });
                     }
                 }
                 i = j;
@@ -746,6 +767,9 @@ fn main() {
     );
     lap("clicks parsed");
 
+    let links = links_job.join().unwrap_or_else(|_| die("link builder panicked"));
+    lap(&format!("links joined: {} linked ids", links.iter().map(|m| m.len()).sum::<usize>()));
+
     // 4b. per user_id bucket: user_id -> person through that bucket's slice of the link table
     let n_ev: usize = routed.iter().flatten().map(|v| v.len()).sum();
     let n_ck: usize = clicks.iter().flatten().map(|v| v.len()).sum();
@@ -754,7 +778,7 @@ fn main() {
         UB,
         || (sized::<PEvent>(PB, n_ev, threads), sized::<PClick>(PB, n_ck, threads)),
         |(oe, oc), u| {
-            let map = &ctx.links[u];
+            let map = &links[u];
             let person = |h: u64, s: Bytes| map.get(&PreHashed { h, s }).copied().unwrap_or((s, h));
             for t in &routed {
                 for e in &t[u] {
@@ -889,7 +913,7 @@ fn parse_event(ctx: &Ctx, [eid, uid, ts, ingest, etype, pid, price]: [Bytes; 7])
         return None;
     }
     let ingest = parse_ts(ingest)?; // always valid F1 per rules.md
-    let mut r = RawEvent { h: hash_bytes(eid), ingest, ts: 0, eid, uid, price: 0, cat: 0, kind: 0, keep: false };
+    let mut r = RawEvent { h: hash_bytes(eid), ingest, ts: 0, eid: Packed::new(eid), uid: Packed::new(uid), price: 0, cat: 0, kind: 0, keep: false };
     if uid.is_empty() || pid.is_empty() {
         return Some(r);
     }

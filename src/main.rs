@@ -1143,7 +1143,9 @@ fn read_ahead(queue: Vec<(&'static InFile, usize, usize)>, threads: usize) {
     }
     let queue = std::sync::Arc::new(queue);
     let next = std::sync::Arc::new(AtomicUsize::new(0));
-    for _ in 0..threads.div_ceil(2) {
+    // two threads: the kernel takes each 128 KiB hint at once, so more only crowd the parse threads (box, cold, 20M:
+    // 1 thread 0.41 s, 2 threads 0.40 s, 3 threads 0.45 s, 4 threads 0.49 s, 16 sendfile threads 0.48 s)
+    for _ in 0..threads.div_ceil(4) {
         let (queue, next) = (queue.clone(), next.clone());
         // never joined: these only start reads, and the end of the process ends them. A thread that cannot start,
         // or a hint the kernel refuses, costs speed only: every byte is still read by `read_span`.
@@ -2172,6 +2174,9 @@ struct Work {
     day_groups: Vec<(usize, usize)>, // (d, first session index)
     cats: Vec<(u16, i64)>,
     touched: Vec<usize>,
+    small: Win,
+    last: Vec<u32>,
+    lctr: u32,
 }
 
 impl Work {
@@ -2181,7 +2186,7 @@ impl Work {
         Work {
             rows: Vec::new(),
             cred: vec![Cred::default(); cells],
-            assist: vec![0; cells],
+            assist: vec![0; cells + 4], // + cells for the unused steps of the vector window
             stamp: vec![false; cx.ncamp + 1],
             iv: vec![(0, 0); cx.ncamp + 1],
             seen: vec![0; cx.ncamp + 1],
@@ -2197,8 +2202,168 @@ impl Work {
             day_groups: Vec::new(),
             cats: Vec::new(),
             touched: Vec::new(),
+            small: Win { ts: A32([0; 72]), nxt: A32([0; 72]), camp: [0; 72], cid: [0; 72] },
+            last: vec![0; cx.ncamp + 1],
+            lctr: 0,
         }
     }
+}
+
+/// Rotation `r` of eight lanes, and the lanes whose rotated-in lane (i + r) % 8 comes before them (for breaking ties).
+#[allow(dead_code)] // only the AVX2 build uses them
+const ROT: [[i32; 8]; 8] = {
+    let mut t = [[0; 8]; 8];
+    let mut r = 0;
+    while r < 8 {
+        let mut i = 0;
+        while i < 8 {
+            t[r][i] = ((i + r) % 8) as i32;
+            i += 1;
+        }
+        r += 1;
+    }
+    t
+};
+#[allow(dead_code)]
+const TIE: [[i32; 8]; 8] = {
+    let mut t = [[0; 8]; 8];
+    let mut r = 0;
+    while r < 8 {
+        let mut i = 0;
+        while i < 8 {
+            t[r][i] = if (i + r) % 8 < i { -1 } else { 0 };
+            i += 1;
+        }
+        r += 1;
+    }
+    t
+};
+
+/// `rank[i]` = slot of key i in sorted order, for 2 <= k <= 64 keys (for k <= 8 the ranks of eight lanes, the ones
+/// past k included: always a permutation of 0..8): the number of keys below it plus the equal keys before it, so no
+/// data-dependent branches and every slot is used once.
+#[inline]
+fn ranks_small(k: usize, key: impl Fn(usize) -> u32, rank: &mut [u8; 64]) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        if k <= 8 {
+            // one vector: every key against the other seven, by rotating the vector, with a fixed trip count.
+            // Lanes past k hold the largest key (and any index into `key` is clamped), so they only rank last.
+            let mut buf = [0i32; 8];
+            for i in 0..8 {
+                let kv = (key(i.min(k - 1)) ^ 0x8000_0000) as i32;
+                buf[i] = if i < k { kv } else { i32::MAX };
+            }
+            let v = _mm256_loadu_si256(buf.as_ptr() as *const __m256i);
+            let mut acc = _mm256_setzero_si256();
+            for r in 1..8 {
+                let rot = _mm256_permutevar8x32_epi32(v, _mm256_loadu_si256(ROT[r].as_ptr() as *const __m256i)); // lane i = key (i + r) % 8
+                let lt = _mm256_cmpgt_epi32(v, rot);
+                let tie = _mm256_and_si256(_mm256_cmpeq_epi32(v, rot), _mm256_loadu_si256(TIE[r].as_ptr() as *const __m256i));
+                acc = _mm256_sub_epi32(acc, _mm256_or_si256(lt, tie));
+            }
+            let mut out = [0i32; 8];
+            _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, acc);
+            for i in 0..8 {
+                rank[i] = out[i] as u8;
+            }
+            return;
+        }
+        #[repr(align(32))]
+        struct K([i32; 64]);
+        let mut kt = K([i32::MAX; 64]); // keys flipped to signed order; the padding sorts last
+        for i in 0..k {
+            kt.0[i] = (key(i) ^ 0x8000_0000) as i32;
+        }
+        let nch = k.div_ceil(8);
+        for i in 0..k {
+            let ki = _mm256_set1_epi32(kt.0[i]);
+            let mut r = 0u32;
+            for c in 0..nch {
+                let t = _mm256_load_si256(kt.0.as_ptr().add(c * 8) as *const __m256i);
+                let lt = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(ki, t))) as u32;
+                let eq = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(ki, t))) as u32;
+                let before = (1u32 << i.saturating_sub(c * 8).min(8)) - 1;
+                r += lt.count_ones() + (eq & before).count_ones();
+            }
+            rank[i] = r as u8;
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    {
+        for i in 0..k {
+            let ki = key(i);
+            rank[i] = (0..k).filter(|&j| key(j) < ki || (key(j) == ki && j < i)).count() as u8;
+        }
+        for i in k..8 {
+            rank[i] = i as u8; // the unused lanes of the vector version
+        }
+    }
+}
+
+/// Bit j set when click j (of the first 8 * nch) is in the 7-day window of a session starting at `st`:
+/// `st - ts` in 0..=WEEK, as an unsigned wrapping difference.
+#[inline(always)]
+fn win_mask(ts: &[u32; 72], nch: usize, st: u32) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let s = _mm256_set1_epi32(st as i32);
+        let w = _mm256_set1_epi32(WEEK as i32);
+        let mut m = 0u64;
+        for c in 0..nch {
+            let t = _mm256_loadu_si256(ts.as_ptr().add(c * 8) as *const __m256i);
+            let d = _mm256_sub_epi32(s, t);
+            let ok = _mm256_cmpeq_epi32(_mm256_min_epu32(d, w), d);
+            m |= (_mm256_movemask_ps(_mm256_castsi256_ps(ok)) as u32 as u64) << (c * 8);
+        }
+        return m;
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut m = 0u64;
+        for j in 0..nch * 8 {
+            m |= ((st.wrapping_sub(ts[j]) <= WEEK as u32) as u64) << j;
+        }
+        m
+    }
+}
+
+/// Bit j set when `nxt[j] >= hi` (the next click of j's campaign is not before `hi`), for the first 8 * nch.
+#[inline(always)]
+fn nxt_mask(nxt: &[u32; 72], nch: usize, hi: u32) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let h = _mm256_set1_epi32(hi as i32 - 1);
+        let mut m = 0u64;
+        for c in 0..nch {
+            let t = _mm256_loadu_si256(nxt.as_ptr().add(c * 8) as *const __m256i);
+            m |= (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(t, h))) as u32 as u64) << (c * 8);
+        }
+        return m;
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut m = 0u64;
+        for j in 0..nch * 8 {
+            m |= ((nxt[j] >= hi) as u64) << j;
+        }
+        m
+    }
+}
+
+#[repr(align(32))]
+struct A32([u32; 72]);
+
+/// The clicks of a person with up to 64 of them, sorted by ts, as arrays for the vector window.
+struct Win {
+    ts: A32,
+    nxt: A32, // index of the next click of the same campaign, else the click count
+    camp: [u32; 72],
+    cid: [u64; 72],
 }
 
 /// Sorts `ts << 32 | pay` values by ts.
@@ -2319,6 +2484,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
 
     let mut ev = std::mem::take(&mut w.ev);
     let mut ck = std::mem::take(&mut w.ck);
+    let mut sorted = [0u64; 72]; // the events of a person with up to 64 of them, by ts
     for l in 0..local {
         let (a, b) = (w.start[l] as usize, w.start[l + 1] as usize);
         if a == b {
@@ -2326,9 +2492,50 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
         }
         let name = cx.ids.slots[(p << cx.pshift) | l].key.load(Relaxed);
         let (ca, cb) = (w.cstart[l] as usize, w.cstart[l + 1] as usize);
-        sort_events(&mut ev[a..b], &mut w.tmp);
-        ck[ca..cb].sort_unstable_by_key(|c| c.k);
-        person_work(cx, name, &ev[a..b], &ck[ca..cb], w);
+        let n = b - a;
+        let evs: &[u64] = if n > 64 {
+            sort_events(&mut ev[a..b], &mut w.tmp);
+            &ev[a..b]
+        } else if n == 1 {
+            &ev[a..b]
+        } else {
+            let mut rank = [0u8; 64];
+            ranks_small(n, |i| (ev[a + i] >> 32) as u32, &mut rank);
+            for i in 0..n.max(8) {
+                sorted[rank[i] as usize] = ev[a + i.min(n - 1)]; // lanes past n land past the end
+            }
+            &sorted[..n]
+        };
+        // the clicks: sorted in place, or (up to 64) as the arrays of the vector window
+        let nc = cb - ca;
+        if nc > 64 {
+            ck[ca..cb].sort_unstable_by_key(|c| c.k);
+        } else if nc > 0 {
+            let mut rank = [0u8; 64];
+            if nc > 1 {
+                ranks_small(nc, |i| (ck[ca + i].k >> 32) as u32, &mut rank);
+            }
+            let sm = &mut w.small;
+            for i in 0..if nc > 1 { nc.max(8) } else { 1 } {
+                let (r, c) = (rank[i] as usize, &ck[ca + i.min(nc - 1)]); // lanes past nc land past the end
+                sm.ts.0[r] = (c.k >> 32) as u32;
+                sm.camp[r] = c.k as u32;
+                sm.cid[r] = c.cid;
+            }
+            // nxt: scanning back, `last` holds the stamp of this person and the index of the later click
+            if w.lctr >= 1 << 26 {
+                w.last.fill(0);
+                w.lctr = 0;
+            }
+            w.lctr += 1;
+            let stamp = w.lctr << 6;
+            for j in (0..nc).rev() {
+                let v = w.last[sm.camp[j] as usize];
+                sm.nxt.0[j] = if v >> 6 << 6 == stamp { v & 63 } else { nc as u32 };
+                w.last[sm.camp[j] as usize] = stamp | j as u32;
+            }
+        }
+        person_work(cx, name, evs, &ck[ca..cb], w);
     }
     w.ev = ev;
     w.ck = ck;
@@ -2338,7 +2545,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
 fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
     let width = cx.ndays;
     let organic = cx.ncamp;
-    let Work { rows, cred, assist, stamp, iv, seen, sctr, sessions, day_groups, cats, touched, .. } = w;
+    let Work { rows, cred, assist, stamp, iv, seen, sctr, sessions, day_groups, cats, touched, small, .. } = w;
 
     // sessions + user_daily rows
     sessions.clear();
@@ -2406,8 +2613,51 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
         for s in sessions.iter() {
             credit(organic, s);
         }
-    } else if nc * ns <= 16384 {
-        // few clicks or few sessions: per session, look at the clicks of its 7-day window [start - 7d, start]
+    } else if nc <= 64 {
+        // up to 64 clicks (sorted into `small`): per session, one vector pass finds the clicks of its 7-day window
+        // [start - 7d, start] (a contiguous run); the credit goes to the last, the assists to the last click of each
+        // campaign in the run
+        let nch = nc.div_ceil(8);
+        let valid = if nc == 64 { !0u64 } else { (1u64 << nc) - 1 };
+        let adummy = assist.len() - 4; // absorbs the increments of the unused steps
+        for s in sessions.iter() {
+            let m = win_mask(&small.ts.0, nch, s.start as u32) & valid;
+            let nz = m != 0;
+            let jh = (63 - (m | 1).leading_zeros()) as usize; // the last click of the window
+            let mut camp = if nz { small.camp[jh] as usize } else { organic };
+            if nz && jh > 0 && small.ts.0[jh - 1] == small.ts.0[jh] {
+                // credit: tie in ts -> smallest click_id
+                let t = small.ts.0[jh];
+                let mut best = jh;
+                let mut j = jh;
+                while j > 0 && small.ts.0[j - 1] == t {
+                    j -= 1;
+                    if cx.names.less(small.cid[j], small.cid[best]) {
+                        best = j;
+                    }
+                }
+                camp = small.camp[best] as usize;
+            }
+            // assists: the last click of each campaign in the window; three fixed steps, the rest in a loop
+            let mut c = m & nxt_mask(&small.nxt.0, nch, jh as u32 + 1);
+            macro_rules! bump {
+                ($n:expr) => {
+                    let j = (c.trailing_zeros() & 63) as usize;
+                    let at = if c != 0 { small.camp[j] as usize * width + s.d } else { adummy + $n };
+                    assist[at] += 1;
+                    c &= c.wrapping_sub(1);
+                };
+            }
+            bump!(0);
+            bump!(1);
+            bump!(2);
+            while c != 0 {
+                bump!(3);
+            }
+            credit(camp, s);
+        }
+    } else if nc * ns <= 2048 {
+        // few sessions: per session, look at the clicks of its 7-day window [start - 7d, start]
         // (a contiguous run of cs) for the credit and for the distinct assisting campaigns
         let (mut lo, mut hi) = (0, 0);
         for s in sessions.iter() {

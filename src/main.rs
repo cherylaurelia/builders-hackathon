@@ -2196,63 +2196,107 @@ unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
     sfence();
 }
 
+/// A cache line of the duplicate finder's table: 8 tags (0 = empty), then their 8 positions + 1.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct DLine([u32; 16]);
+
+/// (bit k set when tag k of `line` is `tag`, bit k set when tag k is empty)
+#[inline(always)]
+fn line_match(line: &[u32; 16], tag: u32) -> (u32, u32) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let v = _mm256_load_si256(line.as_ptr() as *const __m256i);
+        let m = |x: __m256i| _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, x))) as u32;
+        return (m(_mm256_set1_epi32(tag as i32)), m(_mm256_setzero_si256()));
+    }
+    #[allow(unreachable_code)]
+    (0..8).fold((0, 0), |(e, z), k| (e | ((line[k] == tag) as u32) << k, z | ((line[k] == 0) as u32) << k))
+}
+
 /// rules.md "Events" 2: per event-key bucket, among the copies of one event_id the smallest ingest_ts is kept and
-/// every other valid copy is marked dropped. Returns the number of filter candidates.
+/// every other valid copy is marked dropped. Returns the number of records whose tag repeats.
 ///
-/// The filter is one 64-bit word per two events: 32 "seen" bits (even) each with a "twice" bit (odd). A key sets
-/// two seen bits of its word; a key that finds both set sets their twice bits. All copies of a key meet the same
-/// bits, so every copy of a repeated key has both twice bits set at the end; a few other keys do too.
+/// One pass over the bucket's records puts each in a table of 64-byte lines, 8 tags + 8 positions each, probed
+/// with one SIMD compare: a record's line is low bits of mix(key), its tag 31 higher bits | 1, a full line spills
+/// into the next. A record whose tag is already there is a candidate, and so is the record it met (once). All
+/// copies of a key share its tag, so they all become candidates; a few other keys do too and are told apart by key.
 fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
+    // a record's position: shard << POS_T | index in that shard's stream of the bucket; with at most 127 shards,
+    // position + 1 stays below u32::MAX, the table's "already a candidate" mark
+    const POS_T: u32 = 25;
+    if shards.len() > 127 || shards.iter().any(|s| s.lg.iter().any(|l| l.len(LG_BLOCK) >> POS_T != 0)) {
+        die("too many events for the duplicate finder");
+    }
     par(
         threads,
         buckets,
-        || (Vec::<u64>::new(), Vec::<(u64, i64, u64)>::new(), 0usize),
-        |(filter, cand, total), b| {
+        || (Vec::<DLine>::new(), Vec::<u64>::new(), Vec::<LRec>::new(), 0usize),
+        |(table, dups, recs, total), b| {
             let n: usize = shards.iter().map(|s| s.lg[b].len(LG_BLOCK)).sum();
-            let words = (n / 2).next_power_of_two().max(64);
-            filter.clear();
-            filter.resize(words, 0);
-            let at = |k: u64| {
-                let h = mix(k);
-                ((h >> 10) as usize & (words - 1), 1u64 << (2 * (h & 31)) | 1u64 << (2 * ((h >> 5) & 31)))
-            };
-            for s in shards {
+            let lines = (n / 6).next_power_of_two().max(4); // at most 3/4 full
+            let mask = lines - 1;
+            table.clear();
+            table.resize(lines, DLine([0; 16]));
+            dups.clear();
+            for (t, s) in shards.iter().enumerate() {
+                let mut me = ((t as u32) << POS_T) + 1;
                 for blk in s.lg[b].slices(LG_BLOCK) {
-                    for r in blk {
-                        let (w, m) = at(r.key);
-                        let f = &mut filter[w];
-                        *f |= if *f & m == m { m << 1 } else { m };
-                    }
-                }
-            }
-            cand.clear();
-            for s in shards {
-                for blk in s.lg[b].slices(LG_BLOCK) {
-                    for r in blk {
-                        let (w, m) = at(r.key);
-                        if (filter[w] >> 1) & m == m {
-                            cand.push((r.key, r.ingest, r.loc));
+                    for (i, r) in blk.iter().enumerate() {
+                        if let Some(f) = blk.get(i + 8) {
+                            prefetch(&table[mix(f.key) as usize & mask]);
                         }
+                        let h = mix(r.key);
+                        let tag = (h >> 24) as u32 | 1;
+                        let mut l = h as usize & mask;
+                        loop {
+                            let line = &mut table[l].0;
+                            let (eq, empty) = line_match(line, tag);
+                            if eq != 0 {
+                                let at = 8 + eq.trailing_zeros() as usize;
+                                if line[at] != u32::MAX {
+                                    dups.push((tag as u64) << 32 | line[at] as u64);
+                                    line[at] = u32::MAX;
+                                }
+                                dups.push((tag as u64) << 32 | me as u64);
+                                break;
+                            }
+                            if empty != 0 {
+                                let at = empty.trailing_zeros() as usize;
+                                line[at] = tag;
+                                line[8 + at] = me;
+                                break;
+                            }
+                            l = (l + 1) & mask;
+                        }
+                        me += 1;
                     }
                 }
             }
-            *total += cand.len();
-            cand.sort_unstable_by_key(|c| c.0);
+            *total += dups.len();
+            dups.sort_unstable();
+            recs.clear();
+            recs.extend(dups.iter().map(|&d| {
+                let pos = (d as u32 - 1) as usize;
+                let (t, i) = (pos >> POS_T, pos & ((1 << POS_T) - 1));
+                // SAFETY: i < the stream's length, so block i / LG_BLOCK holds it
+                unsafe { *shards[t].lg[b].blocks[i / LG_BLOCK].add(i % LG_BLOCK) }
+            }));
             let mut i = 0;
-            while i < cand.len() {
-                // the copies of one key: the one with the smallest ingest_ts is kept
+            while i < recs.len() {
+                // the candidates of one tag, in table order; mostly the copies of one key
                 let mut j = i + 1;
-                let mut keep = i;
-                while j < cand.len() && cand[j].0 == cand[i].0 {
-                    if cand[j].1 < cand[keep].1 {
-                        keep = j;
-                    }
+                while j < recs.len() && dups[j] >> 32 == dups[i] >> 32 {
                     j += 1;
                 }
-                for k in i..j {
-                    if k != keep && cand[k].2 != 0 {
+                let g = &recs[i..j];
+                for (k, r) in g.iter().enumerate() {
+                    // dropped: a valid copy with an earlier copy of its key (smaller ingest_ts, or equal and before it:
+                    // copies with equal ingest_ts are identical, so exactly one of them is kept)
+                    if r.loc != 0 && g.iter().enumerate().any(|(x, o)| o.key == r.key && (o.ingest < r.ingest || (o.ingest == r.ingest && x < k))) {
                         // SAFETY: the address of an ERec in a live arena; no other thread touches this record now
-                        unsafe { (*(cand[k].2 as *mut ERec)).person = DROPPED };
+                        unsafe { (*(r.loc as *mut ERec)).person = DROPPED };
                     }
                 }
                 i = j;
@@ -2260,7 +2304,7 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
         },
     )
     .iter()
-    .map(|x| x.2)
+    .map(|x| x.3)
     .sum()
 }
 

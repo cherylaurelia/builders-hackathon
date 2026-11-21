@@ -590,12 +590,20 @@ impl IdTable {
         self.slot_from(self.home(key) as u32, key, ins)
     }
 
-    /// `slot` given `home(key)`.
+    /// `slot` given `home(key)`. The probe goes round the 4 slots of home's cache line (the line `aim` fetched)
+    /// before it moves on to the next line: a chain that ran on past the line's end would wait for memory.
     #[inline(always)]
     fn slot_from(&self, home: u32, key: u64, ins: &mut usize) -> u32 {
         let mask = self.slots.len() - 1;
-        let mut i = home as usize;
+        let home = home as usize;
+        let mut base = home & !3;
+        let mut t = 0usize;
         loop {
+            let i = base | ((home + t) & 3);
+            t += 1;
+            if t & 3 == 0 {
+                base = (base + 4) & mask;
+            }
             // SAFETY: i <= mask
             let s = unsafe { self.slots.get_unchecked(i) };
             let k = s.key.load(Relaxed);
@@ -612,7 +620,6 @@ impl IdTable {
                     Err(_) => {}
                 }
             }
-            i = (i + 1) & mask;
         }
     }
 

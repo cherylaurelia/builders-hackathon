@@ -30,6 +30,9 @@ use std::time::Instant;
 
 type Bytes = &'static [u8];
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+mod wide;
+
 /// The allocator: blocks of 1 MiB and more come from their own 2 MiB-aligned anonymous mappings advised for huge
 /// pages, everything smaller from the system allocator. With THP in `madvise` mode the system allocator's large
 /// blocks (the rows, the counting-sort buffers, the duplicate finder's tables, the file buffers) were 4 KiB pages:
@@ -2071,6 +2074,9 @@ struct Shard {
     k: K,
     #[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
     heads: Vec<Head>, // HEADS of them
+    // the dates the 512-bit event loop remembers (`wide::parse_events`)
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    dv: wide::DayV,
 }
 // SAFETY: the streams own their blocks; after the parse they are only read, except for `ERec::person` of distinct
 // records written by the dedup phase while nothing reads them
@@ -2165,6 +2171,8 @@ impl Shard {
             fm: [NO_MSM; 64],
             k: std::hint::black_box(K::NEW),
             heads: vec![NO_HEAD; HEADS],
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+            dv: wide::DayV::new(),
         }
     }
 
@@ -2893,6 +2901,19 @@ unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
 /// Parses the event lines that start in [start, end) of the `len` bytes at `buf` into `st`; the header line is
 /// skipped. `buf` must be readable for 144 bytes past `len`, and buf[len] must be `\n` (`read_span`).
 ///
+/// Eight lines at a time where the CPU has AVX-512 (`wide`), else one at a time (`parse_events_v3`). The wide
+/// loop counts the seconds between window_start and a date, so it wants a window that starts on a whole second.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: usize, st: &mut Shard) {
+    if wide::available() && cx.ws % 1000 == 0 {
+        wide::parse_events(cx, buf, start, end, len, st)
+    } else {
+        parse_events_v3(cx, buf, start, end, len, st)
+    }
+}
+
+/// `parse_events` one line at a time.
+///
 /// One pass per line for the usual shape, everything else goes to `event_line`, which is exact on any line. The
 /// usual shape: the line ends in its bytes 64..96 and its first 64 bytes are all 0x20..=0x7F; its first three
 /// fields end in those 64 bytes and the other four fit the 64 bytes after them; both IDs are 8 or 9 bytes;
@@ -2900,7 +2921,7 @@ unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
 /// precedence of the checks. What the line gives is written straight into the next place of the batch
 /// (`Shard::wait`), which counts only once the event is known to be kept.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
-unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: usize, st: &mut Shard) {
+unsafe fn parse_events_v3(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: usize, st: &mut Shard) {
     use std::arch::x86_64::*;
     let file = std::slice::from_raw_parts(buf, len);
     let first = start.saturating_sub(1);
@@ -4937,6 +4958,16 @@ mod tests {
         }
     }
 
+    type EventParser = unsafe fn(&Ctx, *const u8, usize, usize, usize, &mut Shard);
+    /// Every event parser of this build: the one the run uses first.
+    fn event_parsers() -> Vec<(&'static str, EventParser)> {
+        #[allow(unused_mut)]
+        let mut v: Vec<(&'static str, EventParser)> = vec![("parse_events", parse_events)];
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+        v.push(("parse_events_v3", parse_events_v3));
+        v
+    }
+
     /// (events as (person, ts, pay), dedup records as (key, ingest, has a record)), each sorted
     type Flat = (Vec<(u32, u32, u32)>, Vec<(u64, i64, bool)>);
     fn flat(st: &mut Shard) -> Flat {
@@ -5135,15 +5166,20 @@ mod tests {
                 cuts.push(r.below(len + 1));
             }
             cuts.sort();
-            let (mut a, mut b) = (Shard::new(16, 16), Shard::new(16, 16));
+            let mut b = Shard::new(16, 16);
             for w in cuts.windows(2) {
-                unsafe { parse_events(&c, padded.as_ptr(), w[0], w[1], len, &mut a) };
                 for_records::<7>(file, w[0], w[1], |f| event_fields(&c, f, &mut b));
                 b.drain::<true>(&c);
             }
-            let (fa, fb) = (flat(&mut a), flat(&mut b));
+            let fb = flat(&mut b);
             kept += fb.0.len();
-            assert!(fa == fb, "round {round}: fast parse differs\n{}", std::str::from_utf8(file).unwrap());
+            for (name, parse) in event_parsers() {
+                let mut a = Shard::new(16, 16);
+                for w in cuts.windows(2) {
+                    unsafe { parse(&c, padded.as_ptr(), w[0], w[1], len, &mut a) };
+                }
+                assert!(flat(&mut a) == fb, "round {round}: {name} differs\n{}", std::str::from_utf8(file).unwrap());
+            }
         }
         assert!(kept > 1000, "too few kept events ({kept}) to mean anything");
     }
@@ -5254,6 +5290,14 @@ mod tests {
                         unsafe { parse_events(&c, padded.as_ptr(), w[0], w[1], len, &mut a) };
                         for_records::<7>(file, w[0], w[1], |f| event_fields(&c, f, &mut b));
                         b.drain::<true>(&c);
+                        // the other event parsers of this build give the same
+                        for (name, parse) in event_parsers().into_iter().skip(1) {
+                            let (mut a2, mut b2) = (Shard::new(16, 16), Shard::new(16, 16));
+                            unsafe { parse(&c, padded.as_ptr(), w[0], w[1], len, &mut a2) };
+                            for_records::<7>(file, w[0], w[1], |f| event_fields(&c, f, &mut b2));
+                            b2.drain::<true>(&c);
+                            assert!(flat(&mut a2) == flat(&mut b2), "round {round}: {name} differs\n{}", String::from_utf8_lossy(file));
+                        }
                     } else {
                         unsafe { parse_clicks(&c, padded.as_ptr(), w[0], w[1], len, &mut a) };
                         for_records::<4>(file, w[0], w[1], |f| click_fields(&c, f, &mut b));
@@ -5274,6 +5318,182 @@ mod tests {
             }
         }
         assert!(kept > 3000 && clicks > 5000, "too few kept events ({kept}) or clicks ({clicks}) to mean anything");
+    }
+
+    /// Lines of the generator's shape with every field on its edges, in the order that makes the eight-line
+    /// parser's lanes differ: timestamps of all three forms across ten weeks (two months share a day of the month),
+    /// times and offsets at and past their limits, events ingested exactly 24 hours late and a second more, IDs
+    /// of 7 to 10 bytes, every price, fields quoted at random, bytes changed at random. Every event parser of the
+    /// build against the field parser, and the eight-line one must take most of the lines itself.
+    #[test]
+    fn edge_lines_match_reference() {
+        let c = ctx();
+        let mut r = Rng(0x0123_4567_89ab_cdef);
+        let jan1 = parse_ts(b"2028-01-01T00:00:00Z").unwrap() / 1000;
+        // `YYYY-MM-DDTHH:MM:SS` of a second of January to April 2028
+        fn civil(sec: i64) -> String {
+            let (mut d, s) = (sec.div_euclid(86_400), sec.rem_euclid(86_400));
+            let mut mo = 1;
+            for len in [31, 29, 31] {
+                if d < len {
+                    break;
+                }
+                d -= len;
+                mo += 1;
+            }
+            format!("2028-{mo:02}-{:02}T{:02}:{:02}:{:02}", d + 1, s / 3600, s / 60 % 60, s % 60)
+        }
+        fn b36(r: &mut Rng, n: usize) -> String {
+            (0..n).map(|_| char::from_digit(r.below(36) as u32, 36).unwrap()).collect()
+        }
+        fn id(r: &mut Rng, c: char, dirty: bool) -> String {
+            match if dirty { r.below(12) } else { 6 + r.below(54) } {
+                0 => String::new(),
+                1 => format!("{c}{}", b36(r, 6)),
+                2 => format!("{c}{}", b36(r, 9)),
+                3 => format!("{c}{} ", b36(r, 7)),
+                4 => format!("{c}{}\u{7f}", b36(r, 7)),
+                5 => format!("{c}{}é", b36(r, 6)),
+                6..=20 => format!("{c}{}", b36(r, 7)),
+                _ => format!("{c}{}", b36(r, 8)),
+            }
+        }
+        // a ts for the second `sec` (from 2028-01-01) in one of the three forms, now and then off its rules
+        fn ts(r: &mut Rng, jan1: i64, sec: i64, dirty: bool) -> String {
+            let mut v = match r.below(10) {
+                0..=3 => format!("{}Z", civil(sec)),
+                4..=6 => format!("{}{:03}", jan1 + sec, r.below(1000)),
+                _ => {
+                    let (h, m) = match r.below(8) {
+                        0 => (0, 0),
+                        1 => (23, 59),
+                        2 => (12, 0),
+                        _ => (r.below(13) as i64, [0, 30, 45][r.below(3)]),
+                    };
+                    let off = h * 3600 + m * 60;
+                    if r.below(2) == 0 {
+                        format!("{}+{h:02}:{m:02}", civil(sec + off))
+                    } else {
+                        format!("{}-{h:02}:{m:02}", civil(sec - off))
+                    }
+                }
+            };
+            match if dirty { r.below(10) } else { 99 } {
+                0 if v.len() >= 19 => v.replace_range(11..19, r.pick(&["24:00:00", "23:60:00", "23:59:60", "23:59:59", "00:00:00", "29:59:59", "19:5a:00", "1:00:000"])),
+                1 if v.len() == 25 => v.replace_range(19..25, r.pick(&["+24:00", "+23:60", "-23:59", "+05:6 ", " 05:30", "Z05:30", "+0530 ", "+29:00", "-9:300", "+05-30", "+05:3a"])),
+                2 if v.len() >= 10 => v.replace_range(5..10, r.pick(&["02-30", "02-29", "13-01", "00-10", "03-00", "03-32", "1a-01", "03 01"])),
+                3 => {
+                    let k = r.below(v.len());
+                    v.replace_range(k..k + 1, r.pick(&["0", "9", ":", "-", "T", "Z", "z", "x", "/", " ", "+", "\u{7f}", "\r"]));
+                }
+                4 => v.push_str(r.pick(&["0", "Z", " ", "\r"])),
+                5 => {
+                    v.pop();
+                }
+                6 => v.insert(0, '0'),
+                _ => {}
+            }
+            v
+        }
+        fn quote(r: &mut Rng, v: String, dirty: bool) -> String {
+            match r.below(if dirty { 26 } else { 100 }) {
+                0..=19 => format!("\"{v}\""),
+                20 => format!("\"{v}"),
+                21 => format!("{v}\""),
+                22 => "\"".to_string(),
+                _ => v,
+            }
+        }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+        let usual0 = wide::USUAL.load(Relaxed);
+        let (mut lines, mut kept) = (0, 0);
+        for round in 0..300 {
+            let mut ev = String::from("event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n");
+            for _ in 0..r.below(200) {
+                // 2028-02-05 .. 2028-03-20; the window is 2028-02-20 .. 2028-03-05
+                let sec = if r.below(3) == 0 { 35 * 86_400 + r.below(45 * 86_400) as i64 } else { 50 * 86_400 + r.below(14 * 86_400) as i64 };
+                let sec = match r.below(30) {
+                    0 => 50 * 86_400,     // window_start
+                    1 => 50 * 86_400 - 1, // a second before
+                    2 => 64 * 86_400,     // window_end
+                    3 => 64 * 86_400 - 1,
+                    _ => sec,
+                };
+                let ing = sec + [0, 30, 600, 86_400, 86_401, 86_399, -3600, 5 * 86_400, 40 * 86_400][r.below(9)];
+                // one line in four is dirty in its IDs, its ts, its type or its quotes
+                let dirty = r.below(4) == 0;
+                let f = [
+                    id(&mut r, 'e', dirty),
+                    id(&mut r, 'u', dirty),
+                    ts(&mut r, jan1, sec, dirty),
+                    if r.below(25) == 0 { ts(&mut r, jan1, ing, true) } else { format!("{}Z", civil(ing)) },
+                    r.pick(&["view", "view", "view", "view", "view", "cart", "cart", "purchase", "purchase", "purchase", "Purchase", "views", "cart ", "", "purchas", "purchased"][..if dirty { 16 } else { 10 }]).to_string(),
+                    r.pick(&["p1", "p2", "p2", "p39594", "p17893", "p8823", "p310", "", "P1"]).to_string(),
+                    r.pick(&["", "", "", "41607", "720", "0", "10000000", "10000001", "0250", "-5", "1.5", "12\r", "00000000000000000000000001"]).to_string(),
+                ];
+                let mut l = f.map(|v| quote(&mut r, v, dirty)).join(",");
+                match if dirty { r.below(15) } else { 99 } {
+                    0 => {
+                        let k = r.below(l.len());
+                        if l.is_char_boundary(k) && l.is_char_boundary(k + 1) {
+                            l.replace_range(k..k + 1, r.pick(&["\"", ",", "\r", "\u{1}", " ", "\u{0}"]));
+                        }
+                    }
+                    1 => l.push_str(",x"),
+                    2 => l = l.replacen(',', "", 1),
+                    3 => l.push_str(&" ".repeat(r.below(80))),
+                    _ => {}
+                }
+                ev += &l;
+                ev.push('\n');
+                lines += 1;
+            }
+            if round % 3 == 0 {
+                ev.pop();
+            }
+            let len = ev.len();
+            let mut padded = ev.clone().into_bytes();
+            padded.extend_from_slice(&[b'\n'; PAD]);
+            let file: Bytes = Box::leak(ev.into_bytes().into_boxed_slice());
+            let mut cuts = vec![0, len];
+            for _ in 0..r.below(4) {
+                cuts.push(r.below(len + 1));
+            }
+            cuts.sort();
+            let mut b = Shard::new(16, 16);
+            for w in cuts.windows(2) {
+                for_records::<7>(file, w[0], w[1], |f| event_fields(&c, f, &mut b));
+                b.drain::<true>(&c);
+            }
+            let fb = flat(&mut b);
+            kept += fb.0.len();
+            for (name, parse) in event_parsers() {
+                let mut a = Shard::new(16, 16);
+                for w in cuts.windows(2) {
+                    unsafe { parse(&c, padded.as_ptr(), w[0], w[1], len, &mut a) };
+                }
+                let fa = flat(&mut a);
+                if fa != fb {
+                    let (ea, eb): (std::collections::BTreeSet<_>, std::collections::BTreeSet<_>) = (fa.0.iter().collect(), fb.0.iter().collect());
+                    let (la, lb): (std::collections::BTreeSet<_>, std::collections::BTreeSet<_>) = (fa.1.iter().collect(), fb.1.iter().collect());
+                    panic!(
+                        "round {round}: {name} differs: events only here {:?}, only in the reference {:?}; dedup records only here {:?}, only in the reference {:?}\n{}",
+                        ea.difference(&eb).take(5).collect::<Vec<_>>(),
+                        eb.difference(&ea).take(5).collect::<Vec<_>>(),
+                        la.difference(&lb).take(5).collect::<Vec<_>>(),
+                        lb.difference(&la).take(5).collect::<Vec<_>>(),
+                        String::from_utf8_lossy(file)
+                    );
+                }
+            }
+        }
+        assert!(kept > 3000, "too few kept events ({kept} of {lines} lines) to mean anything");
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+        if wide::available() {
+            let took = wide::USUAL.load(Relaxed) - usual0;
+            eprintln!("the eight-line parser took {took} of {lines} lines itself; {kept} events kept");
+            assert!(took * 5 > lines, "the eight-line parser took {took} of {lines} lines itself");
+        }
     }
 
     #[test]

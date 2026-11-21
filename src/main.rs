@@ -2069,8 +2069,13 @@ fn main() {
     // about 90,000 events per person partition and per event-key bucket: more of them slow the parse (one open
     // block each per thread), fewer leave the later phases with work that no longer fits a core's cache
     let ev_est = ev_bytes / 72;
-    let pbits = (env_num("SESS_PBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000))).clamp(4, 12.min(id_bits - 4)).max(id_bits.saturating_sub(16));
-    let qbits = (env_num("SESS_QBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000))).clamp(4, 12);
+    // and no more than 2^9 of each: past that a thread's open streams (3 per partition pair) outgrow its half of an
+    // L2 shared by two hyperthreads. Intel Cascade Lake, 2 cores x 2 threads, 40M events: 2^10 + 2^10 +2.3% wall
+    // against 2^9 + 2^9, while 2^8 + 2^8 is even with it (164K events a partition); box, 75M events, 8 threads
+    // on 4 CPUs: 2^10 3.03 s, 2^9 2.76 s. Only inputs over ~69M events change. The partitions' floor (a click
+    // keeps its person's number in the partition in 16 bits) stays above the cap.
+    let pbits = (env_num("SESS_PBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000).min(9))).clamp(4, 12.min(id_bits - 4)).max(id_bits.saturating_sub(16));
+    let qbits = (env_num("SESS_QBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000).min(9))).clamp(4, 12);
     // 128 KiB a read: the copy from the page cache passes the piece through the core's cache twice (as source and
     // as copy), and a larger piece pushes the thread's open stream groups out of it (L2 is 1 MiB, and on the scorer
     // two threads share it). tmpfs, 20M, 21 runs each, parse CPU: 512 KiB 1.66 s, 128 KiB 1.62 s, 64 KiB 1.60 s,

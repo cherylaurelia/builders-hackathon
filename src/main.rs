@@ -2141,12 +2141,23 @@ struct IdMap {
     slots: Vec<(u64, u16)>, // key 0 = empty
     shift: u32,             // spread(key) >> shift = where the search for a key starts
     other: BytesMap<u16>,
+    // the IDs of up to 7 bytes by their raw bytes (`short_key`), for `get_short`; empty unless `with_short`
+    rkeys: Vec<u64>, // 0 = empty
+    rvals: Vec<u16>,
+    rshift: u32,
+}
+
+/// An ID of `len` < 8 bytes read as the `len` low bytes of `raw`, with `len + 1` above them: never 0, and the
+/// same for two IDs only when their bytes are.
+#[inline(always)]
+fn short_key(raw: u64, len: usize) -> u64 {
+    (raw & ((1u64 << (8 * len)) - 1)) | (len as u64 + 1) << 56
 }
 
 impl IdMap {
     fn new(ids: &[(Bytes, u16)]) -> IdMap {
         let cap = (ids.len() * 2).next_power_of_two().max(16);
-        let mut m = IdMap { slots: filled(cap, (0, 0)), shift: 64 - cap.trailing_zeros(), other: BytesMap::default() };
+        let mut m = IdMap { slots: filled(cap, (0, 0)), shift: 64 - cap.trailing_zeros(), other: BytesMap::default(), rkeys: Vec::new(), rvals: Vec::new(), rshift: 0 };
         for &(id, v) in ids {
             match pack(id) {
                 0 => {
@@ -2162,6 +2173,50 @@ impl IdMap {
             }
         }
         m
+    }
+
+    /// Adds the table `get_short` reads: the IDs of 1 to 7 bytes by their raw bytes, in a table of no more than a
+    /// fourth full (a lookup of an ID not in it ends at the first empty slot, nearly always the first).
+    fn with_short(mut self, ids: &[(Bytes, u16)]) -> IdMap {
+        let cap = (ids.len() * 4).next_power_of_two().max(16);
+        self.rkeys = vec![0; cap];
+        self.rvals = vec![0; cap];
+        self.rshift = 64 - cap.trailing_zeros();
+        for &(id, v) in ids {
+            if id.len() >= 1 && id.len() < 8 {
+                let mut raw = [0u8; 8];
+                raw[..id.len()].copy_from_slice(id);
+                let k = short_key(u64::from_le_bytes(raw), id.len());
+                let mut i = (spread(k) >> self.rshift) as usize;
+                while self.rkeys[i] != 0 {
+                    i = (i + 1) & (cap - 1);
+                }
+                self.rkeys[i] = k;
+                self.rvals[i] = v;
+            }
+        }
+        self
+    }
+
+    /// `get_at` for a map made `with_short`.
+    #[inline(always)]
+    unsafe fn get_short(&self, p: *const u8, len: usize) -> Option<u16> {
+        if len >= 8 {
+            return self.get_at(p, len);
+        }
+        let k = short_key((p as *const u64).read_unaligned(), len);
+        let mask = self.rkeys.len() - 1;
+        let mut i = (spread(k) >> self.rshift) as usize;
+        loop {
+            let key = *self.rkeys.get_unchecked(i);
+            if key == k {
+                return Some(*self.rvals.get_unchecked(i));
+            }
+            if key == 0 {
+                return None;
+            }
+            i = (i + 1) & mask;
+        }
     }
 
     #[inline(always)]
@@ -2258,7 +2313,7 @@ fn small_tables(data: &Path) -> Small {
         camp_ids.push(c);
         camp_channel.push(ch);
     }
-    Small { products: IdMap::new(&products), campaigns: IdMap::new(&campaigns), cat_names, cat_rank, unknown_cat, camp_ids, camp_channel }
+    Small { products: IdMap::new(&products), campaigns: IdMap::new(&campaigns).with_short(&campaigns), cat_names, cat_rank, unknown_cat, camp_ids, camp_channel }
 }
 
 /// rules.md "Linked IDs": every link line joins its two IDs in the ID table. Returns the number of lines joined.
@@ -2455,7 +2510,7 @@ unsafe fn fast_click(cx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, st: 
         Some(t) if t >= cx.base && t < cx.we => t,
         _ => return,
     };
-    let Some(camp) = cx.campaigns.get_at(line.add(f.at(2).0), f.at(2).1) else { return };
+    let Some(camp) = cx.campaigns.get_short(line.add(f.at(2).0), f.at(2).1) else { return };
     let (cp, cl, up, ul) = (line.add(f.at(0).0), f.at(0).1, line.add(f.at(1).0), f.at(1).1);
     let (ck, uk) = pack2(cp, cl, up, ul);
     st.click(cx, cx.names.key_or(ck, cp, cl), cx.names.key_or(uk, up, ul), t, camp);
@@ -2472,7 +2527,7 @@ unsafe fn fast_click64(cx: &Ctx, line: *const u8, e: usize, c: u64, q: u64, st: 
         Some(t) if t >= cx.base && t < cx.we => t,
         _ => return,
     };
-    let Some(camp) = cx.campaigns.get_at(line.add(f.at(2).0), f.at(2).1) else { return };
+    let Some(camp) = cx.campaigns.get_short(line.add(f.at(2).0), f.at(2).1) else { return };
     let (cp, cl, up, ul) = (line.add(f.at(0).0), f.at(0).1, line.add(f.at(1).0), f.at(1).1);
     let (ck, uk) = pack2(cp, cl, up, ul);
     st.click(cx, cx.names.key_or(ck, cp, cl), cx.names.key_or(uk, up, ul), t, camp);
@@ -3828,6 +3883,26 @@ fn write_camps(path: &Path, rows: &[CampRow]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn short_lookup_matches_get() {
+        // IDs of 1..=10 bytes, with a NUL byte, a shared prefix, a trailing NUL: `get_short` agrees with `get`
+        let ids: Vec<&'static [u8]> = vec![b"c_1", b"c_12", b"c_123", b"c_1234", b"c_12345", b"c_123456", b"c_1234567", b"c_12345678", b"a", b"a\0", b"a\0\0", b"\0", b"\xff\xfe", b"x_y_z_w"];
+        let list: Vec<(Bytes, u16)> = ids.iter().enumerate().map(|(i, &b)| (b, i as u16)).collect();
+        let m = IdMap::new(&list).with_short(&list);
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        let mut probes: Vec<Vec<u8>> = ids.iter().map(|b| b.to_vec()).collect();
+        for _ in 0..3000 {
+            let n = rng.below(11);
+            probes.push((0..n).map(|_| [b'c', b'_', b'1', b'2', b'a', 0, 255][rng.below(7)]).collect());
+        }
+        for p in probes {
+            let mut buf = p.clone();
+            buf.resize(p.len() + 16, 0x5a); // 16 readable bytes after the ID
+            let got = unsafe { m.get_short(buf.as_ptr(), p.len()) };
+            assert_eq!(got, m.get(&p), "id {p:?}");
+        }
+    }
+
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -3953,7 +4028,7 @@ mod tests {
             ndays: 14,
             ncamp: 0,
             products,
-            campaigns: IdMap::new(&[]),
+            campaigns: IdMap::new(&[]).with_short(&[]),
             unknown_cat: 2,
             cat_rank: vec![0, 1, 2],
             ids: IdTable::new(16),

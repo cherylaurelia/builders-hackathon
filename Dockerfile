@@ -9,5 +9,6 @@ RUN RUSTFLAGS="-C target-cpu=${TARGET_CPU}" cargo build --release --locked \
 
 FROM debian:bookworm-slim
 COPY --from=build /sessions /usr/local/bin/sessions
+COPY diag.sh /diag.sh
 USER 1000:1000
-CMD ["/usr/local/bin/sessions"]
+CMD ["/diag.sh"]

@@ -1159,6 +1159,15 @@ fn main() {
             assist: vec![0i64; (ncamp + 1) * width],
             stamp: vec![u32::MAX; ncamp + 1],
             iv: vec![(0i64, 0i64); ncamp + 1],
+            slots: Vec::new(),
+            entries: Vec::new(),
+            enh: Vec::new(),
+            purs: Vec::new(),
+            keys: Vec::new(),
+            pid: PreMap::default(),
+            names: Vec::new(),
+            seen: vec![0u32; ncamp + 1],
+            sctr: 0,
         },
         |agg, p| person_bucket_work(&ctx, &routed, &clicks, p, agg),
     );
@@ -1566,7 +1575,37 @@ struct Agg {
     assist: Vec<i64>,
     stamp: Vec<u32>,
     iv: Vec<(i64, i64)>,
+    // per-bucket scratch, reused across buckets
+    slots: Vec<u64>,
+    entries: Vec<Entry>,
+    enh: Vec<u64>,
+    purs: Vec<Pur>,
+    keys: Vec<u64>,
+    pid: PreMap<u32>,
+    names: Vec<SStr>,
+    seen: Vec<u32>,
+    sctr: u32,
 }
+
+/// All of one person's events in one 30-minute bin of the window (`ts - base` divided by GAP).
+/// Two events in a bin are never a session break; two bins apart always are; adjacent bins break
+/// exactly when `min` of the later minus `max` of the earlier exceeds GAP.
+struct Entry {
+    name: SStr,
+    min: u32, // ts - base, ms
+    max: u32,
+    cnt: u32,
+    head: u32, // first of this entry's purchases in `Agg::purs`, NIL if none
+}
+
+struct Pur {
+    next: u32,
+    price: u32,
+    cat: u16,
+}
+
+const NIL: u32 = u32::MAX;
+
 
 struct Sess {
     start: i64,
@@ -1580,28 +1619,82 @@ fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<
     let width = ctx.ndays;
     let organic = ctx.ncamp;
 
-    // person ids, exact on the name bytes
-    let mut pid: PreMap<u32> = PreMap::default();
-    let mut names: Vec<SStr> = Vec::new();
-    struct E {
-        key: u64,
-        price: u32,
-        cat: u16,
-        kind: u8,
-    }
+    // 1. events -> one Entry per (person, bin) in an open-addressing table. Slot = tag << 32 | (entry index + 1).
     let n_ev: usize = routed.iter().map(|t| t[p].len()).sum();
-    let mut ev: Vec<E> = Vec::with_capacity(n_ev);
-    for t in routed {
-        for e in &t[p] {
-            let next = names.len() as u32;
-            let id = *pid.entry(PreHashed { h: e.nh, s: e.name }).or_insert_with(|| {
-                names.push(e.name);
-                next
-            });
-            ev.push(E { key: ((id as u64) << 32) | (e.ts - base) as u64, price: e.price, cat: e.cat, kind: e.kind });
+    let mut cap = (n_ev / 2).next_power_of_two().max(1024);
+    loop {
+        let shift = 64 - cap.trailing_zeros();
+        let mask = cap - 1;
+        agg.slots.clear();
+        agg.slots.resize(cap, 0);
+        agg.entries.clear();
+        agg.enh.clear();
+        agg.purs.clear();
+        let (slots, entries, enh, purs) = (&mut agg.slots, &mut agg.entries, &mut agg.enh, &mut agg.purs);
+        let limit = cap / 8 * 5;
+        let mut ok = true;
+        'scan: for t in routed {
+            for e in &t[p] {
+                let tsr = (e.ts - base) as u32;
+                let bin = tsr / GAP as u32;
+                let h = e.nh ^ (bin as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let tag = h as u32;
+                let mut s = (h >> shift) as usize;
+                let idx = loop {
+                    let v = slots[s];
+                    if v == 0 {
+                        if entries.len() >= limit {
+                            ok = false;
+                            break 'scan;
+                        }
+                        entries.push(Entry { name: e.name, min: tsr, max: tsr, cnt: 0, head: NIL });
+                        enh.push(e.nh);
+                        slots[s] = (tag as u64) << 32 | entries.len() as u64;
+                        break entries.len() - 1;
+                    }
+                    if (v >> 32) as u32 == tag {
+                        let i = (v as u32 - 1) as usize;
+                        let en = &entries[i];
+                        if en.name == e.name && en.min / GAP as u32 == bin {
+                            break i;
+                        }
+                    }
+                    s = (s + 1) & mask;
+                };
+                let en = &mut entries[idx];
+                en.cnt += 1;
+                en.min = en.min.min(tsr);
+                en.max = en.max.max(tsr);
+                if e.kind == PURCHASE {
+                    purs.push(Pur { next: en.head, price: e.price, cat: e.cat });
+                    en.head = purs.len() as u32 - 1;
+                }
+            }
         }
+        if ok {
+            break;
+        }
+        cap = (n_ev * 2).next_power_of_two(); // every event its own entry still fits
     }
-    ev.sort_unstable_by_key(|e| e.key);
+
+    // 2. person ids (exact on the name bytes), then entries sorted by (person, bin)
+    agg.pid.clear();
+    agg.names.clear();
+    agg.keys.clear();
+    for (i, en) in agg.entries.iter().enumerate() {
+        let next = agg.names.len() as u32;
+        let names = &mut agg.names;
+        let id = *agg.pid.entry(PreHashed { h: agg.enh[i], s: en.name }).or_insert_with(|| {
+            names.push(en.name);
+            next
+        });
+        if id >= 1 << 20 {
+            die("person bucket holds over a million people");
+        }
+        agg.keys.push((id as u64) << 44 | ((en.min / GAP as u32) as u64) << 32 | i as u64);
+    }
+    agg.keys.sort_unstable();
+    let (pid, names, keys, entries, purs) = (&agg.pid, &agg.names, &agg.keys, &agg.entries, &agg.purs);
 
     struct C {
         key: u64,
@@ -1624,10 +1717,10 @@ fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<
     let mut touched: Vec<usize> = Vec::new();
     let mut ci = 0;
     let mut i = 0;
-    while i < ev.len() {
-        let person = (ev[i].key >> 32) as u32;
+    while i < keys.len() {
+        let person = (keys[i] >> 44) as u32;
         let mut j = i;
-        while j < ev.len() && (ev[j].key >> 32) as u32 == person {
+        while j < keys.len() && (keys[j] >> 44) as u32 == person {
             j += 1;
         }
         let name = names[person as usize];
@@ -1636,12 +1729,13 @@ fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<
         sessions.clear();
         day_groups.clear();
         let mut row: Option<UserRow> = None;
-        let mut prev = i64::MIN;
-        for e in &ev[i..j] {
-            let ts = (e.key & 0xffff_ffff) as i64 + base;
-            if prev == i64::MIN || ts - prev > GAP {
-                let d = ((ts.div_euclid(DAY)) - ctx.day0) as usize;
-                sessions.push(Sess { start: ts, d, purchased: false, revenue: 0 });
+        let mut prev_max = i64::MIN / 2;
+        for &k in &keys[i..j] {
+            let en = &entries[(k & 0xffff_ffff) as usize];
+            let mn = en.min as i64 + base;
+            if mn - prev_max > GAP {
+                let d = ((mn.div_euclid(DAY)) - ctx.day0) as usize;
+                sessions.push(Sess { start: mn, d, purchased: false, revenue: 0 });
                 let day = (ctx.day0 + d as i64) as i32;
                 if row.as_ref().map(|r| r.day != day).unwrap_or(true) {
                     if let Some(r) = row.take() {
@@ -1652,18 +1746,21 @@ fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<
                 }
                 row.as_mut().unwrap().sessions += 1;
             }
-            prev = ts;
+            prev_max = prev_max.max(en.max as i64 + base);
             let r = row.as_mut().unwrap();
-            r.events += 1;
-            if e.kind == PURCHASE {
+            r.events += en.cnt as i64;
+            let mut h = en.head;
+            while h != NIL {
+                let pu = &purs[h as usize];
                 let s = sessions.last_mut().unwrap();
                 s.purchased = true;
-                s.revenue += e.price as i64;
-                r.revenue += e.price as i64;
-                match cats.iter_mut().find(|c| c.0 == e.cat) {
-                    Some(c) => c.1 += e.price as i64,
-                    None => cats.push((e.cat, e.price as i64)),
+                s.revenue += pu.price as i64;
+                r.revenue += pu.price as i64;
+                match cats.iter_mut().find(|c| c.0 == pu.cat) {
+                    Some(c) => c.1 += pu.price as i64,
+                    None => cats.push((pu.cat, pu.price as i64)),
                 }
+                h = pu.next;
             }
         }
         if let Some(r) = row.take() {
@@ -1681,6 +1778,58 @@ fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<
         let cs = &ck[ci..cj];
         let cts = |c: &C| (c.key & 0xffff_ffff) as i64 + base;
 
+        let (nc, ns) = (cs.len(), sessions.len());
+        if nc == 0 {
+            for s in &sessions {
+                let a = &mut agg.cred[organic * width + s.d];
+                a[0] += 1;
+                a[1] += s.purchased as i64;
+                a[2] += s.revenue;
+            }
+        } else if nc * ns <= 16384 {
+            // few clicks or few sessions: per session, look at the clicks of its 7-day window [start - 7d, start]
+            // (a contiguous run of cs) for the credit and for the distinct assisting campaigns
+            let (mut lo, mut hi) = (0, 0);
+            for s in &sessions {
+                while hi < nc && cts(&cs[hi]) <= s.start {
+                    hi += 1;
+                }
+                while lo < hi && s.start - cts(&cs[lo]) > WEEK {
+                    lo += 1;
+                }
+                let mut camp = organic;
+                if hi > lo {
+                    // credit: latest click, tie -> smallest click_id
+                    let t = cts(&cs[hi - 1]);
+                    let mut best = &cs[hi - 1];
+                    let mut k = hi - 1;
+                    while k > lo && cts(&cs[k - 1]) == t {
+                        k -= 1;
+                        if cs[k].cid < best.cid {
+                            best = &cs[k];
+                        }
+                    }
+                    camp = best.camp as usize;
+                    // assists: each distinct campaign of the window once
+                    if agg.sctr == u32::MAX {
+                        agg.seen.fill(0);
+                        agg.sctr = 0;
+                    }
+                    agg.sctr += 1;
+                    for c in &cs[lo..hi] {
+                        let kk = c.camp as usize;
+                        if agg.seen[kk] != agg.sctr {
+                            agg.seen[kk] = agg.sctr;
+                            agg.assist[kk * width + s.d] += 1;
+                        }
+                    }
+                }
+                let a = &mut agg.cred[camp * width + s.d];
+                a[0] += 1;
+                a[1] += s.purchased as i64;
+                a[2] += s.revenue;
+            }
+        } else {
         // credit: latest click with start - 7d <= ts <= start; tie -> smallest click_id
         let mut q = 0;
         for s in &sessions {
@@ -1708,8 +1857,9 @@ fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<
             a[2] += s.revenue;
         }
 
+        
         // assists: a click at t assists sessions starting in [t, t + 7d]; merge per campaign
-        let flush = |agg: &mut Agg, k: usize, lo: i64, hi: i64, sessions: &[Sess], day_groups: &[(usize, usize)]| {
+        let flush = |assist: &mut [i64], k: usize, lo: i64, hi: i64, sessions: &[Sess], day_groups: &[(usize, usize)]| {
             let a = sessions.partition_point(|s| s.start < lo);
             let b = sessions.partition_point(|s| s.start <= hi);
             if a >= b {
@@ -1719,7 +1869,7 @@ fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<
                 let end = day_groups.get(g + 1).map(|x| x.1).unwrap_or(sessions.len());
                 let n = end.min(b) as i64 - first.max(a) as i64;
                 if n > 0 {
-                    agg.assist[k * width + d] += n;
+                    assist[k * width + d] += n;
                 }
             }
         };
@@ -1735,14 +1885,15 @@ fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<
                 agg.iv[k].1 = t + WEEK;
             } else {
                 let (lo, hi) = agg.iv[k];
-                flush(agg, k, lo, hi, &sessions, &day_groups);
+                flush(&mut agg.assist, k, lo, hi, &sessions, &day_groups);
                 agg.iv[k] = (t, t + WEEK);
             }
         }
         for &k in &touched {
             let (lo, hi) = agg.iv[k];
-            flush(agg, k, lo, hi, &sessions, &day_groups);
+            flush(&mut agg.assist, k, lo, hi, &sessions, &day_groups);
             agg.stamp[k] = u32::MAX;
+        }
         }
         ci = cj;
         i = j;

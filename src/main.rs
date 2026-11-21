@@ -260,7 +260,10 @@ impl Interner {
 
 // ---------------------------------------------------------------- memory
 
-/// `bytes` of zeroed anonymous memory, never freed; huge pages where the kernel offers them.
+/// Every region `map_anon` has handed out, as (address, bytes): what `release_regions` gives back.
+static REGIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// `bytes` of zeroed anonymous memory, never unmapped; huge pages where the kernel offers them.
 fn map_anon(bytes: usize) -> *mut u8 {
     let p = unsafe { libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
     if p == libc::MAP_FAILED {
@@ -270,17 +273,73 @@ fn map_anon(bytes: usize) -> *mut u8 {
     unsafe {
         libc::madvise(p, bytes, libc::MADV_HUGEPAGE); // a hint: fine if refused
     }
+    REGIONS.lock().unwrap_or_else(|_| die("region list poisoned")).push((p as usize, bytes));
     p as *mut u8
+}
+
+/// Gives the pages of every `map_anon` region back to the kernel, on `threads` threads. Call when nothing reads
+/// them any more: they read as zeros afterwards. Whatever is left, the exit frees on its one thread, and the run
+/// is not over before that. With huge pages that is a few ms either way; where the kernel gave 4 KiB pages (THP
+/// off) it is 36 ms at the exit for 20M events, against 18 ms here.
+fn release_regions(threads: usize) {
+    const STEP: usize = 8 << 20;
+    let regions = std::mem::take(&mut *REGIONS.lock().unwrap_or_else(|_| die("region list poisoned")));
+    let mut pieces = Vec::new();
+    for (p, n) in regions {
+        let mut o = 0;
+        while o < n {
+            pieces.push((p + o, (n - o).min(STEP)));
+            o += STEP;
+        }
+    }
+    par(
+        threads,
+        pieces.len(),
+        || (),
+        |_, i| {
+            // SAFETY: a piece of a live anonymous mapping that nothing reads any more; a hint, fine if refused
+            unsafe { libc::madvise(pieces[i].0 as *mut libc::c_void, pieces[i].1, libc::MADV_DONTNEED) };
+        },
+    );
+}
+
+/// Set at the start when the kernel never gives huge pages (transparent huge pages switched off).
+static SMALL_PAGES: AtomicBool = AtomicBool::new(false);
+
+/// With `SMALL_PAGES`: asks the kernel for the pages of the `bytes` at `p` (page aligned, in a `map_anon` region)
+/// in one call, where their first writes would take one page fault per 4 KiB. False when nothing was asked for:
+/// huge pages are on (a fault then brings 2 MiB at once, and this call on top was measured to cost, not save: 20M
+/// events, cold input, 0.68 -> 0.73 s), or the kernel does not know the call (before Linux 5.14).
+fn populate(p: usize, bytes: usize) -> bool {
+    if !SMALL_PAGES.load(Relaxed) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    // SAFETY: a hint on a live anonymous mapping; its pages stay zero
+    unsafe {
+        libc::madvise(p as *mut libc::c_void, bytes, libc::MADV_POPULATE_WRITE) == 0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (p, bytes);
+        false
+    }
 }
 
 /// A thread's bump allocator for stream blocks.
 struct Arena {
     cur: usize,
     end: usize,
+    ready: usize, // the chunk's pages below this address have been asked for (`populate`)
 }
 
 impl Arena {
     const CHUNK: usize = 32 << 20;
+    const STEP: usize = 2 << 20;
+
+    fn new() -> Arena {
+        Arena { cur: 0, end: 0, ready: 0 }
+    }
 
     #[inline]
     fn alloc(&mut self, bytes: usize) -> *mut u8 {
@@ -289,9 +348,15 @@ impl Arena {
             let n = bytes.max(Self::CHUNK);
             self.cur = map_anon(n) as usize;
             self.end = self.cur + n;
+            self.ready = self.cur;
         }
         let p = self.cur;
         self.cur += bytes;
+        while self.ready < self.cur {
+            let n = (self.end - self.ready).min(Self::STEP);
+            populate(self.ready, n);
+            self.ready += n;
+        }
         p as *mut u8
     }
 }
@@ -442,17 +507,21 @@ impl IdTable {
 
     /// Writes to every 2 MiB of the table, on `threads` threads. A page first touched by a read (a lookup) maps
     /// the shared zero page, and the first write there then leaves the whole 2 MiB in 4 KiB pages: every later
-    /// lookup would miss the TLB. A write first gets a huge page (where the kernel gives them).
+    /// lookup would miss the TLB. A write first gets a huge page (where the kernel gives them). Where it gives
+    /// none, all the pages are asked for here instead: no lookup or insert then waits for a page fault.
     fn populate(&self, threads: usize) {
         const HUGE: usize = 2 << 20;
         let bytes = self.slots.len() * std::mem::size_of::<Slot>();
+        let base = self.slots.as_ptr() as usize;
         par(
             threads,
             bytes.div_ceil(HUGE),
             || (),
             |_, i| {
-                // a zero stored over a zero: the slot stays empty
-                self.slots[i * HUGE / std::mem::size_of::<Slot>()].up.store(0, Relaxed);
+                if !populate(base + i * HUGE, (bytes - i * HUGE).min(HUGE)) {
+                    // a zero stored over a zero: the slot stays empty
+                    self.slots[i * HUGE / std::mem::size_of::<Slot>()].up.store(0, Relaxed);
+                }
             },
         );
     }
@@ -1441,7 +1510,7 @@ struct Ctx {
 impl Shard {
     fn new(parts: usize, buckets: usize) -> Shard {
         Shard {
-            arena: Arena { cur: 0, end: 0 },
+            arena: Arena::new(),
             ev: (0..parts).map(|_| Stream::new()).collect(),
             ck: (0..parts).map(|_| Stream::new()).collect(),
             lg: (0..buckets).map(|_| Stream::new()).collect(),
@@ -1541,6 +1610,11 @@ fn main() {
         usage0.set((c, ins));
     };
 
+    // no huge pages from this kernel: memory is asked for in bulk (`populate`). An unreadable setting counts as on.
+    if std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").is_ok_and(|s| s.contains("[never]")) {
+        SMALL_PAGES.store(true, Relaxed);
+    }
+
     // manifest
     let manifest = std::fs::read_to_string(data.join("manifest.json")).unwrap_or_else(|e| die(&format!("manifest.json: {e}")));
     let ws = manifest_ts(&manifest, "window_start");
@@ -1568,7 +1642,11 @@ fn main() {
     let ev_est = ev_bytes / 72;
     let pbits = (env_num("SESS_PBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000))).clamp(4, 12.min(id_bits - 4));
     let qbits = (env_num("SESS_QBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000))).clamp(4, 12);
-    let chunk = env_num("SESS_CHUNK").filter(|&c| c >= 4096).unwrap_or(512 << 10);
+    // 128 KiB a read: the copy from the page cache passes the piece through the core's cache twice (as source and
+    // as copy), and a larger piece pushes the thread's open stream groups out of it (L2 is 1 MiB, and on the scorer
+    // two threads share it). tmpfs, 20M, 21 runs each, parse CPU: 512 KiB 1.66 s, 128 KiB 1.62 s, 64 KiB 1.60 s,
+    // 32 KiB 1.58 s; wall medians 0.340, 0.336, 0.333, 0.354 s
+    let chunk = env_num("SESS_CHUNK").filter(|&c| c >= 4096).unwrap_or(128 << 10);
 
     // the parse queue: events first, then clicks
     let mut work = Vec::new();
@@ -1691,6 +1769,10 @@ fn main() {
     });
     lap(&format!("sessions aggregated, {} user rows written", n_rows.load(Relaxed)));
 
+    // the records and the ID table have been read for the last time: their memory goes back to the kernel while
+    // this thread writes the campaign table. A thread that cannot start leaves it to the exit.
+    let releaser = std::thread::Builder::new().spawn(move || release_regions(threads)).ok();
+
     // campaign_daily
     let mut cred = vec![[0i64; 3]; (ncamp + 1) * width];
     let mut assist = vec![0i64; (ncamp + 1) * width];
@@ -1716,6 +1798,9 @@ fn main() {
         }
     }
     write_camps(&cd.join("part-0.parquet"), &camp_rows).unwrap_or_else(|e| die(&format!("write campaign_daily: {e}")));
+    if let Some(h) = releaser {
+        let _ = h.join(); // memory still held only costs time at the exit
+    }
     lap(&format!("written: {} campaign rows", camp_rows.len()));
     if std::env::var_os("SESS_DEBUG").is_some() {
         if let Ok(t) = std::fs::read_to_string("/proc/self/smaps_rollup") {
@@ -3412,7 +3497,7 @@ mod tests {
     #[test]
     fn streams_keep_every_record_where_push_said() {
         let mut r = Rng(17);
-        let mut arena = Arena { cur: 0, end: 0 };
+        let mut arena = Arena::new();
         let mut s12: Vec<Stream<ERec>> = (0..23).map(|_| Stream::new()).collect();
         let mut s24: Vec<Stream<LRec>> = (0..23).map(|_| Stream::new()).collect();
         let mut want12: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); 23];

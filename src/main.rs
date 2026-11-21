@@ -30,6 +30,107 @@ use std::time::Instant;
 
 type Bytes = &'static [u8];
 
+/// The allocator: blocks of 1 MiB and more come from their own 2 MiB-aligned anonymous mappings advised for huge
+/// pages, everything smaller from the system allocator. With THP in `madvise` mode the system allocator's large
+/// blocks (the rows, the counting-sort buffers, the duplicate finder's tables, the file buffers) were 4 KiB pages:
+/// a fault and a zeroed page per 4 KiB written. A block that grows moves its pages (mremap) into a new aligned
+/// reservation instead of copying them.
+#[cfg(target_os = "linux")]
+mod huge_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    const BIG: usize = 1 << 20;
+    const HP: usize = 2 << 20;
+
+    pub struct Huge;
+
+    fn big(l: &Layout) -> bool {
+        l.size() >= BIG && l.align() <= HP
+    }
+    fn span(size: usize) -> usize {
+        (size + HP - 1) & !(HP - 1)
+    }
+
+    /// `len` (a multiple of HP) bytes of address space at a multiple of HP, unbacked; null on failure.
+    unsafe fn reserve(len: usize, prot: i32) -> *mut u8 {
+        let raw = libc::mmap(std::ptr::null_mut(), len + HP, prot, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0);
+        if raw == libc::MAP_FAILED {
+            return std::ptr::null_mut();
+        }
+        let r = raw as usize;
+        let a = (r + HP - 1) & !(HP - 1);
+        if a > r {
+            libc::munmap(raw, a - r);
+        }
+        if r + HP > a {
+            libc::munmap((a + len) as *mut libc::c_void, r + HP - a);
+        }
+        a as *mut u8
+    }
+
+    unsafe fn map(size: usize) -> *mut u8 {
+        let len = span(size);
+        let p = reserve(len, libc::PROT_READ | libc::PROT_WRITE);
+        if !p.is_null() {
+            libc::madvise(p as *mut libc::c_void, len, libc::MADV_HUGEPAGE);
+        }
+        p
+    }
+
+    unsafe impl GlobalAlloc for Huge {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            if big(&l) { map(l.size()) } else { System.alloc(l) }
+        }
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            if big(&l) { map(l.size()) } else { System.alloc_zeroed(l) } // fresh mappings read as zeros
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            if big(&l) {
+                libc::munmap(p as *mut libc::c_void, span(l.size()));
+            } else {
+                System.dealloc(p, l)
+            }
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+            let nl = Layout::from_size_align_unchecked(new, l.align());
+            match (big(&l), big(&nl)) {
+                (false, false) => System.realloc(p, l, new),
+                (true, true) => {
+                    let (old, len) = (span(l.size()), span(new));
+                    if len <= old {
+                        if len < old {
+                            libc::munmap(p.add(len) as *mut libc::c_void, old - len);
+                        }
+                        return p;
+                    }
+                    // the pages move to an aligned reservation of the new size: no copy, no new faults for them
+                    let to = reserve(len, libc::PROT_NONE);
+                    if to.is_null() {
+                        return std::ptr::null_mut();
+                    }
+                    let q = libc::mremap(p as *mut libc::c_void, old, len, libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED, to as *mut libc::c_void);
+                    if q == libc::MAP_FAILED {
+                        libc::munmap(to as *mut libc::c_void, len);
+                        return std::ptr::null_mut();
+                    }
+                    libc::madvise(q, len, libc::MADV_HUGEPAGE);
+                    q as *mut u8
+                }
+                _ => {
+                    let q = self.alloc(nl);
+                    if !q.is_null() {
+                        std::ptr::copy_nonoverlapping(p, q, l.size().min(new));
+                        self.dealloc(p, l);
+                    }
+                    q
+                }
+            }
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOC: huge_alloc::Huge = huge_alloc::Huge;
+
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
@@ -249,20 +350,10 @@ fn filled<T: Clone>(n: usize, v: T) -> Vec<T> {
     x
 }
 
-/// An empty vector with room for `cap` elements whose memory the kernel backs with huge pages where it can (THP in
-/// `madvise` mode leaves an allocator's memory in 4 KiB pages: a page fault and a zeroed page per 4 KiB written;
-/// the sessions phase took 37,000 of them at 20M against the parse's 3,700). A hint only.
+/// An empty vector with room for `cap` elements, reserved at once: a block of 1 MiB or more gets huge pages from
+/// the allocator (see `huge_alloc`), and one that never grows is never moved.
 fn huge_vec<T>(cap: usize) -> Vec<T> {
-    let v: Vec<T> = Vec::with_capacity(cap);
-    const HUGE: usize = 2 << 20;
-    let (p, bytes) = (v.as_ptr() as usize, cap * std::mem::size_of::<T>());
-    let (a, b) = ((p + HUGE - 1) & !(HUGE - 1), (p + bytes) & !(HUGE - 1));
-    #[cfg(target_os = "linux")]
-    if b > a {
-        // SAFETY: [a, b) lies inside the allocation; the advice changes no contents
-        unsafe { libc::madvise(a as *mut libc::c_void, b - a, libc::MADV_HUGEPAGE) };
-    }
-    v
+    Vec::with_capacity(cap)
 }
 
 /// Gives the pages of every `map_anon` region back to the kernel, on `threads` threads. Call when nothing reads
@@ -2115,6 +2206,9 @@ fn main() {
     let width = ndays;
     // a thread's rows: about one per 9 events, and room for twice its share (more only grows the vector)
     let rows_cap = n_ev / threads / 4 + 1024;
+    // the counting sorts' buffers: room for the largest partition at once, in huge pages
+    let ev_cap = order.first().map_or(0, |x| x.0);
+    let ck_cap = (0..np).map(|p| shards.iter().map(|s| s.ck[p].len(CK_BLOCK)).sum::<usize>()).max().unwrap_or(0);
     let next = AtomicUsize::new(0);
     let n_rows = AtomicUsize::new(0);
     // A thread that has emptied the queue hands its campaign cells to this thread, then writes its user file; this
@@ -2126,7 +2220,7 @@ fn main() {
                 let (cx, shards, order, next, n_rows, ud, cat_names) = (&cx, &shards, &order, &next, &n_rows, &ud, &cat_names);
                 let tx = tx.clone();
                 sc.spawn(move || {
-                    let mut w = Work::new(cx, rows_cap);
+                    let mut w = Work::new(cx, rows_cap, ev_cap, ck_cap);
                     loop {
                         let i = next.fetch_add(1, Relaxed);
                         if i >= order.len() {
@@ -2880,7 +2974,7 @@ struct Work {
 }
 
 impl Work {
-    fn new(cx: &Ctx, rows_cap: usize) -> Work {
+    fn new(cx: &Ctx, rows_cap: usize, ev_cap: usize, ck_cap: usize) -> Work {
         let cells = (cx.ncamp + 1) * cx.ndays;
         let local = (1usize << cx.pshift) + 1;
         Work {
@@ -2894,8 +2988,8 @@ impl Work {
             sctr: 0,
             start: filled(local + 2, 0),
             cstart: filled(local + 2, 0),
-            ev: Vec::new(),
-            ck: Vec::new(),
+            ev: huge_vec(ev_cap),
+            ck: huge_vec(ck_cap),
             sessions: Vec::new(),
             day_groups: Vec::new(),
             cats: Vec::new(),

@@ -1044,6 +1044,13 @@ impl Table {
     fn prefetch(&self, h: u64) {
         prefetch(unsafe { self.slots.add((h >> self.shift) as usize) });
     }
+    /// For a lookup that probably inserts: the slot and its key.
+    #[inline(always)]
+    fn prefetch_insert(&self, h: u64) {
+        let i = (h >> self.shift) as usize;
+        prefetch(unsafe { self.slots.add(i) });
+        prefetch(unsafe { self.keys.add(i) });
+    }
     #[cold]
     fn grab(&self, credits: &mut usize) -> bool {
         if self.overflow.load(Relaxed) {
@@ -1141,7 +1148,17 @@ impl Table {
     }
     /// Once all unions are done: point each slot of `log` at its root and pick each root's smallest ID.
     fn finalize(&self, log: &[u32]) {
-        for &i in log {
+        for (j, &i) in log.iter().enumerate() {
+            if let Some(&n) = log.get(j + 8) {
+                prefetch(unsafe { self.slots.add(n as usize) });
+                prefetch(unsafe { self.keys.add(n as usize) });
+            }
+            if let Some(&n) = log.get(j + 4) {
+                let p = self.parent(n);
+                prefetch(unsafe { self.slots.add(p as usize) });
+                prefetch(unsafe { self.best.add(p as usize) });
+                prefetch(unsafe { self.keys.add(p as usize) });
+            }
             let r = self.find(i);
             let w = &self.slot(i as usize).w;
             w.store((w.load(Relaxed) & !0xFFFF_FFFF) | r as u64, Relaxed);
@@ -1199,28 +1216,39 @@ struct LinkSt {
     pend: Vec<(SStr, u64, SStr, u64)>,
     credits: usize,
     log: Vec<u32>, // slots this thread created
+    ids: Vec<(u32, u32)>,
 }
 
 fn flush_links(tbl: &Table, st: &mut LinkSt) {
     let mut pend = std::mem::take(&mut st.pend);
+    let mut ids = std::mem::take(&mut st.ids);
     for &(a, ha, b, hb) in &pend {
         let ia = tbl.slot_of::<true>(a, ha, &mut st.credits, &mut st.log);
         let ib = tbl.slot_of::<true>(b, hb, &mut st.credits, &mut st.log);
         if ia != NONE && ib != NONE {
-            tbl.union(ia, ib);
+            // the parents are about to be walked: have them on the way
+            prefetch(unsafe { tbl.slots.add(tbl.parent(ia) as usize) });
+            prefetch(unsafe { tbl.slots.add(tbl.parent(ib) as usize) });
+            ids.push((ia, ib));
         }
     }
+    for &(ia, ib) in &ids {
+        tbl.union(ia, ib);
+    }
+    ids.clear();
+    st.ids = ids;
     pend.clear();
     st.pend = pend;
 }
 
 /// Every ID of a link line goes into the table; the two IDs of a line are unioned.
 fn build_links(tbl: &Table, files: &[Bytes], threads: usize) {
-    let ch = chunks(files);
+    let ch = chunks_of(files, 1 << 18); // small pieces: the link files are few and uneven
+    
     let sts = par(
         threads,
         ch.len(),
-        || LinkSt { pend: Vec::with_capacity(BATCH), credits: 0, log: Vec::new() },
+        || LinkSt { pend: Vec::with_capacity(BATCH), credits: 0, log: Vec::new(), ids: Vec::with_capacity(BATCH) },
         |st, i| {
             let (f, s, e) = ch[i];
             let end = f.as_ptr() as usize + f.len();
@@ -1230,8 +1258,8 @@ fn build_links(tbl: &Table, files: &[Bytes], threads: usize) {
                 }
                 let (ka, kb) = (SStr::field(a, end), SStr::field(b, end));
                 let (ha, hb) = (ka.hash() | 2, kb.hash() | 2);
-                tbl.prefetch(ha);
-                tbl.prefetch(hb);
+                tbl.prefetch_insert(ha);
+                tbl.prefetch_insert(hb);
                 st.pend.push((ka, ha, kb, hb));
                 if st.pend.len() == BATCH {
                     flush_links(tbl, st);

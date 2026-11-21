@@ -291,6 +291,9 @@ impl<T: Copy> Blocks<T> {
     }
     /// Writes out the staged bytes.
     fn flush(&mut self) {
+        if self.fill == 0 {
+            return; // also: no block yet, dst is null
+        }
         unsafe { std::ptr::copy_nonoverlapping(self.buf.0.as_ptr(), self.dst, self.fill) };
         self.dst = unsafe { self.dst.add(self.fill) };
         self.fill = 0;

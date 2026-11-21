@@ -2905,7 +2905,7 @@ struct Work {
     sessions: Vec<Sess>,
     sbit: Vec<u64>, // the 30-minute bins a session of the person starts in
     spre: Vec<u32>, // per word of `sbit`, the bits of the words before it
-    sday: Vec<u32>, // per day, and past the last: the person's sessions that start before it
+    sday: Vec<u16>, // per day, and past the last (17 more entries): the person's sessions that start before it
     stamp: Vec<bool>,
     iv: Vec<(i64, i64)>,
     seen: Vec<u32>,
@@ -2922,7 +2922,7 @@ impl Work {
             rows: huge_vec(rows_cap),
             people: huge_vec(rows_cap / 2),
             cred: filled(cells, 0),
-            assist: filled(cells, 0),
+            assist: filled(cells + 16, 0), // + 16: the vector steps of `credit_big` read and write whole vectors
             around: filled(cells, 0),
             buy: filled(cells, Buy { purchasing: 0, revenue: 0 }),
             doff: cx.base - cx.day0 * DAY,
@@ -2948,7 +2948,7 @@ impl Work {
             sessions: Vec::new(),
             sbit: vec![0; nbins / 64 + 1],
             spre: vec![0; nbins / 64 + 1],
-            sday: vec![0; cx.ndays + 2],
+            sday: vec![0; cx.ndays + 18],
             stamp: vec![false; cx.ncamp + 1],
             iv: vec![(0, 0); cx.ncamp + 1],
             seen: filled(cx.ncamp + 1, 0),
@@ -3413,7 +3413,7 @@ fn credit_clicks(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
     let (width, organic) = (cx.ndays, cx.ncamp);
     let Work { cred, assist, around, buy, ses, ck, cts, ccamp, eq, .. } = w;
     let cs = &ck[ca..ca + nc];
-    assert!(nc <= 64 && assist.len() == (organic + 1) * width);
+    assert!(nc <= 64 && assist.len() >= (organic + 1) * width);
     for (j, c) in cs.iter().enumerate() {
         // SAFETY: j < nc <= 64, and the arrays hold 72
         unsafe {
@@ -3591,9 +3591,9 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
             while j < ns && (ses[j].d as usize) < d {
                 j += 1;
             }
-            *x = j as u32;
+            *x = j as u16; // a person has fewer sessions than bins, under 2^12
         }
-        let (ses, sday): (&[Ses], &[u32]) = (&ses[..ns], sday);
+        let (ses, sday): (&[Ses], &[u16]) = (&ses[..ns], sday);
         let mut flush = |k: usize, lo: i64, hi: i64| {
             let mut a = before((lo / GAP) as usize);
             a += (a < ns && (ses[a].start as i64) < lo) as usize;
@@ -3602,6 +3602,35 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
             if a >= b {
                 return;
             }
+            // Day d has the sessions sday[d]..sday[d + 1], of which a..b are in the interval: none on a day
+            // before the first or after the last of them (the difference below is then not positive).
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            // SAFETY: `sday` has 17 entries past the last day and `assist` 16 past the last cell, so the vectors
+            // of the last step are inside them; the lanes past the last day add 0 (there sday = ns >= b)
+            unsafe {
+                use std::arch::x86_64::*;
+                let (av, bv) = (_mm256_set1_epi16(a as i16), _mm256_set1_epi16(b as i16));
+                let row = assist.as_mut_ptr().add(k * width);
+                let mut d = 0;
+                while d < width {
+                    let first = _mm256_loadu_si256(sday.as_ptr().add(d) as *const __m256i);
+                    let end = _mm256_loadu_si256(sday.as_ptr().add(d + 1) as *const __m256i);
+                    let n = _mm256_subs_epu16(_mm256_min_epu16(end, bv), _mm256_max_epu16(first, av));
+                    let old = _mm256_loadu_si256(row.add(d) as *const __m256i);
+                    let sum = _mm256_add_epi16(old, n);
+                    _mm256_storeu_si256(row.add(d) as *mut __m256i, sum);
+                    // a count that went round is below what it was
+                    let fine = _mm256_movemask_epi8(_mm256_cmpeq_epi16(_mm256_max_epu16(sum, old), sum));
+                    if fine != -1 {
+                        for j in (0..16).filter(|j| fine >> (2 * j) & 1 == 0) {
+                            around[k * width + d + j] += 1;
+                        }
+                    }
+                    d += 16;
+                }
+                return;
+            }
+            #[allow(unreachable_code)]
             for d in ses[a].d as usize..=ses[b - 1].d as usize {
                 assisted(assist, around, k * width + d, (sday[d + 1] as usize).min(b) as u32 - (sday[d] as usize).max(a) as u32);
             }

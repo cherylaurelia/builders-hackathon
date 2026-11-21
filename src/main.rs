@@ -2348,7 +2348,7 @@ fn line_match(line: &[u32; 16], tag: u32) -> (u32, u32) {
 /// every other valid copy is marked dropped. Returns the number of records whose tag repeats.
 ///
 /// One pass over the bucket's records puts each in a table of 64-byte lines, 8 tags + 8 positions each, probed
-/// with one SIMD compare: a record's line is low bits of mix(key), its tag 31 higher bits | 1, a full line spills
+/// with one SIMD compare: a record's line is the top bits of key * 2^64 / phi, its tag 31 lower bits | 1, a full line spills
 /// into the next. A record whose tag is already there is a candidate, and so is the record it met (once). All
 /// copies of a key share its tag, so they all become candidates; a few other keys do too and are told apart by key.
 fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
@@ -2366,6 +2366,9 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
             let n: usize = shards.iter().map(|s| s.lg[b].len(LG_BLOCK)).sum();
             let lines = (n / 6).next_power_of_two().max(4); // at most 3/4 full
             let mask = lines - 1;
+            // Fibonacci hashing: the line is the top bits of key * 2^64 / phi, which depend on every bit of the key
+            let shift = 64 - lines.trailing_zeros();
+            let fib = |k: u64| k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
             table.clear();
             table.resize(lines, DLine([0; 16]));
             dups.clear();
@@ -2374,11 +2377,11 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
                 for blk in s.lg[b].slices(LG_BLOCK) {
                     for (i, r) in blk.iter().enumerate() {
                         if let Some(f) = blk.get(i + 8) {
-                            prefetch(&table[mix(f.key) as usize & mask]);
+                            prefetch(&table[(fib(f.key) >> shift) as usize]);
                         }
-                        let h = mix(r.key);
-                        let tag = (h >> 24) as u32 | 1;
-                        let mut l = h as usize & mask;
+                        let h = fib(r.key);
+                        let tag = (h >> 8) as u32 | 1;
+                        let mut l = (h >> shift) as usize;
                         loop {
                             let line = &mut table[l].0;
                             let (eq, empty) = line_match(line, tag);
@@ -2405,19 +2408,34 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
             }
             *total += dups.len();
             dups.sort_unstable();
-            recs.clear();
-            recs.extend(dups.iter().map(|&d| {
+            let at = |d: u64| {
                 let pos = (d as u32 - 1) as usize;
                 let (t, i) = (pos >> POS_T, pos & ((1 << POS_T) - 1));
                 // SAFETY: i < the stream's length, so block i / LG_BLOCK holds it
-                unsafe { *shards[t].lg[b].blocks[i / LG_BLOCK].add(i % LG_BLOCK) }
-            }));
+                unsafe { shards[t].lg[b].blocks[i / LG_BLOCK].add(i % LG_BLOCK) as *const LRec }
+            };
+            // the candidates' records, and then the events they may mark, asked for AHEAD candidates before use
+            const AHEAD: usize = 16;
+            recs.clear();
+            for x in 0..dups.len() {
+                if let Some(&d) = dups.get(x + AHEAD) {
+                    prefetch(at(d));
+                }
+                // SAFETY: `at` is the address of a record of a live stream
+                recs.push(unsafe { *at(dups[x]) });
+            }
+            for r in recs.iter().take(AHEAD) {
+                prefetch(r.loc as *const ERec);
+            }
             let mut i = 0;
             while i < recs.len() {
                 // the candidates of one tag, in table order; mostly the copies of one key
                 let mut j = i + 1;
                 while j < recs.len() && dups[j] >> 32 == dups[i] >> 32 {
                     j += 1;
+                }
+                for r in &recs[(i + AHEAD).min(recs.len())..(j + AHEAD).min(recs.len())] {
+                    prefetch(r.loc as *const ERec); // loc 0 is a harmless hint
                 }
                 let g = &recs[i..j];
                 for (k, r) in g.iter().enumerate() {

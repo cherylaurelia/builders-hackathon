@@ -2435,10 +2435,12 @@ fn line_match(line: &[u32; 16], tag: u32) -> (u32, u32) {
 /// a repeat of a tag joins (or starts) that tag's group: see `mark_duplicates`.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn dup_insert(tp: *mut DLine, mask: usize, shift: u32, r: &LRec, me: u32, mem: &mut Vec<(LRec, u32)>, groups: &mut Vec<(u32, u32)>, firsts: &mut Vec<(u32, u32)>) {
+unsafe fn dup_insert(tp: *mut DLine, mask: usize, shift: u32, qb: u32, r: &LRec, me: u32, mem: &mut Vec<(LRec, u32)>, groups: &mut Vec<(u32, u32)>, firsts: &mut Vec<(u32, u32)>) {
     let h = r.key.wrapping_mul(0x9E37_79B9_7F4A_7C15); // `fib` of mark_duplicates
     let tag = (h >> 8) as u32 | 1;
-    let mut l = (h >> shift) as usize;
+    // the event-key bucket is the top `qb` bits of this same product: take the line from the bits below them, or every record of a
+    // bucket would pile into 1/2^qb of the lines (20M events in 17 s)
+    let mut l = ((h << qb) >> shift) as usize;
     loop {
         // SAFETY: l <= mask, a line of the table
         let line = &mut (*tp.add(l)).0;
@@ -2516,8 +2518,9 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
             };
             let tp = table.as_mut_ptr();
             // one record into the table; a repeat of a tag joins (or starts) that tag's group
-            let mut insert = |r: &LRec, me: u32| unsafe { dup_insert(tp, mask, shift, r, me, mem, groups, firsts) };
-            let line_of = |r: &LRec| unsafe { tp.add((fib(r.key) >> shift) as usize) };
+            let qb = buckets.trailing_zeros();
+            let mut insert = |r: &LRec, me: u32| unsafe { dup_insert(tp, mask, shift, qb, r, me, mem, groups, firsts) };
+            let line_of = |r: &LRec| unsafe { tp.add(((fib(r.key) << qb) >> shift) as usize) };
             // ahead of record i: its stream RA records on, and the table line of the record LA on
             const RA: usize = 40;
             const LA: usize = 8;

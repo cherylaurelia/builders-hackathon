@@ -2947,6 +2947,7 @@ struct DayAcc {
     revenue: i64,
 }
 
+#[derive(Clone, Copy)]
 struct Sess {
     start: i64, // ms after `Ctx::base`
     d: usize,
@@ -2978,6 +2979,7 @@ struct Work {
     cats: Vec<(u16, i64)>,
     bins: Vec<Bin>, // the bins of the person at hand (all free between people)
     bits: Vec<u64>, // which bins are taken
+    blist: Vec<u32>, // the taken bins of the person at hand, in order
     bin_sess: Vec<u32>, // the session of each bin taken by the person at hand
     purch: Vec<(u32, u32)>, // (bin, pay) of the person's purchases
     sess_day: Vec<u32>,     // the DayAcc of each session
@@ -2992,6 +2994,8 @@ impl Work {
     fn new(cx: &Ctx, rows_cap: usize, ev_cap: usize, ck_cap: usize) -> Work {
         let cells = (cx.ncamp + 1) * cx.ndays;
         let local = (1usize << cx.pshift) + 1;
+        // the 30-minute bins of [base, window end), at most 2^32 ms: under 64 words of `bits`
+        let nbins = ((cx.we - cx.base) / GAP) as usize + 2;
         Work {
             rows: Vec::new(),
             file: UserFile::new(),
@@ -3010,15 +3014,16 @@ impl Work {
             cstart: filled(local + 2, 0),
             ev: huge_vec(ev_cap),
             ck: huge_vec(ck_cap),
-            sessions: Vec::new(),
-            day_groups: Vec::new(),
+            sessions: vec![Sess { start: 0, d: 0, purchased: false, revenue: 0 }; nbins + 1],
+            day_groups: vec![(0, 0); nbins + 1],
             cats: Vec::new(),
-            bins: vec![FREE_BIN; ((cx.we - cx.base) / GAP) as usize + 2],
-            bits: vec![0; ((cx.we - cx.base) / GAP) as usize / 64 + 2],
-            bin_sess: vec![0; ((cx.we - cx.base) / GAP) as usize + 2],
+            bins: vec![FREE_BIN; nbins],
+            bits: vec![0; nbins / 64 + 1],
+            blist: vec![0; nbins + 4],
+            bin_sess: vec![0; nbins],
             purch: Vec::new(),
-            sess_day: Vec::new(),
-            days: Vec::new(),
+            sess_day: vec![0; nbins + 1],
+            days: (0..=nbins).map(|_| DayAcc { d: 0, sessions: 0, events: 0, revenue: 0 }).collect(),
             dcats: Vec::new(),
             small: Win { ts: A32([0; 72]), nxt: A32([0; 72]), camp: [0; 72], cid: [0; 72] },
             last: vec![0; cx.ncamp + 1],
@@ -3267,6 +3272,10 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     let ev = std::mem::take(&mut w.ev);
     let ck = std::mem::take(&mut w.ck);
     for l in 0..local {
+        if l & 3 == 0 {
+            // the names come from the ID table, a cache line (4 slots) for every few people: asked for ahead
+            prefetch(&cx.ids.slots[(p << cx.pshift) | (l + 64).min(local - 1)]);
+        }
         let (a, b) = (w.start[l] as usize, w.start[l + 1] as usize);
         if a == b {
             continue;
@@ -3311,12 +3320,13 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
 fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
     let width = cx.ndays;
     let organic = cx.ncamp;
-    let Work { rows, cred, rev, assist, sessions, day_groups, cats, small, bins, bits, bin_sess, purch, sess_day, days, dcats, sb, pre, best, cmark, cctr, slots, cbm, gm, .. } = w;
+    let Work { rows, cred, rev, assist, sessions, day_groups, cats, small, bins, bits, blist, bin_sess, purch, sess_day, days, dcats, sb, pre, best, cmark, cctr, slots, cbm, gm, .. } = w;
 
     // sessions + user_daily rows: the events go into their 30-minute bins, and the bins in order are the sessions
     // through raw pointers taken once (the vectors' fields would be reloaded from memory after every store), with
     // no bounds checks (an event's ts is below we - base, so its bin is below bins.len()), and every event written
     // to the purchase list, which only keeps the ones with a price
+    let mut top = 0u64; // which words of `bits` have a bin
     purch.clear();
     purch.reserve(evs.len());
     let (bp, wp, pp) = (bins.as_mut_ptr(), bits.as_mut_ptr(), purch.as_mut_ptr());
@@ -3333,38 +3343,59 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u64], cs: &[Ck], w: &mut Work) {
             bin.max = bin.max.max(ts);
             *wp.add(b >> 6) |= 1 << (b & 63);
             *pp.add(np) = (b as u32, e as u32);
+            top |= 1 << (b >> 6);
         }
         np += (e as u32 != 0) as usize;
     }
     // SAFETY: the first np entries are written
     unsafe { purch.set_len(np) };
-    sessions.clear();
-    day_groups.clear();
-    sess_day.clear();
-    days.clear();
-    let mut prev_max = i64::MIN / 2;
-    for (wi, word) in bits.iter_mut().enumerate() {
-        let mut m = std::mem::take(word);
-        while m != 0 {
-            let b = wi * 64 + m.trailing_zeros() as usize;
-            m &= m - 1;
-            let bin = std::mem::replace(&mut bins[b], FREE_BIN);
-            let (mn, mx) = (bin.min as i64, bin.max as i64);
-            if mn - prev_max > GAP {
-                let d = ((mn + cx.base).div_euclid(DAY) - cx.day0) as usize;
-                sessions.push(Sess { start: mn, d, purchased: false, revenue: 0 });
-                if days.last().map_or(true, |x| x.d != d) {
-                    days.push(DayAcc { d, sessions: 0, events: 0, revenue: 0 });
-                    day_groups.push((d, sessions.len() - 1));
-                }
-                days.last_mut().unwrap().sessions += 1;
-                sess_day.push(days.len() as u32 - 1);
-            }
-            prev_max = prev_max.max(mx);
-            days.last_mut().unwrap().events += bin.cnt;
-            bin_sess[b] = sessions.len() as u32 - 1;
+    // the taken bins in order, as a list: four of a word without a branch (few words hold more; the entries
+    // written past a word's count are overwritten or never read)
+    let mut n = 0;
+    while top != 0 {
+        let wi = top.trailing_zeros() as usize;
+        top &= top - 1;
+        let mut m = std::mem::take(&mut bits[wi]);
+        let k = m.count_ones() as usize;
+        let first = (wi * 64) as u32;
+        for j in 0..4 {
+            blist[n + j] = first + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
         }
+        for j in 4..k {
+            blist[n + j] = first + m.trailing_zeros();
+            m &= m - 1;
+        }
+        n += k;
     }
+    // One pass over the bins without a data-dependent branch: the session and the day a bin might open are
+    // written every time, at the next free place, and the counts move on only when it does open them.
+    let doff = cx.base - cx.day0 * DAY; // start + doff = ms after the first day's midnight (an event's start is in the window)
+    let (mut ns, mut nd) = (0usize, 0usize);
+    let mut prev_max = i64::MIN / 2;
+    let mut last_d = usize::MAX;
+    for &b in &blist[..n] {
+        let b = b as usize;
+        let bin = std::mem::replace(&mut bins[b], FREE_BIN);
+        let (mn, mx) = (bin.min as i64, bin.max as i64);
+        let new = mn - prev_max > GAP;
+        let d = ((mn + doff) as u64 / DAY as u64) as usize;
+        let new_day = new & (d != last_d);
+        sessions[ns] = Sess { start: mn, d, purchased: false, revenue: 0 };
+        days[nd] = DayAcc { d, sessions: 0, events: 0, revenue: 0 };
+        day_groups[nd] = (d, ns);
+        nd += new_day as usize;
+        sess_day[ns] = nd as u32 - 1;
+        ns += new as usize;
+        // the first bin opens a session and a day, so nd >= 1 here
+        let day = &mut days[nd - 1];
+        day.sessions += new as u32;
+        day.events += bin.cnt;
+        last_d = if new { d } else { last_d };
+        prev_max = prev_max.max(mx);
+        bin_sess[b] = ns as u32 - 1;
+    }
+    let (sessions, days, day_groups) = (&mut sessions[..ns], &mut days[..nd], &day_groups[..nd]);
     // purchases: into their session and day
     dcats.clear();
     for &(b, pay) in purch.iter() {

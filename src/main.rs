@@ -407,74 +407,98 @@ const GROUP: usize = 192;
 /// directly first reads its cache line from memory (read for ownership) and crowds the cache. A stream keeps the
 /// records of its current group (block offset a multiple of GROUP: blocks are 64-byte aligned, whole groups
 /// long) and writes the full group with non-temporal stores, three whole lines that are never read. A record's
-/// address is known when it is pushed; until its group is full or `finish` runs, its bytes are only in the stage.
-/// The caller fences (`sfence`) before others read, and calls `finish` once the pushing is over.
+/// address is known when it is pushed; until its group is full and the next record comes, or `finish` runs, its
+/// bytes are only in the stage. The caller fences (`sfence`) before others read, and calls `finish` once the
+/// pushing is over.
 struct Stream<T> {
-    cur: *mut T,
-    end: *mut T,
+    grp: *mut u8,            // where the staged group belongs in the current block; null before the first push
+    end: *mut u8,            // the end of the current block
+    pos: usize,              // bytes staged; GROUP = the group is full (or there is no block yet): `next` first
+    stage: [u64; GROUP / 8], // 8-byte aligned, as every record here
     blocks: Vec<*mut T>,
-    n: usize,                    // records of the current group, in `stage`
-    stage: [u64; GROUP / 8],     // 8-byte aligned, as every record here
-    _t: std::marker::PhantomData<T>,
 }
 
 impl<T> Stream<T> {
-    const K: usize = GROUP / std::mem::size_of::<T>();
+    const SIZE: usize = std::mem::size_of::<T>();
 
     fn new() -> Stream<T> {
         const { assert!(GROUP % std::mem::size_of::<T>() == 0 && std::mem::align_of::<T>() <= 8 && !std::mem::needs_drop::<T>()) };
-        Stream { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), blocks: Vec::new(), n: 0, stage: [0; GROUP / 8], _t: std::marker::PhantomData }
+        Stream { grp: std::ptr::null_mut(), end: std::ptr::null_mut(), pos: GROUP, stage: [0; GROUP / 8], blocks: Vec::new() }
     }
 
     #[inline(always)]
     fn push(&mut self, arena: &mut Arena, per: usize, v: T) -> *mut T {
-        if self.cur == self.end {
+        if self.pos == GROUP {
+            self.next(arena, per);
+        }
+        let pos = self.pos;
+        self.pos = pos + Self::SIZE;
+        // SAFETY: pos + SIZE <= GROUP, the size of the stage; [grp, grp + GROUP) is inside the block `grow` took
+        unsafe {
+            ((self.stage.as_mut_ptr() as *mut u8).add(pos) as *mut T).write(v);
+            self.grp.add(pos) as *mut T
+        }
+    }
+
+    /// Asks for the cache line the next record will be staged in (reading `pos` brings the line of the stream's
+    /// own fields).
+    #[inline(always)]
+    fn aim(&self) {
+        prefetch(unsafe { (self.stage.as_ptr() as *const u8).add(self.pos) });
+    }
+
+    /// The staged group is full: it goes to memory and the group after it is staged, in a new block when this
+    /// one is full (or there is none yet).
+    #[inline(always)]
+    fn next(&mut self, arena: &mut Arena, per: usize) {
+        if !self.grp.is_null() {
+            // SAFETY: GROUP bytes at a 64-byte aligned address of the block
+            unsafe {
+                stream_group(self.grp, self.stage.as_ptr() as *const u8);
+                self.grp = self.grp.add(GROUP);
+            }
+        }
+        if self.grp == self.end {
             self.grow(arena, per);
         }
-        let p = self.cur;
-        // SAFETY: cur < end, inside the block `grow` took from the arena; n < K slots of the stage
-        unsafe {
-            (self.stage.as_mut_ptr() as *mut T).add(self.n).write(v);
-            self.cur = p.add(1);
-        }
-        self.n += 1;
-        if self.n == Self::K {
-            // SAFETY: the group [cur - K, cur) is GROUP bytes at a 64-byte aligned address of the block
-            unsafe { stream_group((self.cur as *mut u8).sub(GROUP), self.stage.as_ptr() as *const u8) };
-            self.n = 0;
-        }
-        p
+        self.pos = 0;
     }
 
     #[cold]
     #[inline(never)]
     fn grow(&mut self, arena: &mut Arena, per: usize) {
-        debug_assert!(self.n == 0 && per % Self::K == 0);
-        let p = arena.alloc(per * std::mem::size_of::<T>()) as *mut T;
+        debug_assert!(per * Self::SIZE % GROUP == 0);
+        let p = arena.alloc(per * Self::SIZE);
         debug_assert!(p as usize % 64 == 0);
-        self.blocks.push(p);
-        self.cur = p;
-        self.end = unsafe { p.add(per) };
+        self.blocks.push(p as *mut T);
+        self.grp = p;
+        self.end = unsafe { p.add(per * Self::SIZE) };
     }
 
-    /// Writes the records still staged (a group not yet full) to memory with plain stores.
+    /// Writes the records still staged to memory with plain stores.
     fn finish(&mut self) {
-        // SAFETY: the n staged records belong at [cur - n, cur)
-        unsafe { std::ptr::copy_nonoverlapping(self.stage.as_ptr() as *const T, self.cur.sub(self.n), self.n) };
-        self.n = 0;
+        if !self.grp.is_null() {
+            // SAFETY: the staged bytes belong at [grp, grp + pos), inside the block
+            unsafe { std::ptr::copy_nonoverlapping(self.stage.as_ptr() as *const u8, self.grp, self.pos) };
+        }
+    }
+
+    /// Records in the last block (there is one).
+    fn tail(&self, b: *mut T) -> usize {
+        (self.grp as usize + self.pos - b as usize) / Self::SIZE
     }
 
     fn len(&self, per: usize) -> usize {
         match self.blocks.last() {
             None => 0,
-            Some(&b) => (self.blocks.len() - 1) * per + (unsafe { self.cur.offset_from(b) }) as usize,
+            Some(&b) => (self.blocks.len() - 1) * per + self.tail(b),
         }
     }
 
     fn slices(&self, per: usize) -> impl Iterator<Item = &[T]> {
         let n = self.blocks.len();
         self.blocks.iter().enumerate().map(move |(i, &b)| {
-            let len = if i + 1 == n { (unsafe { self.cur.offset_from(b) }) as usize } else { per };
+            let len = if i + 1 == n { self.tail(b) } else { per };
             unsafe { std::slice::from_raw_parts(b, len) }
         })
     }
@@ -612,6 +636,24 @@ impl IdTable {
     fn slot_in_line(&self, home: u32, key: u64, ins: &mut usize) -> Option<u32> {
         // SAFETY: as in `slot_from`
         let s = unsafe { self.slots.as_ptr().add(home as usize) };
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        // SAFETY: the line is 64 readable bytes (4 slots of 16, the table starts on a page). Each key is read whole
+        // (an aligned 8 bytes is never seen half written), which is all the reasoning above needs.
+        unsafe {
+            use std::arch::x86_64::*;
+            let (a, b) = (_mm256_loadu_si256(s as *const __m256i), _mm256_loadu_si256((s as *const __m256i).add(1)));
+            // bits 0 and 2 of a half: its two keys (bits 1 and 3 are the slots' other fields)
+            let m = |x: __m256i| (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, x))) & 5 | (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, x))) & 5) << 4) as u32;
+            let eq = m(_mm256_set1_epi64x(key as i64));
+            if eq != 0 {
+                return Some(home + eq.trailing_zeros() / 2);
+            }
+            if m(_mm256_setzero_si256()) == 0 {
+                return None;
+            }
+            return Some(self.slot_scan(home, key, ins));
+        }
+        #[allow(unreachable_code)]
         let k = [0, 1, 2, 3].map(|j| unsafe { (*s.add(j)).key.load(Relaxed) });
         let m = (k[0] == key) as u32 | ((k[1] == key) as u32) << 1 | ((k[2] == key) as u32) << 2 | ((k[3] == key) as u32) << 3;
         if m != 0 {
@@ -1202,7 +1244,7 @@ const NO_DAY: Day = Day { a: 0, b: u32::MAX, ms: 0 };
 /// `ts_at` that remembers the dates it has checked (by day of month), so an F1 or F2 timestamp of a known date
 /// costs two compares and the time of day.
 #[inline(always)]
-unsafe fn ts_memo(p: *const u8, len: usize, days: &mut [Day; 32]) -> Option<i64> {
+unsafe fn ts_memo(p: *const u8, len: usize, days: &mut [Day; 64]) -> Option<i64> {
     let at = |i: usize| *p.add(i);
     let f1 = len == 20 && at(19) == b'Z';
     if !f1 && !(len == 25 && (at(19) == b'+' || at(19) == b'-') && at(22) == b':') {
@@ -1210,7 +1252,8 @@ unsafe fn ts_memo(p: *const u8, len: usize, days: &mut [Day; 32]) -> Option<i64>
     }
     let a = (p as *const u64).read_unaligned();
     let b = (p.add(8) as *const u32).read_unaligned() & 0xFF_FFFF;
-    let day = &mut days[(((b & 15) * 10 + ((b >> 8) & 15)) & 31) as usize];
+    // a slot per day of the month: the low bits of its two digits (any other bytes land somewhere too)
+    let day = &mut days[((b ^ (b >> 6)) & 63) as usize];
     if day.a != a || day.b != b {
         // a date not seen yet, or a bad one: the full check; a good one is remembered
         let t = ts_at(p, len)?;
@@ -1647,18 +1690,22 @@ const EV_BLOCK: usize = 512;
 const LG_BLOCK: usize = 384; // records: a whole number of 192-byte groups of 16-byte LRecs (6144 bytes, as before)
 const CK_BLOCK: usize = 192; // records: a whole number of 192-byte groups of 16-byte CRecs (3072 bytes, as before)
 
-/// A valid event or click whose user ID is on its way from memory (`IdTable::aim`).
-#[derive(Clone, Copy, Default)]
-struct Pend {
-    a: u64, // event key, or click key
-    b: i64, // ingest_ts (events)
-    ukey: u64,
-    home: u32,
-    ts: u32,
-    x: u32, // pay, or campaign
+/// Events or clicks whose user IDs are on their way from memory at a time (`Batch`).
+const BATCH: usize = 64;
+
+/// The valid events (or clicks) of the last few lines, each waiting for its user ID's line of the ID table
+/// (`IdTable::aim`). When BATCH of them wait they are looked up and written out in one loop (`Shard::drain`): by
+/// then every line asked for has had the time of the rest of the batch to arrive.
+struct Batch {
+    n: usize,
+    a: [u64; BATCH],    // event key, or click key
+    b: [i64; BATCH],    // ingest_ts (events)
+    ukey: [u64; BATCH], // user ID
+    tx: [u64; BATCH],   // ts (ms after `Ctx::base`) << 32 | pay, or campaign
+    home: [u32; BATCH], // where the search for `ukey` starts
 }
 
-/// Lines between asking for an ID's cache line and using it.
+/// Lines between asking for an ID's cache line and using it (the link builder's ring).
 const RING: usize = 16;
 
 /// One parse thread's output.
@@ -1670,9 +1717,8 @@ struct Shard {
     far: Vec<(u64, u32, i64)>, // (event key, loc, ingest_ts) of the records whose `ing` is ING_FAR
     buf: Vec<u8>,
     ins: usize,
-    ring: [Pend; RING],
-    head: usize, // events or clicks put in the ring since the last flush
-    days: [Day; 32],
+    bt: Batch,
+    days: [Day; 64],
 }
 // SAFETY: the streams own their blocks; after the parse they are only read, except for `ERec::person` of distinct
 // records written by the dedup phase while nothing reads them
@@ -1715,6 +1761,21 @@ impl Ctx {
         (arena_range().0, we + DAY, we + DAY - (ING_SPAN - 1))
     }
 
+    /// `LRec::ing` of an ingest_ts; None for one that 32 bits cannot hold (it goes in `Shard::far`, as ING_FAR).
+    #[inline(always)]
+    fn ing(&self, ingest: i64) -> Option<u32> {
+        if ingest > self.ihi {
+            return Some(ING_LATE);
+        }
+        // ms above ilo (a negative difference is a huge unsigned one)
+        let d = ingest.wrapping_sub(self.ilo) as u64;
+        if d < ING_SPAN as u64 {
+            Some(d as u32 + 1)
+        } else {
+            None
+        }
+    }
+
     /// The ingest_ts of a dedup record, exact except above `ihi` (see ING_LATE); `far` = every shard's far list as
     /// a map (`far_map`).
     #[inline(always)]
@@ -1747,47 +1808,100 @@ impl Shard {
             far: Vec::new(),
             buf: Vec::new(),
             ins: 0,
-            ring: [Pend::default(); RING],
-            head: 0,
-            days: [NO_DAY; 32],
+            bt: Batch { n: 0, a: [0; BATCH], b: [0; BATCH], ukey: [0; BATCH], tx: [0; BATCH], home: [0; BATCH] },
+            days: [NO_DAY; 64],
         }
     }
 
-    /// Queues `p`; returns the one queued RING entries ago, whose slot is in the cache by now.
-    #[inline(always)]
-    fn queue(&mut self, p: Pend) -> Option<Pend> {
-        let i = self.head & (RING - 1);
-        let old = if self.head >= RING { Some(self.ring[i]) } else { None };
-        self.ring[i] = p;
-        self.head += 1;
-        old
-    }
-
-    /// Finishes everything still queued: events when `events`, else clicks. Call at the end of every chunk.
-    fn flush(&mut self, cx: &Ctx, events: bool) {
-        for k in self.head.saturating_sub(RING)..self.head {
-            let p = self.ring[k & (RING - 1)];
-            let person = cx.ids.person(cx.ids.slot_from(p.home, p.ukey, &mut self.ins));
-            if events {
-                self.put_event(cx, p, person);
+    /// Looks up the user IDs of the waiting events (`EVENTS`) or clicks and writes their records. Call when the
+    /// batch is full and at the end of every chunk.
+    ///
+    /// Two passes, so that no record waits on a chain of memory: the first turns every user ID into its person
+    /// (the table lines were asked for as the lines were parsed) and asks for the lines of the streams the records
+    /// will go to, which only the person tells; the second writes the records. An ID that is not in its home line
+    /// (the line was full of other keys when the ID was added, or is now) asks for the next line and is looked up
+    /// from there at the end of the first pass.
+    #[inline(never)]
+    fn drain<const EVENTS: bool>(&mut self, cx: &Ctx) {
+        let Shard { arena, ev, ck, lg, far, ins, bt, .. } = self;
+        let n = bt.n.min(BATCH);
+        bt.n = 0;
+        // what the loops need, in locals: nothing is read again through `cx` or `self` per record
+        let (ids, pshift, qshift, abase) = (&cx.ids, cx.pshift, cx.qshift, cx.abase);
+        let (evp, ckp, lgp) = (ev.as_mut_ptr(), ck.as_mut_ptr(), lg.as_mut_ptr());
+        // SAFETY (the three streams, here and below): a person is a slot number, so its partition is below the
+        // 2^pbits streams of `ev` and `ck`; the shift of the event key leaves qbits bits, a bucket below the
+        // 2^qbits streams of `lg`
+        let aim = |bt: &Batch, i: usize, person: u32| unsafe {
+            let part = (person >> pshift) as usize;
+            if EVENTS {
+                (*evp.add(part)).aim();
+                (*lgp.add((spread(bt.a[i]) >> qshift) as usize)).aim();
             } else {
-                self.put_click(cx, p, person);
+                (*ckp.add(part)).aim();
+            }
+        };
+        let mut person = [0u32; BATCH];
+        let mut late = [0u8; BATCH];
+        let mut nl = 0;
+        for i in 0..n {
+            match ids.slot_in_line(bt.home[i], bt.ukey[i], ins) {
+                Some(slot) => {
+                    person[i] = ids.person(slot);
+                    aim(bt, i, person[i]);
+                }
+                None => {
+                    bt.home[i] = ids.next_line(bt.home[i]);
+                    late[nl & (BATCH - 1)] = i as u8; // nl < n <= BATCH
+                    nl += 1;
+                }
             }
         }
-        self.head = 0;
+        for &i in &late[..nl] {
+            let i = i as usize;
+            // its home line holds four other keys for good, so the search may start at the line after it
+            person[i] = ids.person(ids.slot_scan(bt.home[i], bt.ukey[i], ins));
+            aim(bt, i, person[i]);
+        }
+        for i in 0..n {
+            let (a, tx, person) = (bt.a[i], bt.tx[i], person[i]);
+            let part = (person >> pshift) as usize;
+            // SAFETY: as above
+            unsafe {
+                if EVENTS {
+                    let rec = (*evp.add(part)).push(arena, EV_BLOCK, ERec { person, ts: (tx >> 32) as u32, pay: tx as u32 });
+                    let loc = loc_of(abase, rec);
+                    let ing = cx.ing(bt.b[i]).unwrap_or_else(|| {
+                        far.push((a, loc, bt.b[i]));
+                        ING_FAR
+                    });
+                    (*lgp.add((spread(a) >> qshift) as usize)).push(arena, LG_BLOCK, LRec { key: a, ing, loc });
+                } else {
+                    (*ckp.add(part)).push(arena, CK_BLOCK, CRec::new(a, person & ((1 << pshift) - 1), (tx >> 32) as u32, tx as u32));
+                }
+            }
+        }
     }
 
-    /// The person of the queued `p`, whose line of the ID table is in the cache by now. An ID that is not in that
-    /// line goes back in the queue to wait for the next line, and the entry that leaves the queue for it is looked
-    /// up instead; None when nothing left the queue.
+    /// A valid event (`events`) or click joins the batch, its user ID's line of the ID table asked for.
     #[inline(always)]
-    fn resolve(&mut self, cx: &Ctx, mut p: Pend) -> Option<(Pend, u32)> {
-        loop {
-            if let Some(slot) = cx.ids.slot_in_line(p.home, p.ukey, &mut self.ins) {
-                return Some((p, cx.ids.person(slot)));
+    fn wait(&mut self, cx: &Ctx, events: bool, a: u64, b: i64, ukey: u64, ts: i64, x: u32) {
+        let i = self.bt.n;
+        // SAFETY: n < BATCH between calls: a full batch is drained at once
+        unsafe {
+            *self.bt.a.get_unchecked_mut(i) = a;
+            *self.bt.b.get_unchecked_mut(i) = b;
+            *self.bt.ukey.get_unchecked_mut(i) = ukey;
+            *self.bt.tx.get_unchecked_mut(i) = ((ts - cx.base) as u32 as u64) << 32 | x as u64;
+            *self.bt.home.get_unchecked_mut(i) = cx.ids.aim(ukey);
+        }
+        self.bt.n = i + 1;
+        if i + 1 == BATCH {
+            if events {
+                self.drain::<true>(cx);
+            } else {
+                self.drain::<false>(cx);
             }
-            p.home = cx.ids.next_line(p.home);
-            p = self.queue(p)?;
         }
     }
 
@@ -1795,50 +1909,24 @@ impl Shard {
     #[inline(always)]
     fn log(&mut self, cx: &Ctx, ekey: u64, ingest: i64, loc: u32) {
         let q = (spread(ekey) >> cx.qshift) as usize;
-        let ing = if ingest > cx.ihi {
-            ING_LATE
-        } else {
-            // ms above ilo (a negative difference is a huge unsigned one)
-            let d = ingest.wrapping_sub(cx.ilo) as u64;
-            if d < ING_SPAN as u64 {
-                d as u32 + 1
-            } else {
-                self.far.push((ekey, loc, ingest));
-                ING_FAR
-            }
-        };
-        self.lg[q].push(&mut self.arena, LG_BLOCK, LRec { key: ekey, ing, loc });
+        let ing = cx.ing(ingest).unwrap_or_else(|| {
+            self.far.push((ekey, loc, ingest));
+            ING_FAR
+        });
+        // SAFETY: q is below the 2^qbits streams of `lg`: the shift leaves qbits bits
+        unsafe { self.lg.get_unchecked_mut(q) }.push(&mut self.arena, LG_BLOCK, LRec { key: ekey, ing, loc });
     }
 
     /// A valid, non-late event: into its person's partition, plus its dedup record, once its user ID is at hand.
     #[inline(always)]
     fn keep(&mut self, cx: &Ctx, ekey: u64, ingest: i64, ukey: u64, ts: i64, pay: u32) {
-        if let Some(p) = self.queue(Pend { a: ekey, b: ingest, ukey, home: cx.ids.aim(ukey), ts: (ts - cx.base) as u32, x: pay }) {
-            if let Some((p, person)) = self.resolve(cx, p) {
-                self.put_event(cx, p, person);
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn put_event(&mut self, cx: &Ctx, p: Pend, person: u32) {
-        let rec = self.ev[(person >> cx.pshift) as usize].push(&mut self.arena, EV_BLOCK, ERec { person, ts: p.ts, pay: p.x });
-        self.log(cx, p.a, p.b, loc_of(cx.abase, rec));
+        self.wait(cx, true, ekey, ingest, ukey, ts, pay);
     }
 
     /// A valid click, into its person's partition once its user ID is at hand.
     #[inline(always)]
     fn click(&mut self, cx: &Ctx, cid: u64, ukey: u64, ts: i64, camp: u16) {
-        if let Some(p) = self.queue(Pend { a: cid, b: 0, ukey, home: cx.ids.aim(ukey), ts: (ts - cx.base) as u32, x: camp as u32 }) {
-            if let Some((p, person)) = self.resolve(cx, p) {
-                self.put_click(cx, p, person);
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn put_click(&mut self, cx: &Ctx, p: Pend, person: u32) {
-        self.ck[(person >> cx.pshift) as usize].push(&mut self.arena, CK_BLOCK, CRec::new(p.a, person & ((1 << cx.pshift) - 1), p.ts, p.x));
+        self.wait(cx, false, cid, 0, ukey, ts, camp as u32);
     }
 }
 
@@ -2436,7 +2524,7 @@ unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
             }
         },
     );
-    st.flush(cx, true);
+    st.drain::<true>(cx);
     sfence();
 }
 
@@ -2490,7 +2578,7 @@ unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
             }
         },
     );
-    st.flush(cx, false);
+    st.drain::<false>(cx);
     sfence();
 }
 
@@ -4088,7 +4176,7 @@ mod tests {
     #[test]
     fn timestamps_match_general_parser() {
         let mut r = Rng(7);
-        let mut days = [NO_DAY; 32];
+        let mut days = [NO_DAY; 64];
         for _ in 0..300_000 {
             let mut s: Vec<u8> = match r.below(4) {
                 0 => format!("2028-0{}-{:02}T{:02}:{:02}:{:02}Z", 2 + r.below(2), r.below(32), r.below(25), r.below(61), r.below(61)).into_bytes(),
@@ -4181,7 +4269,7 @@ mod tests {
             for w in cuts.windows(2) {
                 unsafe { parse_events(&c, padded.as_ptr(), w[0], w[1], len, &mut a) };
                 for_records::<7>(file, w[0], w[1], |f| event_fields(&c, f, &mut b));
-                b.flush(&c, true);
+                b.drain::<true>(&c);
             }
             let (fa, fb) = (flat(&mut a), flat(&mut b));
             kept += fb.0.len();
@@ -4193,7 +4281,7 @@ mod tests {
     #[test]
     fn ts_at_matches_parse_ts() {
         let mut r = Rng(0xfeed_beef_1357_9bdf);
-        let mut days = [NO_DAY; 32];
+        let mut days = [NO_DAY; 64];
         let mut hits = 0;
         for _ in 0..200_000 {
             let s = ts_value(&mut r);

@@ -842,18 +842,22 @@ impl IdTable {
     }
 
     /// Joins the trees of `a` and `b`: the root with the larger name goes under the other, so every step up is to
-    /// a smaller name, no cycle can form, and the root of a tree is its smallest name.
-    fn union(&self, names: &Interner, mut a: u32, mut b: u32) {
+    /// a smaller name, no cycle can form, and the root of a tree is its smallest name. Returns (the slot that
+    /// went under another one, that one), None when the two were joined already. A slot goes under another once
+    /// and never is a root again, so over all calls the first slots are exactly the slots that are not roots; each
+    /// has `px` set for the slot it went under, which is its person unless that one goes under a third later.
+    fn union(&self, names: &Interner, mut a: u32, mut b: u32) -> Option<(u32, u32)> {
         loop {
             a = self.find(a);
             b = self.find(b);
             if a == b {
-                return;
+                return None;
             }
             let (ka, kb) = (self.slots[a as usize].key.load(Relaxed), self.slots[b as usize].key.load(Relaxed));
             let (hi, lo) = if names.less(kb, ka) { (a, b) } else { (b, a) };
             if self.slots[hi as usize].up.compare_exchange(0, lo + 1, Relaxed, Relaxed).is_ok() {
-                return;
+                self.slots[hi as usize].px.store(hi ^ lo, Relaxed);
+                return Some((hi, lo));
             }
         }
     }
@@ -1458,16 +1462,29 @@ fn uncached(f: &InFile, off: usize) -> bool {
     unsafe { libc::preadv2(f.f.as_raw_fd(), &iov, 1, off as libc::off_t, libc::RWF_NOWAIT) != 1 }
 }
 
+/// True when `f` is on a file system that keeps its files in memory (tmpfs, ramfs): there is no disk to wait for.
+#[cfg(target_os = "linux")]
+fn in_memory(f: &InFile) -> bool {
+    use std::os::unix::io::AsRawFd;
+    const TMPFS: u32 = 0x0102_1994;
+    const RAMFS: u32 = 0x8584_58f6;
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: an open file and a statfs to fill; a refusal counts as "on a disk"
+    unsafe { libc::fstatfs(f.f.as_raw_fd(), &mut st) == 0 && (st.f_type as u32 == TMPFS || st.f_type as u32 == RAMFS) }
+}
+
 const READ_AHEAD_THREADS: usize = 2;
 
 /// Cold page cache: asks the kernel for the whole input at once, in the order it will be parsed, from a few
 /// threads of their own, so the disk works at full speed from the first moment whatever the parse is doing.
-/// An input that is cached already (16 probes all answer without the disk) is left alone.
+/// An input that is cached already (16 probes all answer without the disk) is left alone, and so is one in memory:
+/// tmpfs has no read that answers "not cached", so its probes all failed, and the threads then made one call per
+/// chunk that did nothing (20M events: 14,600 calls while the links are read).
 #[cfg(target_os = "linux")]
 fn read_ahead(queue: Vec<(&'static InFile, usize, usize)>, _threads: usize) {
     use std::os::unix::io::AsRawFd;
     let n = queue.len();
-    if n == 0 || !(0..16).any(|i| uncached(queue[i * n / 16].0, (queue[i * n / 16].1 + queue[i * n / 16].2) / 2)) {
+    if n == 0 || in_memory(queue[0].0) || !(0..16).any(|i| uncached(queue[i * n / 16].0, (queue[i * n / 16].1 + queue[i * n / 16].2) / 2)) {
         return;
     }
     let queue = std::sync::Arc::new(queue);
@@ -2431,6 +2448,7 @@ fn small_tables(data: &Path) -> Small {
         products.push((p, ci));
     }
     // product_id is unique per rules.md; were one repeated, its last line would count
+    seen.reserve(products.len());
     products.reverse();
     products.retain(|&(p, _)| seen.insert(p, ()).is_none());
     let unknown_cat = cat_names.len() as u16;
@@ -2475,8 +2493,8 @@ fn build_links(ids: &IdTable, names: &Interner, files: &[InFile], threads: usize
     let parts = par(
         threads,
         work.len(),
-        || (Vec::<u8>::new(), 0usize, 0usize),
-        |(buf, lines, ins), i| {
+        || (Vec::<u8>::new(), 0usize, 0usize, Vec::<(u32, u32)>::new()),
+        |(buf, lines, ins, under), i| {
             let (_, fi, s, e) = work[i];
             let (len, start, end) = read_span(&files[fi], s, e, buf);
             // SAFETY: the fields live in `buf`, which outlives this call; nothing keeps them
@@ -2489,7 +2507,7 @@ fn build_links(ids: &IdTable, names: &Interner, files: &[InFile], threads: usize
                 if n >= 2 * HALF {
                     let (x, y) = ends[i];
                     if x != y {
-                        ids.union(names, x, y);
+                        under.extend(ids.union(names, x, y));
                     }
                 }
                 if n >= HALF {
@@ -2516,7 +2534,9 @@ fn build_links(ids: &IdTable, names: &Interner, files: &[InFile], threads: usize
                 if a.is_empty() || b.is_empty() {
                     return;
                 }
-                step(n, Some((names.key(a), names.key(b))), ins);
+                // SAFETY: the fields are in `buf`, which `read_span` leaves readable for PAD bytes past its data
+                let keys = unsafe { (names.key_at(a.as_ptr(), a.len()), names.key_at(b.as_ptr(), b.len())) };
+                step(n, Some(keys), ins);
                 n += 1;
                 *lines += 1;
             });
@@ -2526,31 +2546,32 @@ fn build_links(ids: &IdTable, names: &Interner, files: &[InFile], threads: usize
             }
         },
     );
-    // B. flatten, one pass over the table: every linked ID points straight at its root
-    const SPAN: usize = 1 << 15;
-    const AHEAD: usize = 24;
-    let n = ids.slots.len();
-    par(
-        threads,
-        n.div_ceil(SPAN),
-        || (),
-        |_, t| {
-            for i in t * SPAN..((t + 1) * SPAN).min(n) {
-                if i + AHEAD < n {
-                    let u = ids.slots[i + AHEAD].up.load(Relaxed);
-                    if u != 0 {
-                        prefetch(&ids.slots[u as usize - 1]);
+    // B. flatten: every linked ID gets its person. An ID that went under another one has that one as its person
+    //    already (`union`), which is right unless that one went under a third since: only the IDs the unions put
+    //    under another are looked at (`under`), each by reading the slot it went under (asked for AHEAD before), and
+    //    not the whole table (16 bytes a slot, most of them empty or a root)
+    const PIECE: usize = 4096;
+    const AHEAD: usize = 16;
+    let pieces: Vec<&[(u32, u32)]> = parts.iter().flat_map(|p| p.3.chunks(PIECE)).collect();
+    if !pieces.is_empty() {
+        par(
+            threads,
+            pieces.len(),
+            || (),
+            |_, t| {
+                let l = pieces[t];
+                for (i, &(x, over)) in l.iter().enumerate() {
+                    if let Some(&(_, y)) = l.get(i + AHEAD) {
+                        prefetch(&ids.slots[y as usize]);
+                    }
+                    if ids.slots[over as usize].up.load(Relaxed) != 0 {
+                        let root = ids.find(over);
+                        ids.slots[x as usize].px.store(x ^ root, Relaxed);
                     }
                 }
-                if ids.slots[i].up.load(Relaxed) != 0 {
-                    // i hangs under something, so its root is another slot
-                    let root = ids.find(i as u32);
-                    ids.slots[i].up.store(root + 1, Relaxed);
-                    ids.slots[i].px.store(i as u32 ^ root, Relaxed);
-                }
-            }
-        },
-    );
+            },
+        );
+    }
     parts.iter().map(|p| p.1).sum()
 }
 
@@ -4491,7 +4512,7 @@ mod tests {
         let ids: Vec<u32> = [&b"u5"[..], b"u3", b"u9", b"U7", b"u1", b"zz", b"a-long-user-id"].iter().map(|b| c.ids.slot(c.names.key(b), &mut ins)).collect();
         for (a, b) in [(0, 1), (2, 1), (3, 2), (5, 6), (4, 4)] {
             if a != b {
-                c.ids.union(&c.names, ids[a], ids[b]);
+                let _ = c.ids.union(&c.names, ids[a], ids[b]);
             }
         }
         let root = |i: usize| c.ids.find(ids[i]);

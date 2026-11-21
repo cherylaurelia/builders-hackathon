@@ -1520,7 +1520,7 @@ struct Work {
     ccur: Vec<u32>,
     cout: Vec<u64>,
     cinfo: Vec<(u16, Packed)>,
-    dr: Vec<u32>,
+    lps: Vec<u32>,
     sessions: Vec<Sess>,
     day_groups: Vec<(usize, usize)>,
     cats: Vec<(u16, i64)>,
@@ -1544,7 +1544,7 @@ impl Work {
             ccur: vec![0; nlp + 1],
             cout: Vec::new(),
             cinfo: Vec::new(),
-            dr: Vec::new(),
+            lps: Vec::new(),
             sessions: Vec::new(),
             day_groups: Vec::new(),
             cats: Vec::new(),
@@ -1588,69 +1588,65 @@ fn offsets(c: &mut [u32], cur: &mut [u32]) {
     }
 }
 
+const DROPPED: u32 = u32::MAX; // ts of a record whose copy is not the kept one (real ts are < 2^31)
+
 fn person_bucket(ctx: &Ctx, tab: &Table, st: &[TS], drops: &[Vec<Vec<u32>>], b: usize, w: &mut Work) {
     let nlp = w.cnt.len() - 1;
-    w.dr.clear();
+    // Events 2: mark the dropped copies in place (this task is the only one touching bucket b)
     for d in drops {
-        w.dr.extend_from_slice(&d[b]);
+        for &loc in &d[b] {
+            let (t, i) = ((loc >> 28) as usize, (loc & 0xF_FFFF) as usize);
+            unsafe { (*st[t].pb[b].blks[i / BS].add(i % BS)).ts = DROPPED };
+        }
     }
-    w.dr.sort_unstable();
-    w.dr.push(u32::MAX);
 
     // events: counting sort by person
-    w.cnt.fill(0);
-    let mut di = 0;
+    let cnt = &mut w.cnt;
+    cnt.fill(0);
     for s in st {
-        let lb = (s.t as u32) << 28 | (b as u32) << 20;
-        let mut i = 0u32;
         for sl in s.pb[b].slices() {
             for r in sl {
-                if lb | i == w.dr[di] {
-                    di += 1;
-                } else {
-                    w.cnt[(r.lc & 0xFF_FFFF) as usize] += 1;
+                if r.ts != DROPPED {
+                    unsafe { *cnt.get_unchecked_mut((r.lc & 0xFF_FFFF) as usize) += 1 };
                 }
-                i += 1;
             }
         }
     }
-    offsets(&mut w.cnt, &mut w.cur);
-    let total = w.cnt[nlp] as usize;
+    offsets(cnt, &mut w.cur);
+    let total = cnt[nlp] as usize;
     w.out.clear();
     w.out.resize(total, 0);
     w.purch.clear();
-    di = 0;
     for s in st {
-        let lb = (s.t as u32) << 28 | (b as u32) << 20;
-        let mut i = 0u32;
         for sl in s.pb[b].slices() {
             for r in sl {
-                if lb | i == w.dr[di] {
-                    di += 1;
-                } else {
-                    let lp = (r.lc & 0xFF_FFFF) as usize;
-                    let mut pr = 0u32;
-                    if r.pay != 0 {
-                        w.purch.push((r.pay & 0xFF_FFFF, ((r.pay >> 24) | (r.lc >> 24) << 8) as u16));
-                        pr = w.purch.len() as u32;
-                    }
-                    let c = &mut w.cur[lp];
-                    w.out[*c as usize] = (r.ts as u64) << 32 | pr as u64;
+                if r.ts == DROPPED {
+                    continue;
+                }
+                let mut pr = 0u32;
+                if r.pay != 0 {
+                    w.purch.push((r.pay & 0xFF_FFFF, ((r.pay >> 24) | (r.lc >> 24) << 8) as u16));
+                    pr = w.purch.len() as u32;
+                }
+                unsafe {
+                    let c = w.cur.get_unchecked_mut((r.lc & 0xFF_FFFF) as usize);
+                    *w.out.get_unchecked_mut(*c as usize) = (r.ts as u64) << 32 | pr as u64;
                     *c += 1;
                 }
-                i += 1;
             }
         }
     }
 
     // clicks of persons with events
+    let cnt = &w.cnt;
+    let has = |lp: usize| unsafe { *cnt.get_unchecked(lp + 1) != *cnt.get_unchecked(lp) };
     w.ccnt.fill(0);
     for s in st {
         for sl in s.cb[b].slices() {
             for c in sl {
                 let lp = c.lp as usize;
-                if w.cnt[lp + 1] != w.cnt[lp] {
-                    w.ccnt[lp] += 1;
+                if has(lp) {
+                    unsafe { *w.ccnt.get_unchecked_mut(lp) += 1 };
                 }
             }
         }
@@ -1663,30 +1659,40 @@ fn person_bucket(ctx: &Ctx, tab: &Table, st: &[TS], drops: &[Vec<Vec<u32>>], b: 
         for sl in s.cb[b].slices() {
             for c in sl {
                 let lp = c.lp as usize;
-                if w.cnt[lp + 1] != w.cnt[lp] {
-                    let cur = &mut w.ccur[lp];
-                    w.cout[*cur as usize] = (c.ts as u64) << 32 | w.cinfo.len() as u64;
-                    *cur += 1;
+                if has(lp) {
+                    unsafe {
+                        let cur = w.ccur.get_unchecked_mut(lp);
+                        *w.cout.get_unchecked_mut(*cur as usize) = (c.ts as u64) << 32 | w.cinfo.len() as u64;
+                        *cur += 1;
+                    }
                     w.cinfo.push((c.camp, c.cid));
                 }
             }
         }
     }
 
+    w.lps.clear();
+    for lp in 0..nlp {
+        if has(lp) {
+            w.lps.push(lp as u32);
+        }
+    }
     let mut ev = std::mem::take(&mut w.out);
     let mut ck = std::mem::take(&mut w.cout);
-    for lp in 0..nlp {
-        let (a, z) = (w.cnt[lp] as usize, w.cnt[lp + 1] as usize);
-        if a == z {
-            continue;
+    let lps = std::mem::take(&mut w.lps);
+    for (k, &lp) in lps.iter().enumerate() {
+        if let Some(&n) = lps.get(k + 8) {
+            prefetch(&tab.s[(n as usize) << 8 | b]);
         }
-        let pid = lp << 8 | b;
+        let lp = lp as usize;
+        let (a, z) = (w.cnt[lp] as usize, w.cnt[lp + 1] as usize);
         let es = &mut ev[a..z];
         sort_small(es);
         let cs = &mut ck[w.ccnt[lp] as usize..w.ccnt[lp + 1] as usize];
         sort_small(cs);
-        person(ctx, tab.key(pid), es, cs, w);
+        person(ctx, tab.key(lp << 8 | b), es, cs, w);
     }
+    w.lps = lps;
     w.out = ev;
     w.cout = ck;
 }
@@ -1696,49 +1702,49 @@ fn person(ctx: &Ctx, name: SStr, ev: &[u64], cs: &[u64], w: &mut Work) {
     let base = ctx.base;
     let width = ctx.ndays;
     let organic = ctx.ncamp;
+    let day0ms = ctx.day0 * DAY; // every event ts is at or after it
 
+    // Events 5 + 6: sessions; one user_daily row per day with a session start
     w.sessions.clear();
     w.day_groups.clear();
-    let mut row: Option<UserRow> = None;
-    let mut prev = i64::MIN;
+    let mut prev = i64::MIN / 2;
+    let (mut day, mut nses, mut nev, mut rev) = (usize::MAX, 0i64, 0i64, 0i64);
     for &e in ev {
         let ts = (e >> 32) as i64 + base;
-        if prev == i64::MIN || ts - prev > GAP {
-            let d = (ts.div_euclid(DAY) - ctx.day0) as usize;
+        if ts - prev > GAP {
+            let d = ((ts - day0ms) as u64 / DAY as u64) as usize;
             w.sessions.push(Sess { start: ts, d, purchased: false, revenue: 0 });
-            let day = (ctx.day0 + d as i64) as i32;
-            if row.as_ref().map(|r| r.day != day).unwrap_or(true) {
-                if let Some(r) = row.take() {
-                    w.rows.push(finish_row(r, &mut w.cats, &ctx.cat_rank));
+            if d != day {
+                if day != usize::MAX {
+                    let top = top_cat(&mut w.cats, &ctx.cat_rank);
+                    w.rows.push(UserRow { name, day: (ctx.day0 + day as i64) as i32, sessions: nses, events: nev, revenue: rev, top });
                 }
-                row = Some(UserRow { name, day, sessions: 0, events: 0, revenue: 0, top: None });
+                (day, nses, nev, rev) = (d, 0, 0, 0);
                 w.day_groups.push((d, w.sessions.len() - 1));
             }
-            row.as_mut().unwrap().sessions += 1;
+            nses += 1;
         }
         prev = ts;
-        let r = row.as_mut().unwrap();
-        r.events += 1;
+        nev += 1;
         let pr = e as u32;
         if pr != 0 {
-            let (price, cat) = w.purch[pr as usize - 1];
+            let (price, cat) = unsafe { *w.purch.get_unchecked(pr as usize - 1) };
             let price = price as i64;
-            let s = w.sessions.last_mut().unwrap();
+            let s = unsafe { w.sessions.last_mut().unwrap_unchecked() };
             s.purchased = true;
             s.revenue += price;
-            r.revenue += price;
+            rev += price;
             match w.cats.iter_mut().find(|c| c.0 == cat) {
                 Some(c) => c.1 += price,
                 None => w.cats.push((cat, price)),
             }
         }
     }
-    if let Some(r) = row.take() {
-        w.rows.push(finish_row(r, &mut w.cats, &ctx.cat_rank));
-    }
+    let top = top_cat(&mut w.cats, &ctx.cat_rank);
+    w.rows.push(UserRow { name, day: (ctx.day0 + day as i64) as i32, sessions: nses, events: nev, revenue: rev, top });
 
     let cts = |c: u64| (c >> 32) as i64 + base;
-    // credit: latest click with start - 7d <= ts <= start; tie -> smallest click_id
+    // Clicks 4 + 5: latest click with start - 7d <= ts <= start; tie -> smallest click_id; none -> organic
     let mut q = 0;
     for s in &w.sessions {
         while q < cs.len() && cts(cs[q]) <= s.start {
@@ -1760,13 +1766,16 @@ fn person(ctx: &Ctx, name: SStr, ev: &[u64], cs: &[u64], w: &mut Work) {
                 camp = best.0 as usize;
             }
         }
-        let a = &mut w.cred[camp * width + s.d];
+        let a = unsafe { w.cred.get_unchecked_mut(camp * width + s.d) };
         a[0] += 1;
         a[1] += s.purchased as i64;
         a[2] += s.revenue;
     }
+    if cs.is_empty() {
+        return;
+    }
 
-    // assists: a click at t assists sessions starting in [t, t + 7d]; merge per campaign
+    // Clicks 7: a click at t assists sessions starting in [t, t + 7d]; merge per campaign
     fn flush(assist: &mut [i64], width: usize, k: usize, lo: i64, hi: i64, sessions: &[Sess], day_groups: &[(usize, usize)]) {
         let a = sessions.partition_point(|s| s.start < lo);
         let b = sessions.partition_point(|s| s.start <= hi);
@@ -1805,13 +1814,15 @@ fn person(ctx: &Ctx, name: SStr, ev: &[u64], cs: &[u64], w: &mut Work) {
     }
 }
 
-fn finish_row(mut r: UserRow, cats: &mut Vec<(u16, i64)>, rank: &[u32]) -> UserRow {
-    r.top = cats
-        .iter()
-        .max_by(|a, b| a.1.cmp(&b.1).then(rank[b.0 as usize].cmp(&rank[a.0 as usize])))
-        .map(|c| c.0);
+/// The category with the highest summed price (tie: byte-wise smallest name); None with no purchases. Clears `cats`.
+#[inline]
+fn top_cat(cats: &mut Vec<(u16, i64)>, rank: &[u32]) -> Option<u16> {
+    if cats.is_empty() {
+        return None;
+    }
+    let top = cats.iter().max_by(|a, b| a.1.cmp(&b.1).then(rank[b.0 as usize].cmp(&rank[a.0 as usize]))).map(|c| c.0);
     cats.clear();
-    r
+    top
 }
 
 // ---------------------------------------------------------------- Parquet

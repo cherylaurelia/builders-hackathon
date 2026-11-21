@@ -505,6 +505,33 @@ impl IdTable {
         self.slot_scan(home, key, ins)
     }
 
+    /// `slot_from` that does not leave the line at `home`: None when the line is full of other keys, so the key
+    /// is (or will be added) further on. The caller asks for the next line (`next_line`) and comes back when
+    /// it is in the cache, instead of waiting for it here. Slots fill in order, so a line with a free last slot is
+    /// where the scan for a missing key ends.
+    #[inline(always)]
+    fn slot_in_line(&self, home: u32, key: u64, ins: &mut usize) -> Option<u32> {
+        // SAFETY: as in `slot_from`
+        let s = unsafe { self.slots.as_ptr().add(home as usize) };
+        let k = [0, 1, 2, 3].map(|j| unsafe { (*s.add(j)).key.load(Relaxed) });
+        let m = (k[0] == key) as u32 | ((k[1] == key) as u32) << 1 | ((k[2] == key) as u32) << 2 | ((k[3] == key) as u32) << 3;
+        if m != 0 {
+            return Some(home + m.trailing_zeros());
+        }
+        if k[3] != 0 {
+            return None;
+        }
+        Some(self.slot_scan(home, key, ins))
+    }
+
+    /// The line after the one at `home`, with its cache line on the way.
+    #[inline(always)]
+    fn next_line(&self, home: u32) -> u32 {
+        let h = (home as usize + 4) & (self.slots.len() - 1);
+        prefetch(unsafe { self.slots.as_ptr().add(h) });
+        h as u32
+    }
+
     /// `slot_from` for a key that is not in its home line (yet): linear probing from `home`, adding the key in the
     /// first free slot.
     #[inline(never)]
@@ -1579,13 +1606,28 @@ impl Shard {
     fn flush(&mut self, cx: &Ctx, events: bool) {
         for k in self.head.saturating_sub(RING)..self.head {
             let p = self.ring[k & (RING - 1)];
+            let person = cx.ids.person(cx.ids.slot_from(p.home, p.ukey, &mut self.ins));
             if events {
-                self.finish_event(cx, p);
+                self.put_event(cx, p, person);
             } else {
-                self.finish_click(cx, p);
+                self.put_click(cx, p, person);
             }
         }
         self.head = 0;
+    }
+
+    /// The person of the queued `p`, whose line of the ID table is in the cache by now. An ID that is not in that
+    /// line goes back in the queue to wait for the next line, and the entry that leaves the queue for it is looked
+    /// up instead; None when nothing left the queue.
+    #[inline(always)]
+    fn resolve(&mut self, cx: &Ctx, mut p: Pend) -> Option<(Pend, u32)> {
+        loop {
+            if let Some(slot) = cx.ids.slot_in_line(p.home, p.ukey, &mut self.ins) {
+                return Some((p, cx.ids.person(slot)));
+            }
+            p.home = cx.ids.next_line(p.home);
+            p = self.queue(p)?;
+        }
     }
 
     /// Any parsed event: its dedup record. `loc` = 0 for an invalid or late one.
@@ -1599,13 +1641,14 @@ impl Shard {
     #[inline(always)]
     fn keep(&mut self, cx: &Ctx, ekey: u64, ingest: i64, ukey: u64, ts: i64, pay: u32) {
         if let Some(p) = self.queue(Pend { a: ekey, b: ingest, ukey, home: cx.ids.aim(ukey), ts: (ts - cx.base) as u32, x: pay }) {
-            self.finish_event(cx, p);
+            if let Some((p, person)) = self.resolve(cx, p) {
+                self.put_event(cx, p, person);
+            }
         }
     }
 
     #[inline(always)]
-    fn finish_event(&mut self, cx: &Ctx, p: Pend) {
-        let person = cx.ids.person(cx.ids.slot_from(p.home, p.ukey, &mut self.ins));
+    fn put_event(&mut self, cx: &Ctx, p: Pend, person: u32) {
         let rec = self.ev[(person >> cx.pshift) as usize].push(&mut self.arena, EV_BLOCK, ERec { person, ts: p.ts, pay: p.x });
         self.log(cx, p.a, p.b, rec as u64);
     }
@@ -1614,13 +1657,14 @@ impl Shard {
     #[inline(always)]
     fn click(&mut self, cx: &Ctx, cid: u64, ukey: u64, ts: i64, camp: u16) {
         if let Some(p) = self.queue(Pend { a: cid, b: 0, ukey, home: cx.ids.aim(ukey), ts: (ts - cx.base) as u32, x: camp as u32 }) {
-            self.finish_click(cx, p);
+            if let Some((p, person)) = self.resolve(cx, p) {
+                self.put_click(cx, p, person);
+            }
         }
     }
 
     #[inline(always)]
-    fn finish_click(&mut self, cx: &Ctx, p: Pend) {
-        let person = cx.ids.person(cx.ids.slot_from(p.home, p.ukey, &mut self.ins));
+    fn put_click(&mut self, cx: &Ctx, p: Pend, person: u32) {
         self.ck[(person >> cx.pshift) as usize].push(&mut self.arena, CK_BLOCK, CRec { cid: p.a, person, ts: p.ts, camp: p.x, _pad: 0 });
     }
 }

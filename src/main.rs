@@ -1107,6 +1107,16 @@ unsafe fn ts_at(p: *const u8, len: usize) -> Option<i64> {
     if len == 0 || len > 16 {
         return parse_ts(std::slice::from_raw_parts(p, len));
     }
+    if len == 13 {
+        // F3 of today's length: its first five digits behind three zero bytes, and its last eight
+        const Z: u64 = u64::from_le_bytes([b'0'; 8]);
+        let a = ((p as *const u64).read_unaligned() << 24) ^ (Z << 24);
+        let b = (p.add(5) as *const u64).read_unaligned() ^ Z;
+        if (a.wrapping_add(0x7676_7676_7676_7676) | a | b.wrapping_add(0x7676_7676_7676_7676) | b) & HI != 0 {
+            return None;
+        }
+        return Some((swar8(a) * 100_000_000 + swar8(b)) as i64);
+    }
     // F3 of 1..=16 bytes: right-align into 16 bytes behind leading '0's, check all digits, convert
     let sh = 8 * (16 - len) as u32;
     let zeros = u128::from_le_bytes([b'0'; 16]);
@@ -1346,7 +1356,7 @@ unsafe fn scan_lines<S>(
         let n = n0 as u128 | (n1 as u128) << 64;
         if n != 0 {
             let e = n.trailing_zeros() as usize;
-            let lm = (1u128 << e) - 1;
+            let lm = !n & n.wrapping_sub(1); // the bits below the first newline
             fast(st, line, e, (c0 as u128 | (c1 as u128) << 64) & lm, (q0 as u128 | (q1 as u128) << 64) & lm);
             p += e + 1;
         } else {
@@ -1952,20 +1962,21 @@ fn main() {
 /// key, any other ID in a byte-string map.
 struct IdMap {
     slots: Vec<(u64, u16)>, // key 0 = empty
+    shift: u32,             // spread(key) >> shift = where the search for a key starts
     other: BytesMap<u16>,
 }
 
 impl IdMap {
     fn new(ids: &[(Bytes, u16)]) -> IdMap {
         let cap = (ids.len() * 2).next_power_of_two().max(16);
-        let mut m = IdMap { slots: vec![(0, 0); cap], other: BytesMap::default() };
+        let mut m = IdMap { slots: vec![(0, 0); cap], shift: 64 - cap.trailing_zeros(), other: BytesMap::default() };
         for &(id, v) in ids {
             match pack(id) {
                 0 => {
                     m.other.insert(id, v);
                 }
                 k => {
-                    let mut i = mix(k) as usize & (cap - 1);
+                    let mut i = (spread(k) >> m.shift) as usize;
                     while m.slots[i].0 != 0 {
                         i = (i + 1) & (cap - 1);
                     }
@@ -1979,9 +1990,9 @@ impl IdMap {
     #[inline(always)]
     fn packed(&self, k: u64) -> Option<u16> {
         let mask = self.slots.len() - 1;
-        let mut i = mix(k) as usize & mask;
+        let mut i = (spread(k) >> self.shift) as usize;
         loop {
-            // SAFETY: i <= mask
+            // SAFETY: i <= mask (the shift leaves as many bits as the mask has)
             let (key, v) = unsafe { *self.slots.get_unchecked(i) };
             if key == k {
                 return Some(v);
@@ -3724,6 +3735,19 @@ mod tests {
             hits += (want.is_some() && s.len() >= 20 && before.iter().zip(&days).all(|(x, y)| x.a == y.a && x.b == y.b)) as usize;
         }
         assert!(hits > 20_000, "the memo was hit only {hits} times");
+        // 13 bytes, the F3 length with its own path: digits, and now and then any other byte anywhere
+        let mut good = 0;
+        for i in 0..300_000 {
+            let mut buf: Vec<u8> = (0..13).map(|_| b'0' + r.below(10) as u8).collect();
+            if i % 3 == 0 {
+                buf[r.below(13)] = *[0u8, b'/', b':', b' ', 0x7f, 0x80, 0xb9, 0xff, b'a', b'-', b'.'].get(r.below(11)).unwrap();
+            }
+            let want = parse_ts(&buf);
+            good += want.is_some() as usize;
+            buf.extend_from_slice(&[b'7'; 32]);
+            assert_eq!(unsafe { ts_at(buf.as_ptr(), 13) }, want, "{:?}", &buf[..13]);
+        }
+        assert!(good > 150_000);
     }
 
     #[test]

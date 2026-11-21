@@ -1689,6 +1689,8 @@ struct Agg {
     iv: Vec<(i64, i64)>,
     seen: Vec<u32>,
     sctr: u32,
+    last: Vec<u32>,
+    lctr: u32,
     // per-bucket scratch, reused across buckets
     pslots: Vec<u64>,
     pnames: Vec<SStr>,
@@ -1712,11 +1714,13 @@ impl Agg {
         Agg {
             rows: Vec::new(),
             cred: vec![[0i64; 3]; (ncamp + 1) * width],
-            assist: vec![0i64; (ncamp + 1) * width],
+            assist: vec![0i64; (ncamp + 1) * width + 1], // + a cell for unused increments
             stamp: vec![u32::MAX; ncamp + 1],
             iv: vec![(0i64, 0i64); ncamp + 1],
             seen: vec![0u32; ncamp + 1],
             sctr: 0,
+            last: vec![0u32; ncamp + 1],
+            lctr: 0,
             pslots: Vec::new(),
             pnames: Vec::new(),
             pnh: Vec::new(),
@@ -1829,6 +1833,7 @@ struct Click {
 const NIL: u32 = 0; // end of a purchase chain; chain links and heads are purchase index + 1
 const FIB: u64 = 0x9E37_79B9_7F4A_7C15;
 
+
 struct Sess {
     start: i64,
     d: usize,
@@ -1844,6 +1849,153 @@ fn same_name(a: &SStr, b: &SStr) -> bool {
         a == b
     }
 }
+
+/// Rotation `r` of eight lanes, and the lanes whose rotated-in lane (i + r) % 8 comes before them (for breaking ties).
+#[allow(dead_code)] // only the AVX2 build uses them
+const ROT: [[i32; 8]; 8] = {
+    let mut t = [[0; 8]; 8];
+    let mut r = 0;
+    while r < 8 {
+        let mut i = 0;
+        while i < 8 {
+            t[r][i] = ((i + r) % 8) as i32;
+            i += 1;
+        }
+        r += 1;
+    }
+    t
+};
+#[allow(dead_code)]
+const TIE: [[i32; 8]; 8] = {
+    let mut t = [[0; 8]; 8];
+    let mut r = 0;
+    while r < 8 {
+        let mut i = 0;
+        while i < 8 {
+            t[r][i] = if (i + r) % 8 < i { -1 } else { 0 };
+            i += 1;
+        }
+        r += 1;
+    }
+    t
+};
+
+/// `rank[i]` = slot of key i in sorted order, for 2 <= k <= 64 keys (for k <= 8 the ranks of eight lanes, the ones
+/// past k included: always a permutation of 0..8): the number of keys below it plus the equal keys
+/// before it, counted eight keys at a time, so no data-dependent branches and every slot is used once.
+#[inline]
+fn ranks_small(k: usize, key: impl Fn(usize) -> u32, rank: &mut [u8; 64]) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        if k <= 8 {
+            // one vector: every key against the other seven, by rotating the vector, with a fixed trip count.
+            // Lanes past k hold the largest key (and any index into `key` is clamped), so they only rank last.
+            let mut buf = [0i32; 8];
+            for i in 0..8 {
+                let kv = (key(i.min(k - 1)) ^ 0x8000_0000) as i32;
+                buf[i] = if i < k { kv } else { i32::MAX };
+            }
+            let v = _mm256_loadu_si256(buf.as_ptr() as *const __m256i);
+            let mut acc = _mm256_setzero_si256();
+            for r in 1..8 {
+                let rot = _mm256_permutevar8x32_epi32(v, _mm256_loadu_si256(ROT[r].as_ptr() as *const __m256i)); // lane i = key (i + r) % 8
+                let lt = _mm256_cmpgt_epi32(v, rot);
+                let tie = _mm256_and_si256(_mm256_cmpeq_epi32(v, rot), _mm256_loadu_si256(TIE[r].as_ptr() as *const __m256i));
+                acc = _mm256_sub_epi32(acc, _mm256_or_si256(lt, tie));
+            }
+            let mut out = [0i32; 8];
+            _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, acc);
+            for i in 0..8 {
+                rank[i] = out[i] as u8;
+            }
+            return;
+        }
+        #[repr(align(32))]
+        struct K([i32; 64]);
+        let mut kt = K([i32::MAX; 64]); // keys flipped to signed order; the padding sorts last
+        for i in 0..k {
+            kt.0[i] = (key(i) ^ 0x8000_0000) as i32;
+        }
+        let nch = k.div_ceil(8);
+        for i in 0..k {
+            let ki = _mm256_set1_epi32(kt.0[i]);
+            let mut r = 0u32;
+            for c in 0..nch {
+                let t = _mm256_load_si256(kt.0.as_ptr().add(c * 8) as *const __m256i);
+                let lt = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(ki, t))) as u32;
+                let eq = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(ki, t))) as u32;
+                let before = (1u32 << i.saturating_sub(c * 8).min(8)) - 1;
+                r += lt.count_ones() + (eq & before).count_ones();
+            }
+            rank[i] = r as u8;
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    for i in 0..k {
+        let ki = key(i);
+        rank[i] = (0..k).filter(|&j| key(j) < ki || (key(j) == ki && j < i)).count() as u8;
+    }
+    for i in k..8 {
+        rank[i] = i as u8; // the unused lanes of the vector version
+    }
+}
+
+/// Bit j set when click j (of the first 8 * nch) is in the 7-day window of a session starting at `st`:
+/// `st - ts` in 0..=WEEK, as an unsigned wrapping difference.
+#[inline(always)]
+fn win_mask(ts: &[u32; 72], nch: usize, st: u32) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let s = _mm256_set1_epi32(st as i32);
+        let w = _mm256_set1_epi32(WEEK as i32);
+        let mut m = 0u64;
+        for c in 0..nch {
+            let t = _mm256_loadu_si256(ts.as_ptr().add(c * 8) as *const __m256i);
+            let d = _mm256_sub_epi32(s, t);
+            let ok = _mm256_cmpeq_epi32(_mm256_min_epu32(d, w), d);
+            m |= (_mm256_movemask_ps(_mm256_castsi256_ps(ok)) as u32 as u64) << (c * 8);
+        }
+        return m;
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut m = 0u64;
+        for j in 0..nch * 8 {
+            m |= ((st.wrapping_sub(ts[j]) <= WEEK as u32) as u64) << j;
+        }
+        m
+    }
+}
+
+/// Bit j set when `nxt[j] >= hi` (the next click of j's campaign is not before `hi`), for the first 8 * nch.
+#[inline(always)]
+fn nxt_mask(nxt: &[u32; 72], nch: usize, hi: u32) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let h = _mm256_set1_epi32(hi as i32 - 1);
+        let mut m = 0u64;
+        for c in 0..nch {
+            let t = _mm256_loadu_si256(nxt.as_ptr().add(c * 8) as *const __m256i);
+            m |= (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(t, h))) as u32 as u64) << (c * 8);
+        }
+        return m;
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut m = 0u64;
+        for j in 0..nch * 8 {
+            m |= ((nxt[j] >= hi) as u64) << j;
+        }
+        m
+    }
+}
+
+#[repr(align(32))]
+struct A32([u32; 72]);
 
 /// The person table: open addressing on the hash the router computed, slot = tag << 32 | (person id + 1).
 fn person_find(pslots: &[u64], pnames: &[SStr], nh: u64, name: &SStr) -> Option<u32> {
@@ -2031,22 +2183,6 @@ fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<
             }
         }
     }
-    for pid in 0..np {
-        let g = &mut agg.grp[agg.gstart[pid] as usize..agg.gstart[pid + 1] as usize];
-        if g.len() <= 24 {
-            for i in 1..g.len() {
-                let x = g[i];
-                let mut j = i;
-                while j > 0 && g[j - 1].min > x.min {
-                    g[j] = g[j - 1];
-                    j -= 1;
-                }
-                g[j] = x;
-            }
-        } else {
-            g.sort_unstable_by_key(|x| x.min);
-        }
-    }
 
     // 3. clicks of known people, grouped by person (counting sort) and sorted by ts within a person
     agg.ctmp.clear();
@@ -2072,33 +2208,65 @@ fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<
         agg.cstart[id + 1] += 1;
         agg.cl[at] = Click { cid: c.cid, ts: c.ts, camp: c.pc as u16 };
     }
-    for pid in 0..np {
-        let g = &mut agg.cl[agg.cstart[pid] as usize..agg.cstart[pid + 1] as usize];
-        if g.len() <= 24 {
-            for i in 1..g.len() {
-                let x = g[i];
-                let mut j = i;
-                while j > 0 && g[j - 1].ts > x.ts {
-                    g[j] = g[j - 1];
-                    j -= 1;
-                }
-                g[j] = x;
-            }
-        } else {
-            g.sort_unstable_by_key(|x| x.ts);
-        }
-    }
 
     // 4. per person: sessions + user_daily rows, credit, assists
     let mut sessions: Vec<Sess> = Vec::new();
     let mut day_groups: Vec<(usize, usize)> = Vec::new(); // (d, first session index)
     let mut cats: Vec<(u16, i64)> = Vec::new();
     let mut touched: Vec<usize> = Vec::new();
+    let mut gscratch = [Grp { min: 0, max: 0, cnt: 0, head: NIL }; 64];
+    let mut tsa = A32([0; 72]); // this person's clicks, sorted by ts (people with up to 64 clicks)
+    let mut nxt = A32([0; 72]); // index of the next click of the same campaign, else the click count
+    let mut campa = [0u16; 72];
+    let mut cida = [Packed(0); 72];
     for pid in 0..np {
         let person = pid as u32;
         let name = agg.pnames[pid];
-        let gs = &agg.grp[agg.gstart[pid] as usize..agg.gstart[pid + 1] as usize];
-        let cs = &agg.cl[agg.cstart[pid] as usize..agg.cstart[pid + 1] as usize];
+        // entries of the person, by bin
+        let (g0, g1) = (agg.gstart[pid] as usize, agg.gstart[pid + 1] as usize);
+        let ng = g1 - g0;
+        if ng > 64 {
+            agg.grp[g0..g1].sort_unstable_by_key(|x| x.min);
+        } else if ng == 1 {
+            gscratch[0] = agg.grp[g0];
+        } else if ng > 1 {
+            let mut rank = [0u8; 64];
+            ranks_small(ng, |i| agg.grp[g0 + i].min, &mut rank);
+            for i in 0..ng.max(8) {
+                gscratch[rank[i] as usize] = agg.grp[g0 + i.min(ng - 1)]; // lanes past ng land past the end
+            }
+        }
+        // clicks of the person, by ts
+        let (c0, c1) = (agg.cstart[pid] as usize, agg.cstart[pid + 1] as usize);
+        let nc = c1 - c0;
+        if nc > 64 {
+            agg.cl[c0..c1].sort_unstable_by_key(|x| x.ts);
+        } else if nc > 0 {
+            let mut rank = [0u8; 64];
+            if nc > 1 {
+                ranks_small(nc, |i| agg.cl[c0 + i].ts, &mut rank);
+            }
+            for i in 0..if nc > 1 { nc.max(8) } else { 1 } {
+                let (r, c) = (rank[i] as usize, &agg.cl[c0 + i.min(nc - 1)]); // lanes past nc land past the end
+                tsa.0[r] = c.ts;
+                campa[r] = c.camp;
+                cida[r] = c.cid;
+            }
+            // nxt: scanning back, `last` holds the stamp of this person and the index of the later click
+            if agg.lctr >= 1 << 26 {
+                agg.last.fill(0);
+                agg.lctr = 0;
+            }
+            agg.lctr += 1;
+            let stamp = agg.lctr << 6;
+            for j in (0..nc).rev() {
+                let v = agg.last[campa[j] as usize];
+                nxt.0[j] = if v >> 6 << 6 == stamp { v & 63 } else { nc as u32 };
+                agg.last[campa[j] as usize] = stamp | j as u32;
+            }
+        }
+        let gs: &[Grp] = if ng > 64 { &agg.grp[g0..g1] } else { &gscratch[..ng] };
+        let cs = &agg.cl[c0..c1]; // sorted in place only for people with over 64 clicks
 
         // sessions + user_daily rows
         sessions.clear();
@@ -2150,8 +2318,54 @@ fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<
                 a[1] += s.purchased as i64;
                 a[2] += s.revenue;
             }
+        } else if nc <= 64 {
+            // up to 64 clicks: per session, one vector pass finds the clicks of its 7-day window [start - 7d, start]
+            // (a contiguous run of the sorted clicks); the credit goes to the last, the assists to the last
+            // click of each campaign in the run
+            let nch = nc.div_ceil(8);
+            let valid = if nc == 64 { !0u64 } else { (1u64 << nc) - 1 };
+            let adummy = agg.assist.len() - 1; // absorbs the increments of the unused steps
+            for s in &sessions {
+                let m = win_mask(&tsa.0, nch, (s.start - base) as u32) & valid;
+                let nz = m != 0;
+                let jh = (63 - (m | 1).leading_zeros()) as usize; // the last click of the window
+                let mut camp = if nz { campa[jh] as usize } else { organic };
+                if nz && jh > 0 && tsa.0[jh - 1] == tsa.0[jh] {
+                    // credit: tie in ts -> smallest click_id
+                    let t = tsa.0[jh];
+                    let mut best = jh;
+                    let mut j = jh;
+                    while j > 0 && tsa.0[j - 1] == t {
+                        j -= 1;
+                        if cida[j].get() < cida[best].get() {
+                            best = j;
+                        }
+                    }
+                    camp = campa[best] as usize;
+                }
+                // assists: the last click of each campaign in the window; three fixed steps, the rest in a loop
+                let mut c = m & nxt_mask(&nxt.0, nch, jh as u32 + 1);
+                macro_rules! bump {
+                    () => {
+                        let j = (c.trailing_zeros() & 63) as usize;
+                        let at = if c != 0 { campa[j] as usize * width + s.d } else { adummy };
+                        agg.assist[at] += 1;
+                        c &= c.wrapping_sub(1);
+                    };
+                }
+                bump!();
+                bump!();
+                bump!();
+                while c != 0 {
+                    bump!();
+                }
+                let a = &mut agg.cred[camp * width + s.d];
+                a[0] += 1;
+                a[1] += s.purchased as i64;
+                a[2] += s.revenue;
+            }
         } else if nc * ns <= 2048 {
-            // few clicks or few sessions: per session, look at the clicks of its 7-day window [start - 7d, start]
+            // few sessions: per session, look at the clicks of its 7-day window [start - 7d, start]
             // (a contiguous run of cs) for the credit and for the distinct assisting campaigns
             let (mut lo, mut hi) = (0, 0);
             for s in &sessions {

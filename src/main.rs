@@ -886,7 +886,9 @@ fn main() {
     let lap = |what: &str| {
         let (c, ins) = usage();
         let (c0, i0) = usage0.get();
-        eprintln!("[{:7.3}s wall, {:6.3}s cpu, {:6.2}G ins] {what}", t0.elapsed().as_secs_f64(), c - c0, (ins - i0) as f64 / 1e9);
+        // one write(2) per line: eprintln! issues one per formatted piece
+        let line = format!("[{:7.3}s wall, {:6.3}s cpu, {:6.2}G ins] {what}\n", t0.elapsed().as_secs_f64(), c - c0, (ins - i0) as f64 / 1e9);
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
         usage0.set((c, ins));
     };
 
@@ -900,7 +902,11 @@ fn main() {
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
 
-    // products -> categories; "unknown" is its own category, never one of the file's
+    // products -> categories and campaigns, on a side thread while the links are built (7 ms of serial start-up)
+    let tables = {
+        let data = data.clone();
+        std::thread::spawn(move || {
+    // "unknown" is its own category, never one of the file's
     let mut cat_names: Vec<Bytes> = Vec::new();
     let mut cat_idx: BytesMap<u16> = BytesMap::default();
     let mut products: BytesMap<u16> = BytesMap::default();
@@ -933,12 +939,16 @@ fn main() {
         camp_ids.push(c);
         camp_channel.push(ch);
     }
-    let ncamp = camp_ids.len();
-    lap("small tables");
+    (cat_names, products, unknown_cat, cat_rank, camp_ids, camp_channel, campaigns)
+        })
+    };
 
     // 1. links, on every thread before anything else: small, and a side thread would trail the event parse
     let links = build_links(&csv_files(&data.join("links")), threads);
     lap(&format!("links built: {} linked ids", links.iter().map(|m| m.len()).sum::<usize>()));
+    let (cat_names, products, unknown_cat, cat_rank, camp_ids, camp_channel, campaigns) = tables.join().unwrap_or_else(|_| die("tables thread panicked"));
+    let ncamp = camp_ids.len();
+    lap("small tables");
 
     let ctx = Ctx { ws, we, day0, ndays, ncamp, products, campaigns, unknown_cat, cat_rank };
 

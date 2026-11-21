@@ -190,8 +190,8 @@ fn map_anon(bytes: usize) -> *mut u8 {
     }
     let a = (p as usize + HP - 1) & !(HP - 1);
     #[cfg(target_os = "linux")]
-    unsafe {
-        libc::madvise(a as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
+    if std::env::var_os("C2_NOHP").is_none() {
+        unsafe { libc::madvise(a as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE) };
     }
     a as *mut u8
 }
@@ -513,35 +513,49 @@ unsafe fn tokenize<const N: usize>(p: *const u8) -> Tok<N> {
     Tok::Ok(len, s, e)
 }
 
-/// Calls `f(fields, fast)` for every well-formed line that starts in [start, end) of `file`, header skipped.
-/// `fast`: 16 bytes from the start of every field are mapped (lines that end at least 32 bytes before the file).
-#[inline(always)]
-fn each_line<const N: usize>(file: Bytes, start: usize, end: usize, mut f: impl FnMut([Bytes; N], bool)) {
-    let len = file.len();
-    let first = if start == 0 { 0 } else { start - 1 };
-    let Some(nl) = memchr::memchr(b'\n', &file[first..]) else { return };
-    let mut p = first + nl + 1;
-    while p < end && p < len {
-        if p + 160 <= len {
-            match unsafe { tokenize::<N>(file.as_ptr().add(p)) } {
-                Tok::Ok(ll, s, e) => {
-                    let fields: [Bytes; N] = std::array::from_fn(|i| unsafe { file.get_unchecked(p + s[i] as usize..p + e[i] as usize) });
-                    f(fields, true);
-                    p += ll + 1;
-                    continue;
+/// The well-formed lines that start in [start, end) of `file`, header skipped, as N unquoted fields.
+/// `fast`: 16 bytes from the start of every field are mapped (the line ends at least 32 bytes before the file does).
+struct Lines<const N: usize> {
+    file: Bytes,
+    p: usize,
+    end: usize,
+}
+impl<const N: usize> Lines<N> {
+    fn new(file: Bytes, start: usize, end: usize) -> Self {
+        let first = if start == 0 { 0 } else { start - 1 };
+        let p = match memchr::memchr(b'\n', &file[first.min(file.len())..]) {
+            Some(nl) => first + nl + 1,
+            None => usize::MAX,
+        };
+        Lines { file, p, end: end.min(file.len()) }
+    }
+    #[inline(always)]
+    fn next(&mut self) -> Option<([Bytes; N], bool)> {
+        let (file, len) = (self.file, self.file.len());
+        loop {
+            let p = self.p;
+            if p >= self.end {
+                return None;
+            }
+            if p + 160 <= len {
+                match unsafe { tokenize::<N>(file.as_ptr().add(p)) } {
+                    Tok::Ok(ll, s, e) => {
+                        self.p = p + ll + 1;
+                        return Some((std::array::from_fn(|i| unsafe { file.get_unchecked(p + s[i] as usize..p + e[i] as usize) }), true));
+                    }
+                    Tok::Bad(ll) => {
+                        self.p = p + ll + 1;
+                        continue;
+                    }
+                    Tok::Long => {}
                 }
-                Tok::Bad(ll) => {
-                    p += ll + 1;
-                    continue;
-                }
-                Tok::Long => {}
+            }
+            let e = memchr::memchr(b'\n', &file[p..]).map(|i| p + i).unwrap_or(len);
+            self.p = e + 1;
+            if let Some(fields) = split::<N>(&file[p..e]) {
+                return Some((fields, false));
             }
         }
-        let e = memchr::memchr(b'\n', &file[p..]).map(|i| p + i).unwrap_or(len);
-        if let Some(fields) = split::<N>(&file[p..e]) {
-            f(fields, false);
-        }
-        p = e + 1;
     }
 }
 
@@ -998,11 +1012,24 @@ fn main() {
     let link_bytes: usize = link_files.iter().map(|f| f.len()).sum();
     let ev_bytes: usize = ev_files.iter().map(|f| f.len()).sum();
     let ck_bytes: usize = ck_files.iter().map(|f| f.len()).sum();
-    // linked IDs (~2 per 20-byte line) + IDs on their own (generator: ~1 person per 30 events, ~70 bytes per event)
-    let est = link_bytes / 10 + ev_bytes / 70 / 20 + ck_bytes / 50 / 50;
-    let cap = (est * 2).next_power_of_two().max(1 << 16);
+    // distinct linked IDs (~1 per 15 bytes of links) + IDs on their own (~1 person per 30 events of ~75 bytes,
+    // about half of them with one ID); the table stays under ~2/3 full even at 1.6x this estimate
+    let est = link_bytes / 15 + ev_bytes / 75 / 60 + ck_bytes / 50 / 200;
+    let cap = (est * 3 / 2).next_power_of_two().max(1 << 16);
     let tab = Table::new(cap);
     let parent: &[AtomicU32] = unsafe { std::slice::from_raw_parts(map_anon(cap * 4) as *const AtomicU32, cap) };
+    // touch every page by writing, in parallel: a first read would map the zero page, and the write after it
+    // would cost a copy-on-write fault plus a TLB shootdown of every thread
+    {
+        let regions = [(tab.s.as_ptr() as usize, cap * std::mem::size_of::<Slot>()), (parent.as_ptr() as usize, cap * 4)];
+        let pieces: Vec<(usize, usize)> = regions.iter().flat_map(|&(p, n)| (0..n).step_by(1 << 21).map(move |o| (p + o, (n - o).min(1 << 21)))).collect();
+        par(threads, pieces.len(), || (), |_, i| {
+            let (p, n) = pieces[i];
+            for o in (0..n).step_by(4096) {
+                unsafe { std::ptr::write_volatile((p + o) as *mut u8, 0) };
+            }
+        });
+    }
     let mut st: Vec<TS> = (0..threads)
         .map(|t| TS {
             t,
@@ -1052,6 +1079,10 @@ fn main() {
     let n_er: usize = st.iter().flat_map(|s| s.eb.iter()).map(|b| b.len).sum();
     let n_ck: usize = st.iter().flat_map(|s| s.cb.iter()).map(|b| b.len).sum();
     lap(&format!("parsed: {n_er} events, {n_ev} kept, {n_ck} clicks"));
+    if std::env::var_os("C2_DIAG").is_some() {
+        let used = tab.s.iter().filter(|s| s.st.load(Relaxed) != 0).count();
+        eprintln!("id table: {used} of {cap} slots used");
+    }
 
     // 3. duplicates
     let drops = par(
@@ -1112,113 +1143,139 @@ fn main() {
 
 const BATCH: usize = 32;
 
-fn link_chunk(tab: &Table, s: &mut TS, (f, a, b): (Bytes, usize, usize)) {
-    let mut batch: Vec<(SStr, u64, SStr, u64)> = Vec::with_capacity(BATCH);
-    let flush = |batch: &mut Vec<(SStr, u64, SStr, u64)>, edges: &mut Vec<(u32, u32)>| {
-        for &(x, hx, y, hy) in batch.iter() {
-            let (i, j) = (tab.get_or_insert(x, hx), tab.get_or_insert(y, hy));
-            if i != j {
-                edges.push((i, j));
-            }
-        }
-        batch.clear();
-    };
-    each_line::<2>(f, a, b, |[x, y], fast| {
-        // Linked IDs, rule 1: drop lines where either field is empty
-        if x.is_empty() || y.is_empty() {
-            return;
-        }
-        let (x, y) = if fast { unsafe { (SStr::fast(x), SStr::fast(y)) } } else { (SStr::new(x), SStr::new(y)) };
-        let (hx, hy) = (x.hash(), y.hash());
-        prefetch(&tab.s[tab.home(hx)]);
-        prefetch(&tab.s[tab.home(hy)]);
-        batch.push((x, hx, y, hy));
-        if batch.len() == BATCH {
-            flush(&mut batch, &mut s.edges);
-        }
-    });
-    flush(&mut batch, &mut s.edges);
+#[inline(always)]
+fn sstr(b: Bytes, fast: bool) -> SStr {
+    if fast {
+        unsafe { SStr::fast(b) }
+    } else {
+        SStr::new(b)
+    }
 }
 
+fn link_chunk(tab: &Table, s: &mut TS, (f, a, b): (Bytes, usize, usize)) {
+    let mut batch = [(SStr(0, 0), 0u64, SStr(0, 0), 0u64); BATCH];
+    let mut n = 0;
+    let mut lines = Lines::<2>::new(f, a, b);
+    loop {
+        let next = lines.next();
+        let done = next.is_none();
+        if let Some(([x, y], fast)) = next {
+            // Linked IDs, rule 1: drop lines where either field is empty
+            if !x.is_empty() && !y.is_empty() {
+                let (x, y) = (sstr(x, fast), sstr(y, fast));
+                let (hx, hy) = (x.hash(), y.hash());
+                prefetch(&tab.s[tab.home(hx)]);
+                prefetch(&tab.s[tab.home(hy)]);
+                batch[n] = (x, hx, y, hy);
+                n += 1;
+            }
+        }
+        if n == BATCH || done {
+            for &(x, hx, y, hy) in &batch[..n] {
+                let (i, j) = (tab.get_or_insert(x, hx), tab.get_or_insert(y, hy));
+                if i != j {
+                    s.edges.push((i, j));
+                }
+            }
+            n = 0;
+        }
+        if done {
+            return;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct PendEv {
     eid: SStr,
     uid: SStr,
     uh: u64,
+    eh: u64,
     ingest: u32,
     ts: u32,
     pay: u32,
     cathi: u32,
 }
 
-fn event_chunk(ctx: &Ctx, tab: &Table, s: &mut TS, f: Bytes, a: usize, b: usize) {
-    let t = s.t as u32;
-    let mut batch: Vec<PendEv> = Vec::with_capacity(BATCH);
-    let flush = |batch: &mut Vec<PendEv>, s: &mut TS| {
-        for p in batch.iter() {
-            let pid = tab.get_or_insert(p.uid, p.uh);
-            let bk = pid as usize & (NB - 1);
-            let idx = s.pb[bk].push(&mut s.arena, PRec { lc: (pid >> 8) | p.cathi << 24, ts: p.ts, pay: p.pay });
-            if idx >= 1 << 20 {
-                die("person bucket overflow");
-            }
-            let loc = t << 28 | (bk as u32) << 20 | idx as u32;
-            s.eb[(p.eid.hash() >> 56) as usize].push(&mut s.arena, ERec { eid: p.eid, ingest: p.ingest, loc });
+/// `ingest_ts` as epoch ms; None = not a timestamp (the line is then treated as malformed).
+#[inline(always)]
+fn ingest_ms(ctx: &Ctx, b: &[u8]) -> Option<i64> {
+    if b.len() == 20 && b[19] == b'Z' {
+        if let Some(s) = ctx.dates.secs(b) {
+            return Some(s * 1000);
         }
-        batch.clear();
-    };
-    each_line::<7>(f, a, b, |[eid, uid, ts, ing, ety, pid, price], fast| {
-        // Events 1: drop lines whose event_id is empty
-        if eid.is_empty() {
-            return;
-        }
-        // ingest_ts is always valid F1; a line where it is not is treated as malformed
-        let ingest_ms = match if ing.len() == 20 && ing[19] == b'Z' { ctx.dates.secs(ing).map(|s| s * 1000) } else { None } {
-            Some(v) => v,
-            None => match parse_ts(ing) {
-                Some(v) => v,
-                None => return,
-            },
-        };
-        let ingest = (ingest_ms.div_euclid(1000) - ctx.ing_base).clamp(0, u32::MAX as i64) as u32;
-        let es = if fast { unsafe { SStr::fast(eid) } } else { SStr::new(eid) };
-        // Events 3 + 4: the kept copy must be valid and not late
-        let keep = (|| {
-            if uid.is_empty() || pid.is_empty() {
-                return None;
-            }
-            let ts = parse_ts_near(ts, &ctx.dates)?;
-            if ts < ctx.ws || ts >= ctx.we || ingest_ms - ts > DAY {
-                return None;
-            }
-            let (pay, cathi) = match ety {
-                b"view" | b"cart" => (0, 0),
-                b"purchase" => {
-                    let price = parse_price(price)?;
-                    let cat = ctx.products.get(pid).copied().unwrap_or(ctx.unknown_cat) as u32;
-                    (price | (cat & 0xFF) << 24, cat >> 8)
-                }
-                _ => return None,
-            };
-            Some(((ts - ctx.base) as u32, pay, cathi))
-        })();
-        match keep {
-            Some((ts, pay, cathi)) => {
-                let us = if fast { unsafe { SStr::fast(uid) } } else { SStr::new(uid) };
-                let uh = us.hash();
-                prefetch(&tab.s[tab.home(uh)]);
-                batch.push(PendEv { eid: es, uid: us, uh, ingest, ts, pay, cathi });
-                if batch.len() == BATCH {
-                    flush(&mut batch, s);
-                }
-            }
-            None => {
-                s.eb[(es.hash() >> 56) as usize].push(&mut s.arena, ERec { eid: es, ingest, loc: NONE });
-            }
-        }
-    });
-    flush(&mut batch, s);
+    }
+    parse_ts(b)
 }
 
+fn event_chunk(ctx: &Ctx, tab: &Table, s: &mut TS, f: Bytes, a: usize, b: usize) {
+    let t = s.t as u32;
+    let z = SStr(0, 0);
+    let mut batch = [PendEv { eid: z, uid: z, uh: 0, eh: 0, ingest: 0, ts: 0, pay: 0, cathi: 0 }; BATCH];
+    let mut n = 0;
+    let mut lines = Lines::<7>::new(f, a, b);
+    loop {
+        let next = lines.next();
+        let done = next.is_none();
+        if let Some(([eid, uid, ts, ing, ety, pid, price], fast)) = next {
+            'line: {
+                // Events 1: drop lines whose event_id is empty
+                if eid.is_empty() {
+                    break 'line;
+                }
+                // ingest_ts is always valid F1; a line where it is not is treated as malformed
+                let Some(ingest_ms) = ingest_ms(ctx, ing) else { break 'line };
+                let ingest = (ingest_ms.div_euclid(1000) - ctx.ing_base).clamp(0, u32::MAX as i64) as u32;
+                let es = sstr(eid, fast);
+                let eh = es.hash();
+                // Events 3 + 4: the kept copy must be valid and not late
+                'drop: {
+                    if uid.is_empty() || pid.is_empty() {
+                        break 'drop;
+                    }
+                    let Some(ts) = parse_ts_near(ts, &ctx.dates) else { break 'drop };
+                    if ts < ctx.ws || ts >= ctx.we || ingest_ms - ts > DAY {
+                        break 'drop;
+                    }
+                    let (pay, cathi) = if ety == b"view" || ety == b"cart" {
+                        (0, 0)
+                    } else if ety == b"purchase" {
+                        let Some(price) = parse_price(price) else { break 'drop };
+                        let cat = ctx.products.get(pid).copied().unwrap_or(ctx.unknown_cat) as u32;
+                        (price | (cat & 0xFF) << 24, cat >> 8)
+                    } else {
+                        break 'drop;
+                    };
+                    let us = sstr(uid, fast);
+                    let uh = us.hash();
+                    prefetch(&tab.s[tab.home(uh)]);
+                    batch[n] = PendEv { eid: es, uid: us, uh, eh, ingest, ts: (ts - ctx.base) as u32, pay, cathi };
+                    n += 1;
+                    break 'line;
+                }
+                s.eb[(eh >> 56) as usize].push(&mut s.arena, ERec { eid: es, ingest, loc: NONE });
+            }
+        }
+        if n == BATCH || done {
+            for p in &batch[..n] {
+                let pid = tab.get_or_insert(p.uid, p.uh);
+                let bk = pid as usize & (NB - 1);
+                let idx = s.pb[bk].push(&mut s.arena, PRec { lc: (pid >> 8) | p.cathi << 24, ts: p.ts, pay: p.pay });
+                if idx >= 1 << 20 {
+                    die("person bucket overflow");
+                }
+                let loc = t << 28 | (bk as u32) << 20 | idx as u32;
+                s.eb[(p.eh >> 56) as usize].push(&mut s.arena, ERec { eid: p.eid, ingest: p.ingest, loc });
+            }
+            n = 0;
+        }
+        if done {
+            return;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct PendCk {
     uid: SStr,
     uh: u64,
@@ -1228,34 +1285,41 @@ struct PendCk {
 }
 
 fn click_chunk(ctx: &Ctx, tab: &Table, s: &mut TS, f: Bytes, a: usize, b: usize) {
-    let mut batch: Vec<PendCk> = Vec::with_capacity(BATCH);
-    let flush = |batch: &mut Vec<PendCk>, s: &mut TS| {
-        for p in batch.iter() {
-            let pid = tab.get_or_insert(p.uid, p.uh);
-            s.cb[pid as usize & (NB - 1)].push(&mut s.arena, CRec { lp: pid >> 8, ts: p.ts, cid: p.cid, camp: p.camp });
+    let mut batch = [PendCk { uid: SStr(0, 0), uh: 0, ts: 0, camp: 0, cid: Packed(0) }; BATCH];
+    let mut n = 0;
+    let mut lines = Lines::<4>::new(f, a, b);
+    loop {
+        let next = lines.next();
+        let done = next.is_none();
+        if let Some(([cid, uid, camp, ts], fast)) = next {
+            'line: {
+                // Clicks 1 + 3. Copies of a click are identical, so keeping all of them changes nothing (rule 2).
+                if cid.is_empty() || uid.is_empty() || camp.is_empty() {
+                    break 'line;
+                }
+                let Some(t) = parse_ts_near(ts, &ctx.dates) else { break 'line };
+                if t < ctx.ws - WEEK || t >= ctx.we {
+                    break 'line;
+                }
+                let Some(ci) = ctx.camps.get(sstr(camp, fast)) else { break 'line };
+                let us = sstr(uid, fast);
+                let uh = us.hash();
+                prefetch(&tab.s[tab.home(uh)]);
+                batch[n] = PendCk { uid: us, uh, ts: (t - ctx.base) as u32, camp: ci, cid: Packed::new(cid) };
+                n += 1;
+            }
         }
-        batch.clear();
-    };
-    each_line::<4>(f, a, b, |[cid, uid, camp, ts], fast| {
-        // Clicks 1 + 3. Copies of a click are identical, so keeping all of them changes nothing (rule 2).
-        if cid.is_empty() || uid.is_empty() || camp.is_empty() {
+        if n == BATCH || done {
+            for p in &batch[..n] {
+                let pid = tab.get_or_insert(p.uid, p.uh);
+                s.cb[pid as usize & (NB - 1)].push(&mut s.arena, CRec { lp: pid >> 8, ts: p.ts, cid: p.cid, camp: p.camp });
+            }
+            n = 0;
+        }
+        if done {
             return;
         }
-        let Some(t) = parse_ts_near(ts, &ctx.dates) else { return };
-        if t < ctx.ws - WEEK || t >= ctx.we {
-            return;
-        }
-        let cs = if fast { unsafe { SStr::fast(camp) } } else { SStr::new(camp) };
-        let Some(ci) = ctx.camps.get(cs) else { return };
-        let us = if fast { unsafe { SStr::fast(uid) } } else { SStr::new(uid) };
-        let uh = us.hash();
-        prefetch(&tab.s[tab.home(uh)]);
-        batch.push(PendCk { uid: us, uh, ts: (t - ctx.base) as u32, camp: ci, cid: Packed::new(cid) });
-        if batch.len() == BATCH {
-            flush(&mut batch, s);
-        }
-    });
-    flush(&mut batch, s);
+    }
 }
 
 // ---------------------------------------------------------------- dedup

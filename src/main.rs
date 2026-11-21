@@ -437,7 +437,7 @@ fn for_lines(file: Bytes, start: usize, end: usize, mut f: impl FnMut(Bytes)) {
 
 
 
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -446,6 +446,18 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146097 + doe - 719468
 }
+
+/// Days since the epoch of the 1st of each month from January 1900 (index (y - 1900) * 12 + m - 1) to January 2156:
+/// a month's length is the gap to the next entry.
+static MONTH_START: [i32; 3073] = {
+    let mut t = [0i32; 3073];
+    let mut i = 0;
+    while i < t.len() {
+        t[i] = days_from_civil(1900 + (i / 12) as i64, (i % 12) as i64 + 1, 1) as i32;
+        i += 1;
+    }
+    t
+};
 
 /// `YYYY-MM-DDTHH:MM:SS` (the first 19 bytes) as epoch ms, calendar-checked.
 #[inline]
@@ -563,15 +575,24 @@ unsafe fn civil_at(p: *const u8) -> Option<i64> {
     let h = (pb >> 24) & 0xFF;
     let mi = (pb >> 48) & 0xFF;
     let sec = ((c >> 8) & 0xFF) * 10 + ((c >> 16) & 0xFF);
-    const DIM: [u64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     if (mo.wrapping_sub(1) > 11) | (dd == 0) | (h > 23) | (mi > 59) | (sec > 59) {
         return None;
     }
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    if dd > DIM[mo as usize] + ((mo == 2) & leap) as u64 {
-        return None;
-    }
-    let days = days_from_civil(y as i64, mo as i64, dd as i64);
+    let days = if (1900..2156).contains(&y) {
+        let i = (y as usize - 1900) * 12 + mo as usize - 1;
+        let (first, next) = (MONTH_START[i] as i64, MONTH_START[i + 1] as i64);
+        if dd as i64 > next - first {
+            return None;
+        }
+        first + dd as i64 - 1
+    } else {
+        const DIM: [u64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        if dd > DIM[mo as usize] + ((mo == 2) & leap) as u64 {
+            return None;
+        }
+        days_from_civil(y as i64, mo as i64, dd as i64)
+    };
     Some(days * DAY + (h * 3_600_000 + mi * 60_000 + sec * 1000) as i64)
 }
 
@@ -1413,6 +1434,20 @@ fn parse_event(ctx: &Ctx, [eid, uid, ts, ingest, etype, pid, price]: [Bytes; 7])
     Some(r)
 }
 
+/// `v.push(x)`, then a prefetch-for-write of where `v` writes a few pushes later. A parse thread appends to 512
+/// Vecs, too many streams for the hardware prefetcher: each new cache line would stall on its fetch otherwise.
+#[inline(always)]
+fn push_ahead<T>(v: &mut Vec<T>, x: T) {
+    v.push(x);
+    let next = (v.as_ptr() as *const u8).wrapping_add(v.len() * std::mem::size_of::<T>() + 256);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_ET0 }>(next as *const i8)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = next;
+}
+
 impl EvParse {
     /// A valid, non-late event: into its user_id bucket, plus its (hash(event_id), location) record.
     #[inline(always)]
@@ -1420,8 +1455,8 @@ impl EvParse {
         let u = uid_bucket(e.uh);
         let v = &mut self.ub[u];
         let loc = ((self.t as u64) << LOC_T) | ((u as u64) << LOC_B) | v.len() as u64;
-        v.push(e);
-        self.eb[(h >> 56) as usize % EB].push(ERec { h, loc });
+        push_ahead(v, e);
+        push_ahead(&mut self.eb[(h >> 56) as usize % EB], ERec { h, loc });
     }
 
     /// Any other parsed event: it still takes part in dedup.
@@ -1429,7 +1464,7 @@ impl EvParse {
     fn reject(&mut self, h: u64, eid: Packed, ingest: i64) {
         let loc = LOC_BAD | ((self.t as u64) << LOC_T) | self.bad.len() as u64;
         self.bad.push((eid, ingest));
-        self.eb[(h >> 56) as usize % EB].push(ERec { h, loc });
+        push_ahead(&mut self.eb[(h >> 56) as usize % EB], ERec { h, loc });
     }
 
     #[inline(always)]
@@ -2544,6 +2579,17 @@ mod tests {
             let mut buf = s.clone().into_bytes();
             buf.extend_from_slice(&[b'7'; 32]);
             assert_eq!(unsafe { ts_at(buf.as_ptr(), s.len()) }, parse_ts(s.as_bytes()), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn civil_at_matches_civil_across_years() {
+        let mut r = Rng(99);
+        for _ in 0..300_000 {
+            let s = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", 1890 + r.below(280), r.below(14), r.below(33), r.below(25), r.below(61), r.below(61));
+            let mut buf = s.clone().into_bytes();
+            buf.extend_from_slice(&[b'7'; 32]);
+            assert_eq!(unsafe { civil_at(buf.as_ptr()) }, civil(s.as_bytes()), "{s}");
         }
     }
 

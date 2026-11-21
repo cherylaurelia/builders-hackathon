@@ -3,12 +3,15 @@
 //! One shuffle by person: every ID is resolved to its person while its line is parsed.
 //!   0. links  -> lock-free table of every linked ID (parallel insert + union-find); person = root slot index,
 //!                name = byte-wise smallest member. IDs first seen in events/clicks become their own person.
-//!   1. events -> parse in parallel; a valid event gets its person from the table at once and goes, 40 bytes,
+//!   1. events -> parse in parallel; a valid event gets its person from the table at once and goes, 32 bytes,
 //!                to its event_id bucket (invalid ones too: they still win dedup). Clicks go, 24 bytes, straight
 //!                to their person bucket.
-//!   2. per event_id bucket: dedup (smallest ingest_ts wins, exact on the ID) -> 16 byte records to person buckets
+//!   2. per event_id bucket: dedup (smallest ingest_ts wins) -> 16 byte records to person buckets
 //!   3. per person bucket: counting sort by person, sort by ts, sessionize, credit, assist, aggregate
 //!   4. write Parquet
+//!
+//! IDs are identified by a 96 bit fingerprint in the person table and 89 bits in event_id dedup; both are
+//! exact in practice (collision probability ~1e-14 or less per run).
 
 use memmap2::Mmap;
 use std::collections::HashMap;

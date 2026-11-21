@@ -384,6 +384,109 @@ fn release_regions(threads: usize) {
     });
 }
 
+/// The heap: a block of `BIG` bytes or more (a thread's rows, a Parquet file being built, a duplicate finder's
+/// table) is a mapping of its own, 2 MiB aligned, with huge pages asked for; smaller blocks are malloc's.
+/// malloc backs a block that size with 4 KiB pages: a page fault each on the way in, and at the exit, which frees
+/// them on one thread before the run is over, a quarter of a microsecond each on the way out (20M events: 33,000
+/// pages, 8 ms between the last file and the end of the process on a 2-core Xeon).
+struct BigBlocks;
+
+#[global_allocator]
+static HEAP: BigBlocks = BigBlocks;
+
+const BIG: usize = 1 << 20;
+const HUGE_PAGE: usize = 2 << 20;
+
+/// `len` zeroed bytes (a multiple of HUGE_PAGE) at a HUGE_PAGE-aligned address; null when the kernel has none.
+unsafe fn big_map(len: usize) -> *mut u8 {
+    // HUGE_PAGE more than asked for holds an aligned stretch of `len`; what is before and after it goes back
+    // (a refusal there only leaves address space unused)
+    let p = libc::mmap(std::ptr::null_mut(), len + HUGE_PAGE, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
+    if p == libc::MAP_FAILED {
+        return std::ptr::null_mut();
+    }
+    let p = p as usize;
+    let a = p.next_multiple_of(HUGE_PAGE);
+    if a > p {
+        libc::munmap(p as *mut libc::c_void, a - p);
+    }
+    libc::munmap((a + len) as *mut libc::c_void, p + HUGE_PAGE - a);
+    #[cfg(target_os = "linux")]
+    libc::madvise(a as *mut libc::c_void, len, libc::MADV_HUGEPAGE); // a hint: fine if refused
+    a as *mut u8
+}
+
+/// True for a block that is a mapping of its own.
+#[inline(always)]
+fn is_big(size: usize, align: usize) -> bool {
+    size >= BIG && align <= HUGE_PAGE
+}
+
+// SAFETY: every block comes from malloc or from a mapping of its own, and which of the two follows from its size
+// and alignment alone, which the caller passes back unchanged
+unsafe impl std::alloc::GlobalAlloc for BigBlocks {
+    #[inline]
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        if !is_big(l.size(), l.align()) {
+            return std::alloc::System.alloc(l);
+        }
+        big_map(l.size().next_multiple_of(HUGE_PAGE))
+    }
+
+    #[inline]
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        if !is_big(l.size(), l.align()) {
+            return std::alloc::System.alloc_zeroed(l);
+        }
+        big_map(l.size().next_multiple_of(HUGE_PAGE)) // a new mapping reads as zeros
+    }
+
+    #[inline]
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        if !is_big(l.size(), l.align()) {
+            return std::alloc::System.dealloc(p, l);
+        }
+        // a refusal leaves the block mapped until the exit
+        libc::munmap(p as *mut libc::c_void, l.size().next_multiple_of(HUGE_PAGE));
+    }
+
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new: usize) -> *mut u8 {
+        let (was, will) = (is_big(l.size(), l.align()), is_big(new, l.align()));
+        if !was && !will {
+            return std::alloc::System.realloc(p, l, new);
+        }
+        if was && will {
+            let (old_len, new_len) = (l.size().next_multiple_of(HUGE_PAGE), new.next_multiple_of(HUGE_PAGE));
+            if new_len <= old_len {
+                if new_len < old_len {
+                    libc::munmap(p.add(new_len) as *mut libc::c_void, old_len - new_len);
+                }
+                return p;
+            }
+            // a growing block (a Vec doubling) moves into a larger mapping huge page by huge page: no byte is copied
+            // and no page it already has is faulted in again
+            #[cfg(target_os = "linux")]
+            {
+                let q = big_map(new_len);
+                if q.is_null() {
+                    return q;
+                }
+                let r = libc::mremap(p as *mut libc::c_void, old_len, new_len, libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED, q as *mut libc::c_void);
+                if r != libc::MAP_FAILED {
+                    return r as *mut u8;
+                }
+                libc::munmap(q as *mut libc::c_void, new_len); // refused: the block is copied instead
+            }
+        }
+        let q = self.alloc(std::alloc::Layout::from_size_align_unchecked(new, l.align()));
+        if !q.is_null() {
+            std::ptr::copy_nonoverlapping(p, q, l.size().min(new));
+            self.dealloc(p, l);
+        }
+        q
+    }
+}
+
 /// Set at the start when the kernel never gives huge pages (transparent huge pages switched off).
 static SMALL_PAGES: AtomicBool = AtomicBool::new(false);
 
@@ -827,18 +930,20 @@ impl IdTable {
     }
 
     /// Joins the trees of `a` and `b`: the root with the larger name goes under the other, so every step up is to
-    /// a smaller name, no cycle can form, and the root of a tree is its smallest name.
-    fn union(&self, names: &Interner, mut a: u32, mut b: u32) {
+    /// a smaller name, no cycle can form, and the root of a tree is its smallest name. Returns the slot that went
+    /// under another one (None when the two were joined already): a slot does so once and never is a root again,
+    /// so over all calls these are exactly the slots that are not roots.
+    fn union(&self, names: &Interner, mut a: u32, mut b: u32) -> Option<u32> {
         loop {
             a = self.find(a);
             b = self.find(b);
             if a == b {
-                return;
+                return None;
             }
             let (ka, kb) = (self.slots[a as usize].key.load(Relaxed), self.slots[b as usize].key.load(Relaxed));
             let (hi, lo) = if names.less(kb, ka) { (a, b) } else { (b, a) };
             if self.slots[hi as usize].up.compare_exchange(0, lo + 1, Relaxed, Relaxed).is_ok() {
-                return;
+                return Some(hi);
             }
         }
     }
@@ -2601,8 +2706,8 @@ fn build_links(ids: &IdTable, names: &Interner, files: &[InFile], threads: usize
     let parts = par(
         threads,
         work.len(),
-        || (Vec::<u8>::new(), 0usize, 0usize),
-        |(buf, lines, ins), i| {
+        || (Vec::<u8>::new(), 0usize, 0usize, Vec::<u32>::new()),
+        |(buf, lines, ins, under), i| {
             let (_, fi, s, e) = work[i];
             let (len, start, end) = read_span(&files[fi], s, e, buf);
             // SAFETY: the fields live in `buf`, which outlives this call; nothing keeps them
@@ -2615,7 +2720,7 @@ fn build_links(ids: &IdTable, names: &Interner, files: &[InFile], threads: usize
                 if n >= 2 * HALF {
                     let (x, y) = ends[i];
                     if x != y {
-                        ids.union(names, x, y);
+                        under.extend(ids.union(names, x, y));
                     }
                 }
                 if n >= HALF {
@@ -2652,31 +2757,36 @@ fn build_links(ids: &IdTable, names: &Interner, files: &[InFile], threads: usize
             }
         },
     );
-    // B. flatten, one pass over the table: every linked ID points straight at its root
-    const SPAN: usize = 1 << 15;
-    const AHEAD: usize = 24;
-    let n = ids.slots.len();
-    par(
-        threads,
-        n.div_ceil(SPAN),
-        || (),
-        |_, t| {
-            for i in t * SPAN..((t + 1) * SPAN).min(n) {
-                if i + AHEAD < n {
-                    let u = ids.slots[i + AHEAD].up.load(Relaxed);
-                    if u != 0 {
-                        prefetch(&ids.slots[u as usize - 1]);
+    // B. flatten: every linked ID points straight at its root. The IDs under another one are those the unions put
+    //    there (`under`, each once), so only they are visited and not the whole table (16 bytes a slot, most of
+    //    them empty or a root); an ID's slot is asked for 2 * AHEAD before its turn, what it hangs under AHEAD before
+    const PIECE: usize = 4096;
+    const AHEAD: usize = 12;
+    let pieces: Vec<&[u32]> = parts.iter().flat_map(|p| p.3.chunks(PIECE)).collect();
+    if !pieces.is_empty() {
+        par(
+            threads,
+            pieces.len(),
+            || (),
+            |_, t| {
+                let l = pieces[t];
+                for (i, &x) in l.iter().enumerate() {
+                    if let Some(&y) = l.get(i + 2 * AHEAD) {
+                        prefetch(&ids.slots[y as usize]);
                     }
+                    if let Some(&y) = l.get(i + AHEAD) {
+                        let u = ids.slots[y as usize].up.load(Relaxed);
+                        if u != 0 {
+                            prefetch(&ids.slots[u as usize - 1]);
+                        }
+                    }
+                    let root = ids.find(x);
+                    ids.slots[x as usize].up.store(root + 1, Relaxed);
+                    ids.slots[x as usize].px.store(x ^ root, Relaxed);
                 }
-                if ids.slots[i].up.load(Relaxed) != 0 {
-                    // i hangs under something, so its root is another slot
-                    let root = ids.find(i as u32);
-                    ids.slots[i].up.store(root + 1, Relaxed);
-                    ids.slots[i].px.store(i as u32 ^ root, Relaxed);
-                }
-            }
-        },
-    );
+            },
+        );
+    }
     parts.iter().map(|p| p.1).sum()
 }
 
@@ -4680,7 +4790,7 @@ mod tests {
         let ids: Vec<u32> = [&b"u5"[..], b"u3", b"u9", b"U7", b"u1", b"zz", b"a-long-user-id"].iter().map(|b| c.ids.slot(c.names.key(b), &mut ins)).collect();
         for (a, b) in [(0, 1), (2, 1), (3, 2), (5, 6), (4, 4)] {
             if a != b {
-                c.ids.union(&c.names, ids[a], ids[b]);
+                let _ = c.ids.union(&c.names, ids[a], ids[b]);
             }
         }
         let root = |i: usize| c.ids.find(ids[i]);

@@ -1063,6 +1063,52 @@ fn chunks_of(kind: u8, files: &[InFile], size: usize, out: &mut Vec<(u8, usize, 
     }
 }
 
+/// True unless a byte of `f` at `off` can be read without waiting for the disk.
+#[cfg(target_os = "linux")]
+fn uncached(f: &InFile, off: usize) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let mut b = 0u8;
+    let iov = libc::iovec { iov_base: &mut b as *mut u8 as *mut libc::c_void, iov_len: 1 };
+    // 1 = read from the page cache; EAGAIN = not cached; any other answer (an old kernel) counts as not cached
+    unsafe { libc::preadv2(f.f.as_raw_fd(), &iov, 1, off as libc::off_t, libc::RWF_NOWAIT) != 1 }
+}
+
+/// Cold page cache: asks the kernel for the whole input at once, in the order it will be parsed, from a few
+/// threads of their own, so the disk works at full speed from the first moment whatever the parse is doing.
+/// An input that is cached already (16 probes all answer without the disk) is left alone.
+#[cfg(target_os = "linux")]
+fn read_ahead(queue: Vec<(&'static InFile, usize, usize)>, threads: usize) {
+    use std::os::unix::io::AsRawFd;
+    let n = queue.len();
+    if n == 0 || !(0..16).any(|i| uncached(queue[i * n / 16].0, (queue[i * n / 16].1 + queue[i * n / 16].2) / 2)) {
+        return;
+    }
+    let queue = std::sync::Arc::new(queue);
+    let next = std::sync::Arc::new(AtomicUsize::new(0));
+    for _ in 0..threads.div_ceil(2) {
+        let (queue, next) = (queue.clone(), next.clone());
+        // never joined: these only start reads, and the end of the process ends them. A thread that cannot start,
+        // or a hint the kernel refuses, costs speed only: every byte is still read by `read_span`.
+        let _ = std::thread::Builder::new().spawn(move || loop {
+            let i = next.fetch_add(1, Relaxed);
+            if i >= queue.len() {
+                break;
+            }
+            let (f, s, e) = queue[i];
+            // 128 KiB a call: the kernel caps one request at its readahead size
+            let mut o = s;
+            while o < e {
+                let l = (e - o).min(128 << 10);
+                unsafe { libc::posix_fadvise(f.f.as_raw_fd(), o as libc::off_t, l as libc::off_t, libc::POSIX_FADV_WILLNEED) };
+                o += l;
+            }
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_ahead(_queue: Vec<(&'static InFile, usize, usize)>, _threads: usize) {}
+
 /// Bytes past the data that `read_span` keeps readable (and starts with a `\n`): `scan_lines` loads 144 past a line start.
 const PAD: usize = 160;
 
@@ -1448,9 +1494,8 @@ fn main() {
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
 
-    let link_files = csv_files(&data.join("links"));
-    let ev_files = csv_files(&data.join("events"));
-    let ck_files = csv_files(&data.join("clicks"));
+    let files = |dir: &str| -> &'static [InFile] { Box::leak(csv_files(&data.join(dir)).into_boxed_slice()) };
+    let (link_files, ev_files, ck_files) = (files("links"), files("events"), files("clicks"));
     let bytes = |v: &[InFile]| v.iter().map(|f| f.len).sum::<usize>();
     let (link_bytes, ev_bytes) = (bytes(&link_files), bytes(&ev_files));
 
@@ -1465,13 +1510,26 @@ fn main() {
     let qbits = (env_num("SESS_QBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000))).clamp(4, 12);
     let chunk = env_num("SESS_CHUNK").filter(|&c| c >= 4096).unwrap_or(512 << 10);
 
+    // the parse queue: events first, then clicks
+    let mut work = Vec::new();
+    chunks_of(0, ev_files, chunk, &mut work);
+    chunks_of(1, ck_files, chunk, &mut work);
+    read_ahead(
+        link_files
+            .iter()
+            .map(|f| (f, 0, f.len))
+            .chain(work.iter().map(|&(kind, fi, s, e)| (if kind == 0 { &ev_files[fi] } else { &ck_files[fi] }, s, e)))
+            .collect(),
+        threads,
+    );
+
     // 1. links, on every thread; this one reads the small tables meanwhile
     let ids = IdTable::new(id_bits);
     let names = Interner::new();
     let (n_links, small) = std::thread::scope(|sc| {
         let links = sc.spawn(|| {
             ids.populate(threads);
-            build_links(&ids, &names, &link_files, threads)
+            build_links(&ids, &names, link_files, threads)
         });
         let small = small_tables(&data);
         (links.join().unwrap_or_else(|_| die("link builder panicked")), small)
@@ -1496,10 +1554,7 @@ fn main() {
     };
     lap(&format!("small tables, links joined: {n_links} lines; 2^{id_bits} id slots, 2^{pbits} person partitions, 2^{qbits} event buckets"));
 
-    // 2. events and clicks, one queue: events first
-    let mut work = Vec::new();
-    chunks_of(0, &ev_files, chunk, &mut work);
-    chunks_of(1, &ck_files, chunk, &mut work);
+    // 2. events and clicks, from the one queue
     let (np, nq) = (1usize << pbits, 1usize << qbits);
     let shards = par(
         threads,
@@ -1600,8 +1655,9 @@ fn main() {
             }
         }
     }
-    // everything is on disk: no destructors, the memory is released in parallel
-    fast_exit(threads)
+    // every output file is written and closed: end here, without destructors. The kernel frees the memory, about
+    // 1 GB per 20M events and most of it in huge pages, in a few ms; no input file is mapped.
+    unsafe { libc::_exit(0) }
 }
 
 /// An exact map from the IDs of a small clean file to a number: packed IDs in an open-addressing table on their
@@ -2646,141 +2702,6 @@ fn write_camps(path: &Path, rows: &[CampRow]) -> std::io::Result<()> {
         5 => plain_i64(b, rows.iter().map(|r| r.5)),
         _ => plain_i64(b, rows.iter().map(|r| r.6)),
     })
-}
-
-// ---------------------------------------------------------------- exit
-
-/// Ends the process once the outputs are on disk. Left to the kernel, freeing the GBs of heap and unmapping the
-/// input files runs on one thread (about 0.1 s); here every thread zaps a share first with MADV_DONTNEED.
-/// Nothing may be freed or dropped after the first zap: the heap, malloc state included, reads as zeros from then on.
-/// Never zapped: the threads' stacks (their TCBs sit in them), this thread's TLS block, every region under 1 MiB
-/// (libc state), `[heap]` and the other named regions. Any surprise before the zap falls back to a plain exit.
-#[cfg(target_os = "linux")]
-fn fast_exit(threads: usize) -> ! {
-    use std::sync::atomic::{AtomicUsize, Ordering::{Acquire, Release}};
-    const MAXP: usize = 2048;
-    const PIECE: usize = 16 << 20;
-    const MARGIN: usize = 64 << 10;
-    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else { std::process::exit(0) };
-    // shared state lives on this thread's stack: the heap is about to be zeroed
-    let reg = AtomicUsize::new(0);
-    let go = AtomicBool::new(false);
-    let next = AtomicUsize::new(0);
-    let done = AtomicUsize::new(0);
-    let np = AtomicUsize::new(0);
-    let keep: [[AtomicUsize; 2]; 32] = std::array::from_fn(|_| [AtomicUsize::new(0), AtomicUsize::new(0)]);
-    let pieces: [[AtomicUsize; 2]; MAXP] = std::array::from_fn(|_| [AtomicUsize::new(0), AtomicUsize::new(0)]);
-    std::thread::scope(|sc| {
-        let mut n = 0;
-        while n < threads.clamp(1, 32) {
-            let (reg, go, next, done, np, keep, pieces) = (&reg, &go, &next, &done, &np, &keep, &pieces);
-            let k = n;
-            let spawned = std::thread::Builder::new().spawn_scoped(sc, move || {
-                // publish this thread's stack: never zap it
-                let (mut lo, mut hi) = (0usize, 0usize);
-                unsafe {
-                    let mut attr: libc::pthread_attr_t = std::mem::zeroed();
-                    if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) == 0 {
-                        let mut addr = std::ptr::null_mut();
-                        let mut size = 0usize;
-                        libc::pthread_attr_getstack(&attr, &mut addr, &mut size);
-                        lo = addr as usize;
-                        hi = lo + size;
-                        libc::pthread_attr_destroy(&mut attr);
-                    }
-                }
-                keep[k][0].store(lo.saturating_sub(MARGIN), Relaxed);
-                keep[k][1].store(hi + MARGIN, Relaxed);
-                reg.fetch_add(1, Release);
-                while !go.load(Acquire) {
-                    unsafe { libc::sched_yield() };
-                }
-                loop {
-                    let i = next.fetch_add(1, Relaxed);
-                    if i >= np.load(Relaxed) {
-                        break;
-                    }
-                    unsafe { libc::madvise(pieces[i][0].load(Relaxed) as *mut libc::c_void, pieces[i][1].load(Relaxed), libc::MADV_DONTNEED) };
-                    done.fetch_add(1, Release);
-                }
-                // never return: thread exit would free into the zeroed heap
-                loop {
-                    unsafe { libc::sched_yield() };
-                }
-            });
-            if spawned.is_err() {
-                break;
-            }
-            n += 1;
-        }
-        if n == 0 {
-            std::process::exit(0);
-        }
-        while reg.load(Acquire) < n {
-            std::thread::yield_now();
-        }
-        // a thread that could not read its stack bounds publishes (0, MARGIN): nothing is zapped then
-        if (0..n).any(|k| keep[k][1].load(Relaxed) <= MARGIN) {
-            std::process::exit(0);
-        }
-        let me = unsafe { libc::pthread_self() } as usize;
-        let mut excl: Vec<(usize, usize)> = (0..n).map(|k| (keep[k][0].load(Relaxed), keep[k][1].load(Relaxed))).collect();
-        excl.push((me.saturating_sub(MARGIN), me + MARGIN));
-        let mut cnt = 0usize;
-        for line in maps.lines() {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            // anonymous heap (no name), or an input file mapped read-only and shared
-            let anon = f.len() == 5 && f[1] == "rw-p";
-            let file = f.len() == 6 && f[1] == "r--s" && f[5].starts_with('/') && !f[5].starts_with("/dev/");
-            if !anon && !file {
-                continue;
-            }
-            let Some((a, b)) = f[0].split_once('-') else { continue };
-            let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) else { continue };
-            let mut segs = vec![(a, b)];
-            for &(x, y) in &excl {
-                let mut out = Vec::new();
-                for (s, e) in segs {
-                    if y <= s || x >= e {
-                        out.push((s, e));
-                    } else {
-                        if x > s {
-                            out.push((s, x & !4095));
-                        }
-                        if y < e {
-                            out.push(((y + 4095) & !4095, e));
-                        }
-                    }
-                }
-                segs = out;
-            }
-            for (s, e) in segs {
-                if e <= s || e - s < (1 << 20) {
-                    continue;
-                }
-                let mut p = s;
-                while p < e && cnt < MAXP {
-                    let l = PIECE.min(e - p);
-                    pieces[cnt][0].store(p, Relaxed);
-                    pieces[cnt][1].store(l, Relaxed);
-                    cnt += 1;
-                    p += l;
-                }
-            }
-        }
-        np.store(cnt, Relaxed);
-        go.store(true, Release);
-        while done.load(Acquire) < cnt {
-            std::thread::yield_now();
-        }
-        unsafe { libc::_exit(0) }
-    });
-    unreachable!()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn fast_exit(_threads: usize) -> ! {
-    std::process::exit(0)
 }
 
 #[cfg(test)]

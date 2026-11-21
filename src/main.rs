@@ -407,6 +407,60 @@ fn populate(p: usize, bytes: usize) -> bool {
     }
 }
 
+/// The address range every arena chunk comes from, reserved once and handed out a chunk at a time. Its size keeps
+/// a record's address within 32 bits (`loc_of`): 2^32 - 3 steps of 4 bytes.
+const ARENA_SPAN: usize = 1 << 34;
+static ARENA_BASE: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new(); // (address, bytes)
+static ARENA_USED: AtomicUsize = AtomicUsize::new(0);
+
+/// The start of the arena range (2 MiB aligned) and its size: reserved on the first call, no memory behind it yet.
+fn arena_range() -> (usize, usize) {
+    *ARENA_BASE.get_or_init(|| {
+        const ALIGN: usize = 2 << 20;
+        // a smaller range where the full one is refused: enough for 100M events at 4 GiB
+        for span in [ARENA_SPAN, ARENA_SPAN / 2, ARENA_SPAN / 4] {
+            let p = unsafe {
+                libc::mmap(std::ptr::null_mut(), span + ALIGN, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0)
+            };
+            if p != libc::MAP_FAILED {
+                return ((p as usize + ALIGN - 1) & !(ALIGN - 1), span);
+            }
+        }
+        die(&format!("reserving the record address range: {}", std::io::Error::last_os_error()))
+    })
+}
+
+/// `bytes` (a multiple of 2 MiB) of zeroed memory from the arena range, never unmapped; huge pages where offered.
+fn arena_chunk(bytes: usize) -> *mut u8 {
+    let (base, span) = arena_range();
+    let off = ARENA_USED.fetch_add(bytes, Relaxed);
+    if off + bytes > span {
+        die("the records need more memory than the arena range holds");
+    }
+    let p = (base + off) as *mut libc::c_void;
+    if unsafe { libc::mprotect(p, bytes, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
+        die(&format!("arena chunk of {bytes} bytes: {}", std::io::Error::last_os_error()));
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::madvise(p, bytes, libc::MADV_HUGEPAGE); // a hint: fine if refused
+    }
+    REGIONS.lock().unwrap_or_else(|_| die("region list poisoned")).push((p as usize, bytes));
+    p as *mut u8
+}
+
+/// The address of an `ERec` in an arena as a number from 1 (0 = no record); `abase` = `arena_range().0`.
+#[inline(always)]
+fn loc_of(abase: usize, rec: *mut ERec) -> u32 {
+    ((rec as usize - abase) >> 2) as u32 + 1
+}
+
+/// The `ERec` of a `loc_of` number. For 0 the address is not a record: fine for a prefetch, never to be read.
+#[inline(always)]
+fn rec_at(abase: usize, loc: u32) -> *mut ERec {
+    abase.wrapping_add((loc as usize) << 2).wrapping_sub(4) as *mut ERec
+}
+
 /// A thread's bump allocator for stream blocks.
 struct Arena {
     cur: usize,
@@ -415,7 +469,8 @@ struct Arena {
 }
 
 impl Arena {
-    const CHUNK: usize = 32 << 20;
+    // the unit tests make hundreds of arenas, each with its own chunk of the arena range: small ones there
+    const CHUNK: usize = if cfg!(test) { 2 << 20 } else { 32 << 20 };
     const STEP: usize = 2 << 20;
 
     fn new() -> Arena {
@@ -426,8 +481,8 @@ impl Arena {
     fn alloc(&mut self, bytes: usize) -> *mut u8 {
         debug_assert!(bytes % 64 == 0); // blocks stay 64-byte aligned (see `Stream`)
         if self.cur + bytes > self.end {
-            let n = bytes.max(Self::CHUNK);
-            self.cur = map_anon(n) as usize;
+            let n = bytes.max(Self::CHUNK).next_multiple_of(Self::STEP);
+            self.cur = arena_chunk(n) as usize;
             self.end = self.cur + n;
             self.ready = self.cur;
         }
@@ -442,7 +497,7 @@ impl Arena {
     }
 }
 
-/// Bytes a stream writes at a time: three cache lines, a whole number of records of every size here (12, 24).
+/// Bytes a stream writes at a time: three cache lines, a whole number of records of every size here (12, 16).
 const GROUP: usize = 192;
 
 /// An append-only list of `T` in blocks of `per` records; a record never moves.
@@ -1860,15 +1915,25 @@ struct ERec {
 }
 const DROPPED: u32 = u32::MAX;
 
-/// One parsed event line in its event-key bucket: `loc` is the address of its `ERec`, 0 for an invalid or late event
-/// (it still takes part in dedup).
+/// One parsed event line in its event-key bucket, 16 bytes: `loc` is its `ERec` (`loc_of`), 0 for an invalid or
+/// late event (it still takes part in dedup); `ing` is its ingest_ts (`Ctx::ing`).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct LRec {
     key: u64,
-    ingest: i64,
-    loc: u64,
+    ing: u32,
+    loc: u32,
 }
+
+/// `LRec::ing` of an ingest_ts above `Ctx::ihi`: such an event is late or invalid whatever its ts (a valid ts is
+/// below the window end, more than a day before it), so among the copies of an event it only has to rank after
+/// every copy that is not.
+const ING_LATE: u32 = u32::MAX;
+/// `LRec::ing` of an ingest_ts that 32 bits cannot hold (more than 49 days before `Ctx::ihi`): the exact value is
+/// in `Shard::far`.
+const ING_FAR: u32 = 0;
+/// Milliseconds from `Ctx::ilo` through `Ctx::ihi`: `ing` = ms above `ilo` + 1, in 1..ING_LATE.
+const ING_SPAN: i64 = (u32::MAX - 2) as i64;
 
 /// A valid click in its person partition.
 #[repr(C)]
@@ -1898,7 +1963,7 @@ impl CRec {
 }
 
 const EV_BLOCK: usize = 512;
-const LG_BLOCK: usize = 256;
+const LG_BLOCK: usize = 384; // records: a whole number of 192-byte groups of 16-byte LRecs (6144 bytes, as before)
 const CK_BLOCK: usize = 192; // records: a whole number of 192-byte groups of 16-byte CRecs (3072 bytes, as before)
 
 /// A valid event or click whose user ID is on its way from memory (`IdTable::aim`).
@@ -1921,6 +1986,7 @@ struct Shard {
     ev: Vec<Stream<ERec>>,
     ck: Vec<Stream<CRec>>,
     lg: Vec<Stream<LRec>>,
+    far: Vec<(u64, u32, i64)>, // (event key, loc, ingest_ts) of the records whose `ing` is ING_FAR
     buf: Vec<u8>,
     ins: usize,
     ring: [Pend; RING],
@@ -1957,6 +2023,37 @@ struct Ctx {
     names: Interner,
     pshift: u32, // person >> pshift = person partition
     qshift: u32, // spread(event key) >> qshift = event-key bucket
+    abase: usize, // `arena_range().0`: where `LRec::loc` counts from
+    ihi: i64,     // window end + 24 h: an event ingested later is late or invalid
+    ilo: i64,     // ihi - (ING_SPAN - 1) ms: the earliest ingest_ts an `LRec` holds itself
+}
+
+impl Ctx {
+    /// (abase, ihi, ilo) for a window that ends at `we`.
+    fn record_fields(we: i64) -> (usize, i64, i64) {
+        (arena_range().0, we + DAY, we + DAY - (ING_SPAN - 1))
+    }
+
+    /// The ingest_ts of a dedup record, exact except above `ihi` (see ING_LATE); `far` = every shard's far list as
+    /// a map (`far_map`).
+    #[inline(always)]
+    fn ingest_of(&self, r: &LRec, far: &HashMap<(u64, u32), i64>) -> i64 {
+        match r.ing {
+            ING_FAR => far[&(r.key, r.loc)],
+            ING_LATE => i64::MAX,
+            v => self.ilo + (v as i64 - 1),
+        }
+    }
+}
+
+/// The far ingest_ts of every shard by (event key, loc). The records of one key without an `ERec` (loc 0) share an
+/// entry, the earliest of them: none of them can be dropped, and for the others of the key only the earliest counts.
+fn far_map(shards: &[Shard]) -> HashMap<(u64, u32), i64> {
+    let mut m = HashMap::new();
+    for &(key, loc, ingest) in shards.iter().flat_map(|s| s.far.iter()) {
+        m.entry((key, loc)).and_modify(|v: &mut i64| *v = (*v).min(ingest)).or_insert(ingest);
+    }
+    m
 }
 
 impl Shard {
@@ -1966,6 +2063,7 @@ impl Shard {
             ev: (0..parts).map(|_| Stream::new()).collect(),
             ck: (0..parts).map(|_| Stream::new()).collect(),
             lg: (0..buckets).map(|_| Stream::new()).collect(),
+            far: Vec::new(),
             buf: Vec::new(),
             ins: 0,
             ring: [Pend::default(); RING],
@@ -2016,10 +2114,22 @@ impl Shard {
 
     /// Any parsed event: its dedup record. `loc` = 0 for an invalid or late one.
     #[inline(always)]
-    fn log(&mut self, cx: &Ctx, ekey: u64, ingest: i64, loc: u64) {
+    fn log(&mut self, cx: &Ctx, ekey: u64, ingest: i64, loc: u32) {
         let q = (spread(ekey) >> cx.qshift) as usize;
+        let ing = if ingest > cx.ihi {
+            ING_LATE
+        } else {
+            // ms above ilo (a negative difference is a huge unsigned one)
+            let d = ingest.wrapping_sub(cx.ilo) as u64;
+            if d < ING_SPAN as u64 {
+                d as u32 + 1
+            } else {
+                self.far.push((ekey, loc, ingest));
+                ING_FAR
+            }
+        };
         // SAFETY: q < 2^qbits, the number of streams (`Shard::new`)
-        unsafe { self.lg.get_unchecked_mut(q) }.push(&mut self.arena, LG_BLOCK, LRec { key: ekey, ingest, loc });
+        unsafe { self.lg.get_unchecked_mut(q) }.push(&mut self.arena, LG_BLOCK, LRec { key: ekey, ing, loc });
     }
 
     /// A valid, non-late event: into its person's partition, plus its dedup record, once its user ID is at hand.
@@ -2036,7 +2146,7 @@ impl Shard {
     fn put_event(&mut self, cx: &Ctx, p: Pend, person: u32) {
         // SAFETY: a person is a slot number, below 2^id_bits; shifted, below 2^pbits, the number of streams
         let rec = unsafe { self.ev.get_unchecked_mut((person >> cx.pshift) as usize) }.push(&mut self.arena, EV_BLOCK, ERec { person, ts: p.ts, pay: p.x });
-        self.log(cx, p.a, p.b, rec as u64);
+        self.log(cx, p.a, p.b, loc_of(cx.abase, rec));
     }
 
     /// A valid click, into its person's partition once its user ID is at hand.
@@ -2153,6 +2263,7 @@ fn main() {
     });
     let Small { products, campaigns, cat_names, cat_rank, unknown_cat, camp_ids, camp_channel } = small;
     let ncamp = camp_ids.len();
+    let (abase, ihi, ilo) = Ctx::record_fields(we);
     let cx = Ctx {
         ws,
         we,
@@ -2168,6 +2279,9 @@ fn main() {
         names,
         pshift: id_bits - pbits,
         qshift: 64 - qbits,
+        abase,
+        ihi,
+        ilo,
     };
     lap(&format!("small tables, links joined: {n_links} lines; 2^{id_bits} id slots, 2^{pbits} person partitions, 2^{qbits} event buckets"));
 
@@ -2207,7 +2321,7 @@ fn main() {
     }
 
     // 3. duplicates
-    let n_dups = mark_duplicates(&shards, nq, threads);
+    let n_dups = mark_duplicates(&cx, &shards, nq, threads);
     lap(&format!("duplicates marked: {n_dups} candidates"));
 
     // 4. per person partition, the largest first; each thread writes its rows when the queue is empty
@@ -2793,8 +2907,10 @@ const DUP_GRP: u32 = (127 << DUP_POS_T) + 1;
 /// into the next. A record whose tag is already there joins that tag's group (the slot then holds the group, and
 /// the group starts with the record it met), chained in `mem`. All copies of a key share its tag, so they all meet
 /// in one group; a few other keys do too and are told apart by key.
-fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
+fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -> usize {
     const POS_T: u32 = DUP_POS_T;
+    let far = far_map(shards); // empty unless an ingest_ts is far from the window
+    let (far, abase) = (&far, cx.abase);
     if shards.len() > 127 || shards.iter().any(|s| s.lg.iter().any(|l| l.len(LG_BLOCK) >> POS_T != 0)) {
         die("too many events for the duplicate finder");
     }
@@ -2876,8 +2992,8 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
             }
             // per group, the events it may mark asked for AHEAD groups before
             let ahead = |g: (u32, u32)| {
-                prefetch(mem[g.0 as usize].0.loc as *const ERec); // loc 0 is a harmless hint
-                prefetch(mem[g.0 as usize + 1].0.loc as *const ERec);
+                prefetch(rec_at(abase, mem[g.0 as usize].0.loc)); // loc 0 is a harmless hint
+                prefetch(rec_at(abase, mem[g.0 as usize + 1].0.loc));
             };
             groups.iter().take(AHEAD).for_each(|&g| ahead(g));
             for gi in 0..groups.len() {
@@ -2893,11 +3009,11 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
                 }
                 if grp.len() > 16 {
                     // a big group (one event_id with many copies, or many keys on one tag): sorted, not pairwise
-                    grp.sort_unstable_by_key(|r| (r.key, r.ingest));
+                    grp.sort_unstable_by_key(|r| (r.key, cx.ingest_of(r, far)));
                     for k in 1..grp.len() {
                         if grp[k].loc != 0 && grp[k - 1].key == grp[k].key {
                             // SAFETY: as below
-                            unsafe { (*(grp[k].loc as *mut ERec)).person = DROPPED };
+                            unsafe { (*rec_at(abase, grp[k].loc)).person = DROPPED };
                         }
                     }
                     continue;
@@ -2905,9 +3021,14 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
                 for (k, r) in grp.iter().enumerate() {
                     // dropped: a valid copy with an earlier copy of its key (smaller ingest_ts, or equal and before it:
                     // copies with equal ingest_ts are identical, so exactly one of them is kept)
-                    if r.loc != 0 && grp.iter().enumerate().any(|(x, o)| o.key == r.key && (o.ingest < r.ingest || (o.ingest == r.ingest && x < k))) {
+                    let ri = cx.ingest_of(r, far);
+                    let earlier = |(x, o): (usize, &LRec)| {
+                        let oi = cx.ingest_of(o, far);
+                        o.key == r.key && (oi < ri || (oi == ri && x < k))
+                    };
+                    if r.loc != 0 && grp.iter().enumerate().any(earlier) {
                         // SAFETY: the address of an ERec in a live arena; no other thread touches this record now
-                        unsafe { (*(r.loc as *mut ERec)).person = DROPPED };
+                        unsafe { (*rec_at(abase, r.loc)).person = DROPPED };
                     }
                 }
             }
@@ -4198,6 +4319,9 @@ mod tests {
             names: Interner::new(),
             pshift: 12,
             qshift: 60,
+            abase: Ctx::record_fields(0).0,
+            ihi: Ctx::record_fields(ws + 14 * DAY).1,
+            ilo: Ctx::record_fields(ws + 14 * DAY).2,
         }
     }
 
@@ -4207,7 +4331,10 @@ mod tests {
         st.ev.iter_mut().for_each(Stream::finish);
         st.lg.iter_mut().for_each(Stream::finish);
         let mut ev: Vec<_> = st.ev.iter().flat_map(|s| s.slices(EV_BLOCK)).flatten().map(|r| (r.person, r.ts, r.pay)).collect();
-        let mut lg: Vec<_> = st.lg.iter().flat_map(|s| s.slices(LG_BLOCK)).flatten().map(|r| (r.key, r.ingest, r.loc != 0)).collect();
+        // the ingest_ts as the record holds it; a far one as its exact value, from the shard's far list
+        let mut lg: Vec<_> = st.lg.iter().flat_map(|s| s.slices(LG_BLOCK)).flatten().filter(|r| r.ing != ING_FAR).map(|r| (r.key, r.ing as i64, r.loc != 0)).collect();
+        lg.extend(st.far.iter().map(|&(key, loc, ingest)| (key, ingest, loc != 0)));
+        assert_eq!(st.far.len(), st.lg.iter().flat_map(|s| s.slices(LG_BLOCK)).flatten().filter(|r| r.ing == ING_FAR).count());
         ev.sort();
         lg.sort();
         (ev, lg)
@@ -4382,7 +4509,7 @@ mod tests {
         let mut s12: Vec<Stream<ERec>> = (0..23).map(|_| Stream::new()).collect();
         let mut s24: Vec<Stream<LRec>> = (0..23).map(|_| Stream::new()).collect();
         let mut want12: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); 23];
-        let mut want24: Vec<Vec<(u64, i64, u64)>> = vec![Vec::new(); 23];
+        let mut want24: Vec<Vec<(u64, u32, u32)>> = vec![Vec::new(); 23];
         let mut at: Vec<(*mut ERec, u32)> = Vec::new();
         for i in 0..400_000u32 {
             let b = r.below(23);
@@ -4391,9 +4518,9 @@ mod tests {
                 at.push((s12[b].push(&mut arena, EV_BLOCK, rec), i));
                 want12[b].push((rec.person, rec.ts, rec.pay));
             } else {
-                let rec = LRec { key: r.next(), ingest: i as i64, loc: b as u64 };
+                let rec = LRec { key: r.next(), ing: i, loc: b as u32 };
                 s24[b].push(&mut arena, LG_BLOCK, rec);
-                want24[b].push((rec.key, rec.ingest, rec.loc));
+                want24[b].push((rec.key, rec.ing, rec.loc));
             }
         }
         sfence();
@@ -4403,7 +4530,7 @@ mod tests {
             let got: Vec<_> = s12[b].slices(EV_BLOCK).flatten().map(|r| (r.person, r.ts, r.pay)).collect();
             assert_eq!(got, want12[b]);
             assert_eq!(s12[b].len(EV_BLOCK), want12[b].len());
-            let got: Vec<_> = s24[b].slices(LG_BLOCK).flatten().map(|r| (r.key, r.ingest, r.loc)).collect();
+            let got: Vec<_> = s24[b].slices(LG_BLOCK).flatten().map(|r| (r.key, r.ing, r.loc)).collect();
             assert_eq!(got, want24[b]);
         }
         assert!(at.iter().all(|&(p, i)| unsafe { (*p).person } == i));

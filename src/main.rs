@@ -1425,6 +1425,7 @@ unsafe fn scan_lines<S>(
     len: usize,
     st: &mut S,
     fast: impl Fn(&mut S, *const u8, usize, u128, u128),
+    fast64: impl Fn(&mut S, *const u8, usize, u64, u64),
     slow: impl Fn(&mut S, Bytes),
 ) {
     let file = std::slice::from_raw_parts(buf, len);
@@ -1434,11 +1435,18 @@ unsafe fn scan_lines<S>(
     while p < end && p < len {
         let line = buf.add(p);
         let [c0, q0, n0] = masks64(line);
-        // nearly every line ends in its first 96 bytes: the last 32 of the 128 are looked at only when it does not
+        if n0 != 0 {
+            // the line ends in its first 64 bytes: one word of masks, the 64 bytes after it never read
+            let e = n0.trailing_zeros() as usize;
+            let lm = !n0 & n0.wrapping_sub(1); // the bits below the first newline
+            fast64(st, line, e, c0 & lm, q0 & lm);
+            p += e + 1;
+            continue;
+        }
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         let [c1, q1, n1] = {
             let [mut c1, mut q1, mut n1] = masks32(line.add(64));
-            if n0 | n1 == 0 {
+            if n1 == 0 {
                 let [c, q, n] = masks32(line.add(96));
                 (c1, q1, n1) = (c1 | c << 32, q1 | q << 32, n1 | n << 32);
             }
@@ -1446,7 +1454,7 @@ unsafe fn scan_lines<S>(
         };
         #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
         let [c1, q1, n1] = masks64(line.add(64));
-        let n = n0 as u128 | (n1 as u128) << 64;
+        let n = (n1 as u128) << 64; // n0 == 0 here (the line did not end in its first 64 bytes)
         if n != 0 {
             let e = n.trailing_zeros() as usize;
             let lm = !n & n.wrapping_sub(1); // the bits below the first newline
@@ -1518,6 +1526,48 @@ impl Fields {
     #[inline(always)]
     fn at(&self, i: usize) -> (usize, usize) {
         (((self.s >> (8 * i)) & 0xFF) as usize, ((self.l >> (8 * i)) & 0xFF) as usize)
+    }
+}
+
+/// `fast_fields` for a line that ends in its first 64 bytes: one word of masks.
+#[inline(always)]
+unsafe fn fast_fields64<const N: usize>(line: *const u8, e: usize, c: u64, q: u64) -> Option<Fields> {
+    const { assert!(N >= 2 && N <= 8) };
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2", target_feature = "popcnt"))]
+    {
+        use std::arch::x86_64::{_pdep_u64, _pext_u64};
+        let _ = line;
+        if c.count_ones() as usize != N - 1 {
+            return None;
+        }
+        let b = c | (1u64 << e); // the N boundaries
+        let s = (c << 1) | 1; // the N field starts
+        let z = b >> 1; // the byte before each boundary
+        let y = q << 1; // the byte after each quote
+        let qs = _pext_u64(q, s);
+        let qe = _pext_u64(y, b);
+        if (q & !(s | z)) | (q & s & z) | (qs ^ qe) != 0 {
+            return None;
+        }
+        // byte i of k = where field i ends: the commas in order, then the line's end
+        let (mut w, mut k) = (c, (e as u64) << (8 * (N - 1)));
+        for i in 0..N - 1 {
+            k |= (w.trailing_zeros() as u64) << (8 * i);
+            w &= w.wrapping_sub(1);
+        }
+        let quoted = _pdep_u64(qs, 0x0101_0101_0101_0101);
+        let s = (k << 8).wrapping_add(0x0101_0101_0101_0100).wrapping_add(quoted);
+        return Some(Fields { s, l: k.wrapping_sub(s).wrapping_sub(quoted) });
+    }
+    #[allow(unreachable_code)]
+    {
+        let f = fast_split::<N>(line, e, c as u128, q as u128)?;
+        let (mut s, mut l) = (0u64, 0u64);
+        for i in 0..N {
+            s |= (f[i].0 as u64) << (8 * i);
+            l |= (f[i].1 as u64) << (8 * i);
+        }
+        Some(Fields { s, l })
     }
 }
 
@@ -2371,6 +2421,7 @@ unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
         len,
         st,
         |st, line, e, c, q| fast_event(cx, line, e, c, q, st),
+        |st, line, e, c, q| fast_event(cx, line, e, c as u128, q as u128, st),
         |st, l| {
             if let Some(f) = split::<7>(l) {
                 event_fields(cx, f, st);
@@ -2410,6 +2461,23 @@ unsafe fn fast_click(cx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, st: 
     st.click(cx, cx.names.key_or(ck, cp, cl), cx.names.key_or(uk, up, ul), t, camp);
 }
 
+/// `fast_click` for a line that ends in its first 64 bytes.
+#[inline(always)]
+unsafe fn fast_click64(cx: &Ctx, line: *const u8, e: usize, c: u64, q: u64, st: &mut Shard) {
+    let Some(f) = fast_fields64::<4>(line, e, c, q) else { return };
+    if f.at(0).1 == 0 || f.at(1).1 == 0 {
+        return;
+    }
+    let t = match ts_memo(line.add(f.at(3).0), f.at(3).1, &mut st.days) {
+        Some(t) if t >= cx.base && t < cx.we => t,
+        _ => return,
+    };
+    let Some(camp) = cx.campaigns.get_at(line.add(f.at(2).0), f.at(2).1) else { return };
+    let (cp, cl, up, ul) = (line.add(f.at(0).0), f.at(0).1, line.add(f.at(1).0), f.at(1).1);
+    let (ck, uk) = pack2(cp, cl, up, ul);
+    st.click(cx, cx.names.key_or(ck, cp, cl), cx.names.key_or(uk, up, ul), t, camp);
+}
+
 unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: usize, st: &mut Shard) {
     scan_lines(
         buf,
@@ -2418,6 +2486,7 @@ unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
         len,
         st,
         |st, line, e, c, q| fast_click(cx, line, e, c, q, st),
+        |st, line, e, c, q| fast_click64(cx, line, e, c as u64, q as u64, st),
         |st, l| {
             if let Some(f) = split::<4>(l) {
                 click_fields(cx, f, st);
@@ -3931,6 +4000,10 @@ mod tests {
                 let (c, q) = ((c0 as u128 | (c1 as u128) << 64) & lm, (q0 as u128 | (q1 as u128) << 64) & lm);
                 let packed = fast_fields::<N>(p, e, c, q).map(|f| std::array::from_fn::<_, N, _>(|i| f.at(i)));
                 assert_eq!(packed, fast_split::<N>(p, e, c, q), "line {line:?}");
+                if e < 64 {
+                    let p64 = fast_fields64::<N>(p, e, c as u64, q as u64).map(|f| std::array::from_fn::<_, N, _>(|i| f.at(i)));
+                    assert_eq!(p64, packed, "line {line:?}");
+                }
                 packed
             }
             .map(|f| f.map(|(s, l)| buf[s..s + l].to_vec()));

@@ -2720,24 +2720,22 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
             if n >= u32::MAX as usize {
                 die("too many events in one event-key bucket");
             }
-            // 8 slots a record, 64 slots a word: the words of "seen" bits, then as many of "again" bits
-            let sbits = (n * 8).next_power_of_two().trailing_zeros().clamp(6, 64 - qb);
-            let words = 1usize << (sbits - 6);
+            // 8 slots a record, 32 slots a word: "seen" bits in the low half, "again" bits in the high half, so that
+            // a record touches one cache line of the table
+            let sbits = (n * 8).next_power_of_two().trailing_zeros().clamp(5, 64 - qb);
             seen.clear();
-            seen.resize(2 * words, 0);
+            seen.resize(1 << (sbits - 5), 0);
             // A record's slot is the sbits bits of its hash below the qb bits of its bucket, and those are b for
             // every record here: the hash shifted down to the slot still has b in front, which a base as many
-            // words back takes away. So one shift gives the bit (its low 6 bits) and the word (the rest).
+            // words back takes away. So one shift gives the bit (its low 5 bits) and the word (the rest).
             let s0 = 64 - qb - sbits;
-            let wb = seen.as_mut_ptr().wrapping_sub(b << (sbits - 6));
-            // SAFETY (both passes): hash >> s0 is b << sbits | slot, so the word is one of the first `words` of
-            // `seen`, and the one `words` further one of the rest
+            let wb = seen.as_mut_ptr().wrapping_sub(b << (sbits - 5));
+            // SAFETY (both passes): hash >> s0 is b << sbits | slot, so the word is one of `seen`
             let first = |r: &LRec| unsafe {
                 let x = spread(r.key) >> s0;
-                let w = wb.wrapping_add((x >> 6) as usize);
-                let (v, t) = (*w, 1u64 << (x & 63));
-                *w = v | t;
-                *w.add(words) |= v & t;
+                let w = wb.wrapping_add((x >> 5) as usize);
+                let (v, t) = (*w, (1u32 << (x as u32 & 31)) as u64);
+                *w = v | t | (v & t) << 32;
             };
             for s in shards {
                 for blk in s.lg[b].slices(LG_BLOCK) {
@@ -2759,7 +2757,7 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
             let mut second = |r: &LRec| unsafe {
                 let x = spread(r.key) >> s0;
                 *cp.add(c) = *r;
-                c += (*wb.wrapping_add((x >> 6) as usize).add(words) >> (x & 63) & 1) as usize;
+                c += (((*wb.wrapping_add((x >> 5) as usize) >> 32) as u32 >> (x as u32 & 31)) & 1) as usize;
             };
             for s in shards {
                 for blk in s.lg[b].slices(LG_BLOCK) {

@@ -2080,11 +2080,7 @@ struct IdMap {
 impl IdMap {
     fn new(ids: &[(Bytes, u16)]) -> IdMap {
         let cap = (ids.len() * 2).next_power_of_two().max(16);
-<<<<<<< HEAD
-        let mut m = IdMap { slots: vec![(0, 0); cap], shift: 64 - cap.trailing_zeros(), other: BytesMap::default() };
-=======
-        let mut m = IdMap { slots: filled(cap, (0, 0)), other: BytesMap::default() };
->>>>>>> c166174 (tables filled by real writes (filled()) instead of vec![0; n]: a first read of an untouched page maps the shared zero page and the write after it flushes that mapping from every CPU of the process; the product IdMap did this ~512 times while the link workers ran (14% of the links phase in IPIs). TLB/function-call IPIs per 20M run 8,400 -> 2,000. Box guard ok; AB vs cfedecc 0.977, 1.004, 0.979)
+        let mut m = IdMap { slots: filled(cap, (0, 0)), shift: 64 - cap.trailing_zeros(), other: BytesMap::default() };
         for &(id, v) in ids {
             match pack(id) {
                 0 => {

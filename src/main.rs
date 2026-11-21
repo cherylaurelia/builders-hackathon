@@ -293,6 +293,75 @@ impl<T> Stream<T> {
     }
 }
 
+/// A stream's last few records on their way to its block: 192 bytes (three cache lines) that are written to the
+/// block in one go with non-temporal stores. A parse thread appends to hundreds of streams; writing each record
+/// straight into its block would first fetch every new cache line of every block from memory.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Wc<T: Copy, const N: usize> {
+    recs: [T; N],
+}
+
+/// Copies the 192 bytes at `src` (64-byte aligned) to `dst` (64-byte aligned) past the cache.
+#[inline(always)]
+unsafe fn store_192(src: *const u8, dst: *mut u8) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+    {
+        use std::arch::x86_64::*;
+        for i in 0..6 {
+            _mm256_stream_si256(dst.add(32 * i) as *mut __m256i, _mm256_load_si256(src.add(32 * i) as *const __m256i));
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx")))]
+    std::ptr::copy_nonoverlapping(src, dst, 192);
+}
+
+/// Makes the non-temporal stores of this thread visible in order with its later stores.
+#[inline(always)]
+fn store_fence() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_sfence()
+    }
+}
+
+/// Appends `v` to `stream` through its buffer `wc` holding `*n` records; returns where `v` will be in the block.
+/// A block is a whole number of buffers, so a full buffer always fits the block it was started for.
+#[inline(always)]
+fn push_wc<T: Copy, const N: usize>(stream: &mut Stream<T>, wc: &mut Wc<T, N>, n: &mut u8, arena: &mut Arena, per: usize, v: T) -> *mut T {
+    const { assert!(std::mem::size_of::<Wc<T, N>>() == 192 && std::mem::size_of::<T>() * N == 192) };
+    let k = *n as usize;
+    if k == 0 && stream.cur == stream.end {
+        stream.grow(arena, per);
+    }
+    // SAFETY: k < N, and cur + N <= end: `per` is a multiple of N and cur moves N at a time until `finish_wc`
+    unsafe {
+        let at = stream.cur.add(k);
+        *wc.recs.get_unchecked_mut(k) = v;
+        if k + 1 == N {
+            store_192(wc.recs.as_ptr() as *const u8, stream.cur as *mut u8);
+            stream.cur = stream.cur.add(N);
+            *n = 0;
+        } else {
+            *n = k as u8 + 1;
+        }
+        at
+    }
+}
+
+/// Writes the `*n` buffered records of `stream` to its block. Nothing may be pushed to the stream afterwards.
+fn finish_wc<T: Copy, const N: usize>(stream: &mut Stream<T>, wc: &Wc<T, N>, n: &mut u8) {
+    let k = *n as usize;
+    if k > 0 {
+        // SAFETY: as in `push_wc`
+        unsafe {
+            std::ptr::copy_nonoverlapping(wc.recs.as_ptr(), stream.cur, k);
+            stream.cur = stream.cur.add(k);
+        }
+        *n = 0;
+    }
+}
+
 /// Asks for the cache line at `p`; a hint only.
 #[inline(always)]
 fn prefetch<T>(p: *const T) {
@@ -1267,6 +1336,10 @@ struct CRec {
 
 const EV_BLOCK: usize = 512;
 const LG_BLOCK: usize = 256;
+/// Records per write-combining buffer (192 bytes each); the blocks above are whole numbers of them.
+const EV_WC: usize = 16;
+const LG_WC: usize = 8;
+const _: () = assert!(EV_BLOCK % EV_WC == 0 && LG_BLOCK % LG_WC == 0 && EV_BLOCK * 12 % 64 == 0 && LG_BLOCK * 24 % 64 == 0 && CK_BLOCK * 24 % 64 == 0 && Arena::CHUNK % 64 == 0);
 const CK_BLOCK: usize = 128;
 
 /// A valid event or click whose user ID is on its way from memory (`IdTable::aim`).
@@ -1289,6 +1362,10 @@ struct Shard {
     ev: Vec<Stream<ERec>>,
     ck: Vec<Stream<CRec>>,
     lg: Vec<Stream<LRec>>,
+    ev_wc: Vec<Wc<ERec, EV_WC>>,
+    ev_n: Vec<u8>,
+    lg_wc: Vec<Wc<LRec, LG_WC>>,
+    lg_n: Vec<u8>,
     buf: Vec<u8>,
     ins: usize,
     ring: [Pend; RING],
@@ -1334,6 +1411,10 @@ impl Shard {
             ev: (0..parts).map(|_| Stream::new()).collect(),
             ck: (0..parts).map(|_| Stream::new()).collect(),
             lg: (0..buckets).map(|_| Stream::new()).collect(),
+            ev_wc: vec![Wc { recs: [ERec { person: 0, ts: 0, pay: 0 }; EV_WC] }; parts],
+            ev_n: vec![0; parts],
+            lg_wc: vec![Wc { recs: [LRec { key: 0, ingest: 0, loc: 0 }; LG_WC] }; buckets],
+            lg_n: vec![0; buckets],
             buf: Vec::new(),
             ins: 0,
             ring: [Pend::default(); RING],
@@ -1363,13 +1444,26 @@ impl Shard {
             }
         }
         self.head = 0;
+        store_fence();
+    }
+
+    /// Writes out what the write-combining buffers still hold. Call once, after the last chunk: nothing may be
+    /// parsed into this shard afterwards.
+    fn finish(&mut self) {
+        for i in 0..self.ev.len() {
+            finish_wc(&mut self.ev[i], &self.ev_wc[i], &mut self.ev_n[i]);
+        }
+        for i in 0..self.lg.len() {
+            finish_wc(&mut self.lg[i], &self.lg_wc[i], &mut self.lg_n[i]);
+        }
+        store_fence();
     }
 
     /// Any parsed event: its dedup record. `loc` = 0 for an invalid or late one.
     #[inline(always)]
     fn log(&mut self, cx: &Ctx, ekey: u64, ingest: i64, loc: u64) {
         let q = (mix(ekey) >> cx.qshift) as usize;
-        self.lg[q].push(&mut self.arena, LG_BLOCK, LRec { key: ekey, ingest, loc });
+        push_wc(&mut self.lg[q], &mut self.lg_wc[q], &mut self.lg_n[q], &mut self.arena, LG_BLOCK, LRec { key: ekey, ingest, loc });
     }
 
     /// A valid, non-late event: into its person's partition, plus its dedup record, once its user ID is at hand.
@@ -1383,7 +1477,8 @@ impl Shard {
     #[inline(always)]
     fn finish_event(&mut self, cx: &Ctx, p: Pend) {
         let person = cx.ids.person(cx.ids.slot_from(p.home, p.ukey, &mut self.ins));
-        let rec = self.ev[(person >> cx.pshift) as usize].push(&mut self.arena, EV_BLOCK, ERec { person, ts: p.ts, pay: p.x });
+        let part = (person >> cx.pshift) as usize;
+        let rec = push_wc(&mut self.ev[part], &mut self.ev_wc[part], &mut self.ev_n[part], &mut self.arena, EV_BLOCK, ERec { person, ts: p.ts, pay: p.x });
         self.log(cx, p.a, p.b, rec as u64);
     }
 
@@ -1505,7 +1600,7 @@ fn main() {
 
     // 2. events and clicks, from the one queue
     let (np, nq) = (1usize << pbits, 1usize << qbits);
-    let shards = par(
+    let mut shards = par(
         threads,
         work.len(),
         || Shard::new(np, nq),
@@ -1525,6 +1620,7 @@ fn main() {
             st.buf = buf;
         },
     );
+    shards.iter_mut().for_each(Shard::finish);
     let n_ev: usize = shards.iter().flat_map(|s| s.ev.iter()).map(|s| s.len(EV_BLOCK)).sum();
     let n_ck: usize = shards.iter().flat_map(|s| s.ck.iter()).map(|s| s.len(CK_BLOCK)).sum();
     lap(&format!("parsed: {n_ev} valid events, {n_ck} valid clicks"));
@@ -3005,6 +3101,8 @@ mod tests {
                 for_records::<7>(file, w[0], w[1], |f| event_fields(&c, f, &mut b));
                 b.flush(&c, true);
             }
+            a.finish();
+            b.finish();
             let (fa, fb) = (flat(&a), flat(&b));
             kept += fb.0.len();
             assert!(fa == fb, "round {round}: fast parse differs\n{}", std::str::from_utf8(file).unwrap());

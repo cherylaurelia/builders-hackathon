@@ -1354,7 +1354,7 @@ fn load_small(data: &Path) -> (Vec<Bytes>, BytesMap<u16>, u16, Vec<u32>, Vec<Byt
 
 // ---------------------------------------------------------------- parse
 
-const BATCH: usize = 32;
+const BATCH: usize = 64;
 
 #[inline(always)]
 fn key(b: Bytes, fast: bool) -> Key {

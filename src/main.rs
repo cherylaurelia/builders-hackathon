@@ -438,13 +438,14 @@ const GROUP: usize = 192;
 /// directly first reads its cache line from memory (read for ownership) and crowds the cache. A stream keeps the
 /// records of its current group (block offset a multiple of GROUP: blocks are 64-byte aligned, whole groups
 /// long) and writes the full group with non-temporal stores, three whole lines that are never read. A record's
-/// address is known when it is pushed; until its group is full or `finish` runs, its bytes are only in the stage.
+/// address is known when it is pushed; until the push after its group is full, or `finish`, its bytes are only in
+/// the stage.
 /// The caller fences (`sfence`) before others read, and calls `finish` once the pushing is over.
 #[repr(C, align(64))]
 struct Stream<T> {
-    cur: *mut T,
+    base: *mut T,                // where the current group belongs in its block; null before the first block
     end: *mut T,
-    n: usize,                    // records of the current group, in `stage`
+    n: usize,                    // records of the current group, in `stage`; K = full (or no block yet)
     blocks: Vec<*mut T>,
     _pad: [u64; 2],              // the stage on its own three cache lines
     stage: [u64; GROUP / 8],     // 8-byte aligned, as every record here
@@ -456,58 +457,77 @@ impl<T> Stream<T> {
 
     fn new() -> Stream<T> {
         const { assert!(GROUP % std::mem::size_of::<T>() == 0 && std::mem::align_of::<T>() <= 8 && !std::mem::needs_drop::<T>()) };
-        Stream { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), n: 0, blocks: Vec::new(), _pad: [0; 2], stage: [0; GROUP / 8], _t: std::marker::PhantomData }
+        Stream { base: std::ptr::null_mut(), end: std::ptr::null_mut(), n: Self::K, blocks: Vec::new(), _pad: [0; 2], stage: [0; GROUP / 8], _t: std::marker::PhantomData }
     }
 
+    /// Appends `v`; returns where it will be in memory. A push costs one test, the record and the count: a full
+    /// group is written (and a full block followed by a new one) by the push that comes after it.
     #[inline(always)]
     fn push(&mut self, arena: &mut Arena, per: usize, v: T) -> *mut T {
-        if self.cur == self.end {
+        if self.n == Self::K {
+            self.spill(arena, per);
+        }
+        let n = self.n;
+        self.n = n + 1;
+        // SAFETY: n < K slots of the stage; the group [base, base + K) is inside the block `grow` took
+        unsafe {
+            (self.stage.as_mut_ptr() as *mut T).add(n).write(v);
+            self.base.add(n)
+        }
+    }
+
+    /// Makes room in the stage: writes the full group, if there is one, and moves on to the next (in a new block
+    /// when this one is full, or there is none yet).
+    #[inline(always)]
+    fn spill(&mut self, arena: &mut Arena, per: usize) {
+        if !self.base.is_null() {
+            // SAFETY: the group at base is GROUP bytes at a 64-byte aligned address of the block
+            unsafe {
+                stream_group(self.base as *mut u8, self.stage.as_ptr() as *const u8);
+                self.base = self.base.add(Self::K);
+            }
+        }
+        if self.base == self.end {
             self.grow(arena, per);
         }
-        let p = self.cur;
-        // SAFETY: cur < end, inside the block `grow` took from the arena; n < K slots of the stage
-        unsafe {
-            (self.stage.as_mut_ptr() as *mut T).add(self.n).write(v);
-            self.cur = p.add(1);
-        }
-        self.n += 1;
-        if self.n == Self::K {
-            // SAFETY: the group [cur - K, cur) is GROUP bytes at a 64-byte aligned address of the block
-            unsafe { stream_group((self.cur as *mut u8).sub(GROUP), self.stage.as_ptr() as *const u8) };
-            self.n = 0;
-        }
-        p
+        self.n = 0;
     }
 
     #[cold]
     #[inline(never)]
     fn grow(&mut self, arena: &mut Arena, per: usize) {
-        debug_assert!(self.n == 0 && per % Self::K == 0);
+        debug_assert!(per % Self::K == 0);
         let p = arena.alloc(per * std::mem::size_of::<T>()) as *mut T;
         debug_assert!(p as usize % 64 == 0);
         self.blocks.push(p);
-        self.cur = p;
+        self.base = p;
         self.end = unsafe { p.add(per) };
     }
 
-    /// Writes the records still staged (a group not yet full) to memory with plain stores.
+    /// Writes the records still staged to memory with plain stores. Pushing may go on afterwards.
     fn finish(&mut self) {
-        // SAFETY: the n staged records belong at [cur - n, cur)
-        unsafe { std::ptr::copy_nonoverlapping(self.stage.as_ptr() as *const T, self.cur.sub(self.n), self.n) };
-        self.n = 0;
+        if !self.base.is_null() {
+            // SAFETY: the n (<= K) staged records belong at [base, base + n), inside the block
+            unsafe { std::ptr::copy_nonoverlapping(self.stage.as_ptr() as *const T, self.base, self.n) };
+        }
+    }
+
+    /// Records in the last block.
+    fn tail(&self, b: *mut T) -> usize {
+        (unsafe { self.base.offset_from(b) }) as usize + self.n
     }
 
     fn len(&self, per: usize) -> usize {
         match self.blocks.last() {
             None => 0,
-            Some(&b) => (self.blocks.len() - 1) * per + (unsafe { self.cur.offset_from(b) }) as usize,
+            Some(&b) => (self.blocks.len() - 1) * per + self.tail(b),
         }
     }
 
     fn slices(&self, per: usize) -> impl Iterator<Item = &[T]> {
         let n = self.blocks.len();
         self.blocks.iter().enumerate().map(move |(i, &b)| {
-            let len = if i + 1 == n { (unsafe { self.cur.offset_from(b) }) as usize } else { per };
+            let len = if i + 1 == n { self.tail(b) } else { per };
             unsafe { std::slice::from_raw_parts(b, len) }
         })
     }

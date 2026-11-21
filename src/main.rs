@@ -68,11 +68,53 @@ impl Hasher for BytesHasher {
 }
 type BytesMap<V> = HashMap<Bytes, V, BuildHasherDefault<BytesHasher>>;
 
+/// An ID of up to 15 bytes stored inline (zero padded, length in the last byte), else a pointer to it.
+/// Inline IDs compare as one 128-bit value: no pointer chase into the input files.
+#[derive(Clone, Copy)]
+struct SStr([u8; 16]);
+impl SStr {
+    const LONG: u8 = 0xFF;
+    #[inline]
+    fn new(b: Bytes) -> SStr {
+        let mut x = [0u8; 16];
+        if b.len() <= 15 {
+            x[..b.len()].copy_from_slice(b);
+            x[15] = b.len() as u8;
+        } else {
+            x[..8].copy_from_slice(&(b.as_ptr() as u64).to_le_bytes());
+            x[8..16].copy_from_slice(&(b.len() as u64).to_le_bytes());
+            x[15] = SStr::LONG; // lengths stay far below 2^56
+        }
+        SStr(x)
+    }
+    #[inline]
+    fn get(&self) -> &[u8] {
+        if self.0[15] != SStr::LONG {
+            &self.0[..self.0[15] as usize]
+        } else {
+            let p = u64::from_le_bytes(self.0[..8].try_into().unwrap()) as *const u8;
+            let mut l = [0u8; 8];
+            l[..7].copy_from_slice(&self.0[8..15]);
+            unsafe { std::slice::from_raw_parts(p, u64::from_le_bytes(l) as usize) }
+        }
+    }
+}
+impl PartialEq for SStr {
+    #[inline]
+    fn eq(&self, o: &Self) -> bool {
+        if self.0[15] != SStr::LONG && o.0[15] != SStr::LONG {
+            u128::from_ne_bytes(self.0) == u128::from_ne_bytes(o.0)
+        } else {
+            self.get() == o.get()
+        }
+    }
+}
+
 /// Key whose hash was computed earlier; equality is still exact on the bytes.
 #[derive(Clone, Copy)]
 struct PreHashed {
     h: u64,
-    s: Bytes,
+    s: SStr,
 }
 impl PartialEq for PreHashed {
     fn eq(&self, o: &Self) -> bool {
@@ -576,7 +618,7 @@ impl Packed {
 /// A valid, non-late event in its user_id bucket, until dedup and person resolution.
 struct UEvent {
     uh: u64,
-    uid: Packed,
+    uid: SStr,
     eid: Packed,
     ingest: i64,
     ts: i64,
@@ -607,7 +649,7 @@ struct EvParse {
 #[derive(Clone, Copy)]
 struct PEvent {
     nh: u64,
-    name: Bytes,
+    name: SStr,
     ts: i64,
     price: u32,
     cat: u16,
@@ -618,14 +660,14 @@ struct PEvent {
 #[derive(Clone, Copy)]
 struct PClick {
     nh: u64,
-    name: Bytes,
+    name: SStr,
     ts: i64,
     cid: Bytes,
     camp: u16,
 }
 
 struct UserRow {
-    name: Bytes,
+    name: SStr,
     day: i32,
     sessions: i64,
     events: i64,
@@ -742,7 +784,7 @@ fn main() {
                         let loc = ((st.t as u64) << LOC_T) | ((u as u64) << LOC_B) | v.len() as u64;
                         v.push(UEvent {
                             uh,
-                            uid: r.uid,
+                            uid: SStr::new(r.uid.get()),
                             eid: r.eid,
                             ingest: r.ingest,
                             ts: r.ts,
@@ -874,13 +916,13 @@ fn main() {
         || (sized::<PEvent>(PB, n_ev, threads), sized::<PClick>(PB, n_ck, threads)),
         |(oe, oc), u| {
             let map = &links[u];
-            let person = |h: u64, s: Bytes| map.get(&PreHashed { h, s }).copied().unwrap_or((s, h));
+            let person = |h: u64, s: SStr| map.get(&PreHashed { h, s }).copied().unwrap_or((s, h));
             for t in &parsed {
                 for e in &t.ub[u] {
                     if e.dropped.load(Relaxed) {
                         continue;
                     }
-                    let (name, nh) = person(e.uh, e.uid.get());
+                    let (name, nh) = person(e.uh, e.uid);
                     oe[person_bucket(nh)].push(PEvent { nh, name, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
                 }
             }
@@ -944,7 +986,7 @@ fn main() {
     lap(&format!("written: {} user rows, {} campaign rows", user_parts.iter().map(|p| p.len()).sum::<usize>(), camp_rows.len()));
 }
 
-fn build_links(files: &[Bytes], threads: usize) -> Vec<PreMap<(Bytes, u64)>> {
+fn build_links(files: &[Bytes], threads: usize) -> Vec<PreMap<(SStr, u64)>> {
     let ch = chunks(files);
     let parts = par(
         threads,
@@ -995,12 +1037,12 @@ fn build_links(files: &[Bytes], threads: usize) -> Vec<PreMap<(Bytes, u64)>> {
             best[r] = i as u32;
         }
     }
-    let mut maps: Vec<PreMap<(Bytes, u64)>> = (0..UB).map(|_| PreMap::default()).collect();
+    let mut maps: Vec<PreMap<(SStr, u64)>> = (0..UB).map(|_| PreMap::default()).collect();
     for i in 0..n {
         let r = find(&mut parent, i as u32) as usize;
         let name = names[best[r] as usize];
         let h = hash_bytes(names[i]);
-        maps[uid_bucket(h)].insert(PreHashed { h, s: names[i] }, (name, hash_bytes(name)));
+        maps[uid_bucket(h)].insert(PreHashed { h, s: SStr::new(names[i]) }, (SStr::new(name), hash_bytes(name)));
     }
     maps
 }
@@ -1049,7 +1091,7 @@ fn parse_click(ctx: &Ctx, [cid, uid, camp, ts]: [Bytes; 4]) -> Option<PClick> {
     }
     let camp = *ctx.campaigns.get(camp)?;
     // routed by user_id for now; phase 4b swaps in the person
-    Some(PClick { nh: hash_bytes(uid), name: uid, ts: t, cid, camp })
+    Some(PClick { nh: hash_bytes(uid), name: SStr::new(uid), ts: t, cid, camp })
 }
 
 struct Agg {
@@ -1074,7 +1116,7 @@ fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<
 
     // person ids, exact on the name bytes
     let mut pid: PreMap<u32> = PreMap::default();
-    let mut names: Vec<Bytes> = Vec::new();
+    let mut names: Vec<SStr> = Vec::new();
     struct E {
         key: u64,
         price: u32,
@@ -1322,7 +1364,7 @@ fn write_users(path: &Path, rows: &[&UserRow], cat_names: &[Bytes]) -> parquet::
     while let Some(mut c) = rg.next_column()? {
         match col {
             0 => {
-                let v: Vec<ByteArray> = rows.iter().map(|r| ba(r.name)).collect();
+                let v: Vec<ByteArray> = rows.iter().map(|r| ba(r.name.get())).collect();
                 c.typed::<ByteArrayType>().write_batch(&v, None, None)?;
             }
             1 => {

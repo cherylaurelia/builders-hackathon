@@ -219,6 +219,7 @@ struct Arena {
 }
 impl Arena {
     fn alloc(&mut self, bytes: usize) -> *mut u8 {
+        let bytes = (bytes + 63) & !63;
         if self.cur + bytes > self.end {
             let sz = (64usize << 20).max(bytes);
             self.cur = map_anon(sz) as usize;
@@ -232,8 +233,38 @@ impl Arena {
 
 const BS: usize = 2048; // elements per block
 
-/// An append-only list in blocks of BS elements: no copying on growth.
+#[repr(C, align(64))]
+struct Line([u8; 128]);
+
+/// Writes 64 bytes from `src` to `dst` (both 64-byte aligned) around the caches: no read for ownership.
+#[inline(always)]
+unsafe fn stream64(dst: *mut u8, src: *const u8) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        _mm256_stream_si256(dst as *mut __m256i, _mm256_load_si256(src as *const __m256i));
+        _mm256_stream_si256(dst.add(32) as *mut __m256i, _mm256_load_si256(src.add(32) as *const __m256i));
+        return;
+    }
+    #[allow(unreachable_code)]
+    std::ptr::copy_nonoverlapping(src, dst, 64);
+}
+
+#[inline(always)]
+fn sfence() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_sfence()
+    }
+}
+
+/// An append-only list in blocks of BS elements: no copying on growth. Appends are staged in a 64-byte line and
+/// written with streaming stores (hundreds of lists are filled at once: plain stores would each miss). A block is a
+/// whole number of lines, so the stage is empty at every block boundary. `flush` before reading.
 struct Blocks<T> {
+    buf: Line,
+    fill: usize,
+    dst: *mut u8,
     blks: Vec<*mut T>,
     len: usize,
 }
@@ -241,18 +272,36 @@ unsafe impl<T> Send for Blocks<T> {}
 unsafe impl<T> Sync for Blocks<T> {}
 impl<T: Copy> Blocks<T> {
     fn new() -> Self {
-        Blocks { blks: Vec::new(), len: 0 }
+        assert!((BS * std::mem::size_of::<T>()) % 64 == 0 && std::mem::size_of::<T>() <= 64);
+        Blocks { buf: Line([0; 128]), fill: 0, dst: std::ptr::null_mut(), blks: Vec::new(), len: 0 }
     }
-    #[inline]
+    #[inline(always)]
     fn push(&mut self, a: &mut Arena, v: T) -> usize {
         let i = self.len;
-        let o = i % BS;
-        if o == 0 {
-            self.blks.push(a.alloc(BS * std::mem::size_of::<T>()) as *mut T);
+        if i % BS == 0 {
+            let b = a.alloc(BS * std::mem::size_of::<T>());
+            self.blks.push(b as *mut T);
+            self.dst = b;
         }
-        unsafe { (*self.blks.last().unwrap_unchecked()).add(o).write(v) };
+        unsafe {
+            (self.buf.0.as_mut_ptr().add(self.fill) as *mut T).write_unaligned(v);
+            self.fill += std::mem::size_of::<T>();
+            if self.fill >= 64 {
+                stream64(self.dst, self.buf.0.as_ptr());
+                self.dst = self.dst.add(64);
+                self.fill -= 64;
+                let b = self.buf.0.as_mut_ptr();
+                std::ptr::copy_nonoverlapping(b.add(64), b, 64);
+            }
+        }
         self.len = i + 1;
         i
+    }
+    /// Writes out the staged bytes.
+    fn flush(&mut self) {
+        unsafe { std::ptr::copy_nonoverlapping(self.buf.0.as_ptr(), self.dst, self.fill) };
+        self.dst = unsafe { self.dst.add(self.fill) };
+        self.fill = 0;
     }
     #[inline]
     fn get(&self, i: usize) -> &T {
@@ -1131,6 +1180,11 @@ fn main() {
             click_chunk(&ctx, &tab, s, f, a, b)
         }
     });
+    for s in st.iter_mut() {
+        s.pb.iter_mut().for_each(|b| b.flush());
+        s.eb.iter_mut().for_each(|b| b.flush());
+        s.cb.iter_mut().for_each(|b| b.flush());
+    }
     let n_ev: usize = st.iter().flat_map(|s| s.pb.iter()).map(|b| b.len).sum();
     let n_er: usize = st.iter().flat_map(|s| s.eb.iter()).map(|b| b.len).sum();
     let n_ck: usize = st.iter().flat_map(|s| s.cb.iter()).map(|b| b.len).sum();
@@ -1253,15 +1307,15 @@ struct PendEv {
     cathi: u32,
 }
 
-/// `ingest_ts` as epoch ms; None = not a timestamp (the line is then treated as malformed).
+/// `ingest_ts` as epoch seconds (F1 is whole seconds); None = not a timestamp (the line is then treated as malformed).
 #[inline(always)]
-fn ingest_ms(ctx: &Ctx, b: &[u8]) -> Option<i64> {
+fn ingest_secs(ctx: &Ctx, b: &[u8]) -> Option<i64> {
     if b.len() == 20 && b[19] == b'Z' {
         if let Some(s) = ctx.dates.secs(b) {
-            return Some(s * 1000);
+            return Some(s);
         }
     }
-    parse_ts(b)
+    parse_ts(b).map(|ms| ms.div_euclid(1000))
 }
 
 fn event_chunk(ctx: &Ctx, tab: &Table, s: &mut TS, f: Bytes, a: usize, b: usize) {
@@ -1280,8 +1334,8 @@ fn event_chunk(ctx: &Ctx, tab: &Table, s: &mut TS, f: Bytes, a: usize, b: usize)
                     break 'line;
                 }
                 // ingest_ts is always valid F1; a line where it is not is treated as malformed
-                let Some(ingest_ms) = ingest_ms(ctx, ing) else { break 'line };
-                let ingest = (ingest_ms.div_euclid(1000) - ctx.ing_base).clamp(0, u32::MAX as i64) as u32;
+                let Some(ingest_s) = ingest_secs(ctx, ing) else { break 'line };
+                let ingest = (ingest_s - ctx.ing_base).clamp(0, u32::MAX as i64) as u32;
                 let es = sstr(eid, fast);
                 let eh = es.hash();
                 // Events 3 + 4: the kept copy must be valid and not late
@@ -1290,7 +1344,7 @@ fn event_chunk(ctx: &Ctx, tab: &Table, s: &mut TS, f: Bytes, a: usize, b: usize)
                         break 'drop;
                     }
                     let Some(ts) = parse_ts_near(ts, &ctx.dates) else { break 'drop };
-                    if ts < ctx.ws || ts >= ctx.we || ingest_ms - ts > DAY {
+                    if ts < ctx.ws || ts >= ctx.we || ingest_s * 1000 - ts > DAY {
                         break 'drop;
                     }
                     let (pay, cathi) = if ety == b"view" || ety == b"cart" {
@@ -1326,6 +1380,7 @@ fn event_chunk(ctx: &Ctx, tab: &Table, s: &mut TS, f: Bytes, a: usize, b: usize)
             n = 0;
         }
         if done {
+            sfence();
             return;
         }
     }
@@ -1373,6 +1428,7 @@ fn click_chunk(ctx: &Ctx, tab: &Table, s: &mut TS, f: Bytes, a: usize, b: usize)
             n = 0;
         }
         if done {
+            sfence();
             return;
         }
     }

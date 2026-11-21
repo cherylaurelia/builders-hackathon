@@ -3088,10 +3088,8 @@ struct Work {
     iv: Vec<(i64, i64)>,
     seen: Vec<u32>,
     sctr: u32,
-    start: Vec<u32>,
-    fill: Vec<u32>,
+    start: Vec<u32>,  // see partition_work
     cstart: Vec<u32>,
-    cfill: Vec<u32>,
     ev: Vec<u64>,
     ck: Vec<Ck>,
     sessions: Vec<Sess>,
@@ -3122,10 +3120,8 @@ impl Work {
             iv: vec![(0, 0); cx.ncamp + 1],
             seen: filled(cx.ncamp + 1, 0),
             sctr: 0,
-            start: filled(local, 0),
-            fill: filled(local, 0),
-            cstart: filled(local, 0),
-            cfill: filled(local, 0),
+            start: filled(local + 2, 0),
+            cstart: filled(local + 2, 0),
             ev: Vec::new(),
             ck: Vec::new(),
             sessions: Vec::new(),
@@ -3308,68 +3304,75 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     let local = 1usize << cx.pshift;
     let lmask = (local - 1) as u32;
 
-    // events: counting sort by person (the low bits of the slot number)
-    w.start[..=local].fill(0);
-    for s in shards {
-        for blk in s.ev[p].slices(EV_BLOCK) {
-            for r in blk {
-                if r.person != DROPPED {
-                    w.start[(r.person & lmask) as usize + 1] += 1;
+    // events: counting sort by person (the low bits of the slot number), with no branch and no bounds check. A
+    // dropped copy goes to person `local`, a bin past the real ones whose events are never read. `start[l + 2]`
+    // counts person l; then `start[l + 1]` is where l's events begin, and moves to their end as they are placed, so
+    // afterwards person l has `start[l]..start[l + 1]`.
+    let st = w.start.as_mut_ptr();
+    let lm = lmask as usize;
+    // SAFETY: start and cstart hold local + 3 entries, and every index below is at most local + 2
+    unsafe {
+        let ev_bin = |r: &ERec| if r.person == DROPPED { local } else { r.person as usize & lm };
+        std::ptr::write_bytes(st, 0, local + 3);
+        for s in shards {
+            for blk in s.ev[p].slices(EV_BLOCK) {
+                for r in blk {
+                    *st.add(ev_bin(r) + 2) += 1;
                 }
             }
         }
-    }
-    let mut sum = 0;
-    for l in 0..local {
-        sum += w.start[l + 1];
-        w.start[l + 1] = sum;
-        w.fill[l] = w.start[l];
-    }
-    let n = sum as usize;
-    if n == 0 {
-        return;
-    }
-    if w.ev.len() < n {
-        w.ev.resize(n, 0);
-    }
-    for s in shards {
-        for blk in s.ev[p].slices(EV_BLOCK) {
-            for r in blk {
-                if r.person != DROPPED {
-                    let f = &mut w.fill[(r.person & lmask) as usize];
-                    w.ev[*f as usize] = (r.ts as u64) << 32 | r.pay as u64;
+        let mut run = 0;
+        for l in 0..=local {
+            let c = *st.add(l + 2);
+            *st.add(l + 1) = run;
+            run += c;
+        }
+        if *st.add(local + 1) == 0 {
+            return;
+        }
+        if w.ev.len() < run as usize {
+            w.ev.resize(run as usize, 0);
+        }
+        let ev = w.ev.as_mut_ptr();
+        for s in shards {
+            for blk in s.ev[p].slices(EV_BLOCK) {
+                for r in blk {
+                    let f = st.add(ev_bin(r) + 1);
+                    *ev.add(*f as usize) = (r.ts as u64) << 32 | r.pay as u64;
                     *f += 1;
                 }
             }
         }
-    }
 
-    // clicks of the people with events, the same way
-    w.cstart[..=local].fill(0);
-    for s in shards {
-        for blk in s.ck[p].slices(CK_BLOCK) {
-            for r in blk {
-                let l = r.local() as usize;
-                w.cstart[l + 1] += (w.start[l + 1] != w.start[l]) as u32;
+        // clicks of the people with events, the same way: the others' go to bin `local`
+        let ct = w.cstart.as_mut_ptr();
+        let ck_bin = |r: &CRec| {
+            let l = r.local() as usize & lm; // masked: the index is unchecked
+            if *st.add(l + 1) != *st.add(l) { l } else { local }
+        };
+        std::ptr::write_bytes(ct, 0, local + 3);
+        for s in shards {
+            for blk in s.ck[p].slices(CK_BLOCK) {
+                for r in blk {
+                    *ct.add(ck_bin(r) + 2) += 1;
+                }
             }
         }
-    }
-    let mut sum = 0;
-    for l in 0..local {
-        sum += w.cstart[l + 1];
-        w.cstart[l + 1] = sum;
-        w.cfill[l] = w.cstart[l];
-    }
-    if w.ck.len() < sum as usize {
-        w.ck.resize(sum as usize, Ck { k: 0, cid: 0 });
-    }
-    for s in shards {
-        for blk in s.ck[p].slices(CK_BLOCK) {
-            for r in blk {
-                let l = r.local() as usize;
-                if w.start[l + 1] != w.start[l] {
-                    let f = &mut w.cfill[l];
-                    w.ck[*f as usize] = Ck { k: (r.ts() as u64) << 32 | r.camp() as u64, cid: r.cid };
+        let mut run = 0;
+        for l in 0..=local {
+            let c = *ct.add(l + 2);
+            *ct.add(l + 1) = run;
+            run += c;
+        }
+        if w.ck.len() < run as usize {
+            w.ck.resize(run as usize, Ck { k: 0, cid: 0 });
+        }
+        let ckp = w.ck.as_mut_ptr();
+        for s in shards {
+            for blk in s.ck[p].slices(CK_BLOCK) {
+                for r in blk {
+                    let f = ct.add(ck_bin(r) + 1);
+                    *ckp.add(*f as usize) = Ck { k: (r.ts() as u64) << 32 | r.camp() as u64, cid: r.cid };
                     *f += 1;
                 }
             }

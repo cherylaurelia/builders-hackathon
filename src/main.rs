@@ -284,6 +284,7 @@ impl Arena {
 
     #[inline]
     fn alloc(&mut self, bytes: usize) -> *mut u8 {
+        debug_assert!(bytes % 64 == 0); // blocks stay 64-byte aligned (see `Stream`)
         if self.cur + bytes > self.end {
             let n = bytes.max(Self::CHUNK);
             self.cur = map_anon(n) as usize;
@@ -295,16 +296,32 @@ impl Arena {
     }
 }
 
+/// Bytes a stream writes at a time: three cache lines, a whole number of records of every size here (12, 24).
+const GROUP: usize = 192;
+
 /// An append-only list of `T` in blocks of `per` records; a record never moves.
+///
+/// Records reach memory a group at a time: a thread appends to some 800 streams at once, and a record stored
+/// directly first reads its cache line from memory (read for ownership) and crowds the cache. A stream keeps the
+/// records of its current group (block offset a multiple of GROUP: blocks are 64-byte aligned, whole groups
+/// long) and writes the full group with non-temporal stores, three whole lines that are never read. A record's
+/// address is known when it is pushed; until its group is full or `finish` runs, its bytes are only in the stage.
+/// The caller fences (`sfence`) before others read, and calls `finish` once the pushing is over.
 struct Stream<T> {
     cur: *mut T,
     end: *mut T,
     blocks: Vec<*mut T>,
+    n: usize,                    // records of the current group, in `stage`
+    stage: [u64; GROUP / 8],     // 8-byte aligned, as every record here
+    _t: std::marker::PhantomData<T>,
 }
 
 impl<T> Stream<T> {
+    const K: usize = GROUP / std::mem::size_of::<T>();
+
     fn new() -> Stream<T> {
-        Stream { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), blocks: Vec::new() }
+        const { assert!(GROUP % std::mem::size_of::<T>() == 0 && std::mem::align_of::<T>() <= 8 && !std::mem::needs_drop::<T>()) };
+        Stream { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), blocks: Vec::new(), n: 0, stage: [0; GROUP / 8], _t: std::marker::PhantomData }
     }
 
     #[inline(always)]
@@ -313,10 +330,16 @@ impl<T> Stream<T> {
             self.grow(arena, per);
         }
         let p = self.cur;
-        // SAFETY: cur < end, inside the block `grow` took from the arena
+        // SAFETY: cur < end, inside the block `grow` took from the arena; n < K slots of the stage
         unsafe {
-            p.write(v);
+            (self.stage.as_mut_ptr() as *mut T).add(self.n).write(v);
             self.cur = p.add(1);
+        }
+        self.n += 1;
+        if self.n == Self::K {
+            // SAFETY: the group [cur - K, cur) is GROUP bytes at a 64-byte aligned address of the block
+            unsafe { stream_group((self.cur as *mut u8).sub(GROUP), self.stage.as_ptr() as *const u8) };
+            self.n = 0;
         }
         p
     }
@@ -324,10 +347,19 @@ impl<T> Stream<T> {
     #[cold]
     #[inline(never)]
     fn grow(&mut self, arena: &mut Arena, per: usize) {
+        debug_assert!(self.n == 0 && per % Self::K == 0);
         let p = arena.alloc(per * std::mem::size_of::<T>()) as *mut T;
+        debug_assert!(p as usize % 64 == 0);
         self.blocks.push(p);
         self.cur = p;
         self.end = unsafe { p.add(per) };
+    }
+
+    /// Writes the records still staged (a group not yet full) to memory with plain stores.
+    fn finish(&mut self) {
+        // SAFETY: the n staged records belong at [cur - n, cur)
+        unsafe { std::ptr::copy_nonoverlapping(self.stage.as_ptr() as *const T, self.cur.sub(self.n), self.n) };
+        self.n = 0;
     }
 
     fn len(&self, per: usize) -> usize {
@@ -343,6 +375,30 @@ impl<T> Stream<T> {
             let len = if i + 1 == n { (unsafe { self.cur.offset_from(b) }) as usize } else { per };
             unsafe { std::slice::from_raw_parts(b, len) }
         })
+    }
+}
+
+/// Copies a GROUP of bytes to `dst` (64-byte aligned) with non-temporal stores where available.
+#[inline(always)]
+unsafe fn stream_group(dst: *mut u8, src: *const u8) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        for i in 0..GROUP / 32 {
+            _mm256_stream_si256(dst.add(32 * i) as *mut __m256i, _mm256_loadu_si256(src.add(32 * i) as *const __m256i));
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    std::ptr::copy_nonoverlapping(src, dst, GROUP);
+}
+
+/// Orders this thread's non-temporal stores before its later stores.
+#[inline(always)]
+fn sfence() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_sfence()
     }
 }
 
@@ -1558,7 +1614,7 @@ fn main() {
 
     // 2. events and clicks, from the one queue
     let (np, nq) = (1usize << pbits, 1usize << qbits);
-    let shards = par(
+    let mut shards = par(
         threads,
         work.len(),
         || Shard::new(np, nq),
@@ -1578,6 +1634,12 @@ fn main() {
             st.buf = buf;
         },
     );
+    // the records of groups not yet full, written by this thread (each parse thread fenced its own before the join)
+    for s in &mut shards {
+        s.ev.iter_mut().for_each(Stream::finish);
+        s.ck.iter_mut().for_each(Stream::finish);
+        s.lg.iter_mut().for_each(Stream::finish);
+    }
     let n_ev: usize = shards.iter().flat_map(|s| s.ev.iter()).map(|s| s.len(EV_BLOCK)).sum();
     let n_ck: usize = shards.iter().flat_map(|s| s.ck.iter()).map(|s| s.len(CK_BLOCK)).sum();
     lap(&format!("parsed: {n_ev} valid events, {n_ck} valid clicks"));
@@ -1953,6 +2015,7 @@ unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
         },
     );
     st.flush(cx, true);
+    sfence();
 }
 
 /// rules.md "Clicks" 1, 3 for one line given as its 4 fields: the generic path of `fast_click`.
@@ -1997,6 +2060,7 @@ unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
         },
     );
     st.flush(cx, false);
+    sfence();
 }
 
 /// rules.md "Events" 2: per event-key bucket, among the copies of one event_id the smallest ingest_ts is kept and
@@ -3001,12 +3065,132 @@ mod tests {
 
     /// (events as (person, ts, pay), dedup records as (key, ingest, has a record)), each sorted
     type Flat = (Vec<(u32, u32, u32)>, Vec<(u64, i64, bool)>);
-    fn flat(st: &Shard) -> Flat {
+    fn flat(st: &mut Shard) -> Flat {
+        st.ev.iter_mut().for_each(Stream::finish);
+        st.lg.iter_mut().for_each(Stream::finish);
         let mut ev: Vec<_> = st.ev.iter().flat_map(|s| s.slices(EV_BLOCK)).flatten().map(|r| (r.person, r.ts, r.pay)).collect();
         let mut lg: Vec<_> = st.lg.iter().flat_map(|s| s.slices(LG_BLOCK)).flatten().map(|r| (r.key, r.ingest, r.loc != 0)).collect();
         ev.sort();
         lg.sort();
         (ev, lg)
+    }
+
+    /// `fast_split` (with the masks `scan_lines` computes) agrees with `split` on random lines made of the bytes
+    /// that matter (from arena/c2's tests).
+    fn fast_split_vs_split<const N: usize>(seed: u64) {
+        let mut r = Rng(seed);
+        let atoms = ["a", ",", "\"", "\"\"", "xy", "\r", " ", "\"ab\"", "1234567"];
+        for _ in 0..200_000 {
+            let mut line = String::new();
+            for _ in 0..r.below(40) {
+                line += r.pick(&atoms);
+            }
+            line.truncate(126);
+            let mut buf = line.clone().into_bytes();
+            buf.push(b'\n');
+            buf.resize(buf.len() + 200, b'z');
+            let want = split::<N>(Box::leak(line.clone().into_bytes().into_boxed_slice())).map(|f| f.map(|x| x.to_vec()));
+            let got = unsafe {
+                let p = buf.as_ptr();
+                let [c0, q0, n0] = masks64(p);
+                let [c1, q1, n1] = masks64(p.add(64));
+                let e = (n0 as u128 | (n1 as u128) << 64).trailing_zeros() as usize;
+                assert_eq!(e, line.len());
+                let lm = (1u128 << e) - 1;
+                fast_split::<N>(p, e, (c0 as u128 | (c1 as u128) << 64) & lm, (q0 as u128 | (q1 as u128) << 64) & lm)
+            }
+            .map(|f| f.map(|(s, l)| buf[s..s + l].to_vec()));
+            assert_eq!(got, want, "line {line:?}");
+        }
+    }
+
+    #[test]
+    fn fast_split_matches_split() {
+        fast_split_vs_split::<2>(1);
+        fast_split_vs_split::<4>(2);
+        fast_split_vs_split::<7>(3);
+    }
+
+    #[test]
+    fn prices() {
+        assert_eq!(parse_price(b"0250"), Some(250));
+        assert_eq!(parse_price(b"000000000000000000000250"), Some(250));
+        assert_eq!(parse_price(b"10000000"), Some(10_000_000));
+        assert_eq!(parse_price(b"10000001"), None);
+        assert_eq!(parse_price(b"0"), None);
+        assert_eq!(parse_price(b"12.5"), None);
+        assert_eq!(parse_price(b""), None);
+        assert_eq!(parse_price(b"99999999999999999999999"), None);
+    }
+
+    /// `ts_at` and `ts_memo` agree with `parse_ts` on arena/c2's timestamp mix: F1/F2 with random fields near a
+    /// window holding February 29, 13-digit F3, digit strings of any length, and a stray byte now and then.
+    #[test]
+    fn timestamps_match_general_parser() {
+        let mut r = Rng(7);
+        let mut days = [NO_DAY; 32];
+        for _ in 0..300_000 {
+            let mut s: Vec<u8> = match r.below(4) {
+                0 => format!("2028-0{}-{:02}T{:02}:{:02}:{:02}Z", 2 + r.below(2), r.below(32), r.below(25), r.below(61), r.below(61)).into_bytes(),
+                1 => format!(
+                    "2028-0{}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
+                    2 + r.below(2),
+                    r.below(32),
+                    r.below(25),
+                    r.below(61),
+                    r.below(61),
+                    if r.below(2) == 0 { '+' } else { '-' },
+                    r.below(25),
+                    r.below(61)
+                )
+                .into_bytes(),
+                2 => format!("18{:011}", r.next() % 100_000_000_000).into_bytes(),
+                _ => (0..r.below(22)).map(|_| b'0' + r.below(10) as u8).collect(),
+            };
+            if r.below(8) == 0 && !s.is_empty() {
+                let i = r.below(s.len());
+                s[i] = b"xZT:-+ 0"[r.below(8)];
+            }
+            let mut buf = s.clone();
+            buf.extend_from_slice(&[b'7'; 32]);
+            let want = parse_ts(&s);
+            assert_eq!(unsafe { ts_at(buf.as_ptr(), s.len()) }, want, "{:?}", String::from_utf8_lossy(&s));
+            assert_eq!(unsafe { ts_memo(buf.as_ptr(), s.len(), &mut days) }, want, "memo {:?}", String::from_utf8_lossy(&s));
+        }
+    }
+
+    #[test]
+    fn streams_keep_every_record_where_push_said() {
+        let mut r = Rng(17);
+        let mut arena = Arena { cur: 0, end: 0 };
+        let mut s12: Vec<Stream<ERec>> = (0..23).map(|_| Stream::new()).collect();
+        let mut s24: Vec<Stream<LRec>> = (0..23).map(|_| Stream::new()).collect();
+        let mut want12: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); 23];
+        let mut want24: Vec<Vec<(u64, i64, u64)>> = vec![Vec::new(); 23];
+        let mut at: Vec<(*mut ERec, u32)> = Vec::new();
+        for i in 0..400_000u32 {
+            let b = r.below(23);
+            if r.below(2) == 0 {
+                let rec = ERec { person: i, ts: r.next() as u32, pay: b as u32 };
+                at.push((s12[b].push(&mut arena, EV_BLOCK, rec), i));
+                want12[b].push((rec.person, rec.ts, rec.pay));
+            } else {
+                let rec = LRec { key: r.next(), ingest: i as i64, loc: b as u64 };
+                s24[b].push(&mut arena, LG_BLOCK, rec);
+                want24[b].push((rec.key, rec.ingest, rec.loc));
+            }
+        }
+        sfence();
+        s12.iter_mut().for_each(Stream::finish);
+        s24.iter_mut().for_each(Stream::finish);
+        for b in 0..23 {
+            let got: Vec<_> = s12[b].slices(EV_BLOCK).flatten().map(|r| (r.person, r.ts, r.pay)).collect();
+            assert_eq!(got, want12[b]);
+            assert_eq!(s12[b].len(EV_BLOCK), want12[b].len());
+            let got: Vec<_> = s24[b].slices(LG_BLOCK).flatten().map(|r| (r.key, r.ingest, r.loc)).collect();
+            assert_eq!(got, want24[b]);
+        }
+        assert!(at.iter().all(|&(p, i)| unsafe { (*p).person } == i));
     }
 
     #[test]
@@ -3039,7 +3223,7 @@ mod tests {
                 for_records::<7>(file, w[0], w[1], |f| event_fields(&c, f, &mut b));
                 b.flush(&c, true);
             }
-            let (fa, fb) = (flat(&a), flat(&b));
+            let (fa, fb) = (flat(&mut a), flat(&mut b));
             kept += fb.0.len();
             assert!(fa == fb, "round {round}: fast parse differs\n{}", std::str::from_utf8(file).unwrap());
         }

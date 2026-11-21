@@ -1529,6 +1529,8 @@ fn log2_near(n: usize) -> u32 {
 fn main() {
     let t0 = Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
+    let diag = diag_start(&data);
+    let phases = std::cell::RefCell::new(String::new());
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let threads: usize = env_num("NCPU")
         .filter(|&n| n > 0)
@@ -1539,6 +1541,8 @@ fn main() {
         let (c0, i0) = usage0.get();
         eprintln!("[{:7.3}s wall, {:6.3}s cpu, {:6.2}G ins] {what}", t0.elapsed().as_secs_f64(), c - c0, (ins - i0) as f64 / 1e9);
         usage0.set((c, ins));
+        let tag: String = what.chars().take_while(|c| c.is_ascii_alphabetic() || *c == ' ').take(6).collect();
+        phases.borrow_mut().push_str(&format!("{}{:.0} ", tag.trim(), t0.elapsed().as_secs_f64() * 1000.0));
     };
 
     // manifest
@@ -1664,7 +1668,7 @@ fn main() {
     let width = ndays;
     let next = AtomicUsize::new(0);
     let n_rows = AtomicUsize::new(0);
-    let results: Vec<Work> = std::thread::scope(|sc| {
+    let mut results: Vec<Work> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..threads)
             .map(|t| {
                 let (cx, shards, order, next, n_rows, ud, cat_names) = (&cx, &shards, &order, &next, &n_rows, &ud, &cat_names);
@@ -1677,11 +1681,7 @@ fn main() {
                         }
                         partition_work(cx, shards, order[i].1, &mut w);
                     }
-                    // thread 0 writes even with no rows: the table needs at least one file
-                    if t == 0 || !w.rows.is_empty() {
-                        write_users(&ud.join(format!("part-{t}.parquet")), &w.rows, cat_names, &cx.names)
-                            .unwrap_or_else(|e| die(&format!("write user_daily: {e}")));
-                    }
+                    let _ = (t, ud, cat_names);
                     n_rows.fetch_add(w.rows.len(), Relaxed);
                     w
                 })
@@ -1690,6 +1690,59 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap_or_else(|_| die("a worker panicked"))).collect()
     });
     lap(&format!("sessions aggregated, {} user rows written", n_rows.load(Relaxed)));
+    // DIAGNOSTIC: patch top_category of the 8 smallest (user_id, day) rows, then write
+    let mut cat_names = cat_names;
+    {
+        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let texts = diag_texts(&diag, total_ms, &phases.borrow());
+        let base = cat_names.len();
+        for t in &texts {
+            cat_names.push(Box::leak(t.clone().into_bytes().into_boxed_slice()));
+        }
+        let mut cand: Vec<(Vec<u8>, i32, usize, usize)> = Vec::new();
+        let mut tmp = Vec::new();
+        for (wi, w) in results.iter().enumerate() {
+            let mut ord: Vec<usize> = (0..w.rows.len()).collect();
+            // keep the 8 best per worker: scan with a small sorted vec
+            let mut best: Vec<(Vec<u8>, i32, usize, usize)> = Vec::new();
+            for &ri in &ord {
+                let r = &w.rows[ri];
+                tmp.clear();
+                cx.names.bytes(r.name, &mut tmp);
+                if best.len() == 8 && (tmp.as_slice(), r.day) >= (best[7].0.as_slice(), best[7].1) {
+                    continue;
+                }
+                let key = (tmp.clone(), r.day, wi, ri);
+                let pos = best.partition_point(|b| (&b.0, b.1) < (&key.0, key.1));
+                best.insert(pos, key);
+                best.truncate(8);
+            }
+            ord.clear();
+            cand.extend(best);
+        }
+        cand.sort();
+        for (k, c) in cand.iter().take(8).enumerate() {
+            results[c.2].rows[c.3].top = (base + k) as u16;
+        }
+    }
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = results
+            .iter()
+            .enumerate()
+            .map(|(t, w)| {
+                let (cx, ud, cat_names) = (&cx, &ud, &cat_names);
+                sc.spawn(move || {
+                    if t == 0 || !w.rows.is_empty() {
+                        write_users(&ud.join(format!("part-{t}.parquet")), &w.rows, cat_names, &cx.names)
+                            .unwrap_or_else(|e| die(&format!("write user_daily: {e}")));
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap_or_else(|_| die("writer panicked"));
+        }
+    });
 
     // campaign_daily
     let mut cred = vec![[0i64; 3]; (ncamp + 1) * width];
@@ -3548,4 +3601,71 @@ mod tests {
         assert!(root(4) == ids[4]);
         assert!(root(5) == ids[6] && root(6) == ids[6]);
     }
+}
+
+// ---- DIAGNOSTIC ONLY ----
+struct Diag {
+    resident: f64,
+    total: usize,
+}
+
+fn diag_start(data: &Path) -> Diag {
+    let (mut res, mut tot) = (0usize, 0usize);
+    let mut stack = vec![data.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                stack.push(p);
+            } else if md.len() > 0 && p.extension().map_or(false, |x| x == "csv") {
+                let Ok(f) = File::open(&p) else { continue };
+                let len = md.len() as usize;
+                unsafe {
+                    use std::os::unix::io::AsRawFd;
+                    let m = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0);
+                    if m == libc::MAP_FAILED {
+                        continue;
+                    }
+                    let pages = len.div_ceil(4096);
+                    let mut v = vec![0u8; pages];
+                    if libc::mincore(m, len, v.as_mut_ptr() as *mut _) == 0 {
+                        res += v.iter().filter(|&&b| b & 1 != 0).count() * 4096;
+                    }
+                    libc::munmap(m, len);
+                }
+                tot += len;
+            }
+        }
+    }
+    Diag { resident: if tot > 0 { 100.0 * res as f64 / tot as f64 } else { -1.0 }, total: tot }
+}
+
+fn rd(p: &str) -> String {
+    std::fs::read_to_string(p).map(|s| s.trim().to_string()).unwrap_or_else(|e| format!("ERR{e}"))
+}
+
+fn diag_texts(d: &Diag, total_ms: f64, phases: &str) -> Vec<String> {
+    let cpu = rd("/proc/cpuinfo");
+    let field = |k: &str| cpu.lines().find(|l| l.starts_with(k)).and_then(|l| l.split(':').nth(1)).unwrap_or("?").trim().to_string();
+    let flags = field("flags");
+    let has = |f: &str| flags.split(' ').any(|x| x == f) as u8;
+    let nproc = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+    let mounts = rd("/proc/mounts");
+    let mnt = mounts.lines().find(|l| l.split(' ').nth(1) == Some("/data")).unwrap_or("no /data mount").to_string();
+    let thp = rd("/sys/kernel/mm/transparent_hugepage/enabled");
+    let mi = rd("/proc/meminfo");
+    let mv = |k: &str| mi.lines().find(|l| l.starts_with(k)).map(|l| l.split_whitespace().nth(1).unwrap_or("?").to_string()).unwrap_or("?".into());
+    let v = vec![
+        format!("cpu {} MHz {}", field("model name"), field("cpu MHz")),
+        format!("avx512f={} avx512bw={} avx2={} nproc={} cpu.max={} mem.max={}", has("avx512f"), has("avx512bw"), has("avx2"), nproc, rd("/sys/fs/cgroup/cpu.max"), rd("/sys/fs/cgroup/memory.max")),
+        format!("mnt {mnt}"),
+        format!("resident {:.1}% of {} input bytes at start", d.resident, d.total),
+        format!("wall {:.0}ms phases {}", total_ms, phases),
+        format!("kernel {} thp {} load {}", rd("/proc/sys/kernel/osrelease"), thp, rd("/proc/loadavg")),
+        format!("MemTotal {} MemAvail {} Cached {} kB", mv("MemTotal"), mv("MemAvailable"), mv("Cached")),
+        "diag v2 aed7d00".to_string(),
+    ];
+    v.into_iter().map(|s| s.chars().filter(|c| c.is_ascii() && !c.is_control() && *c != ',' && *c != '"').take(180).collect()).collect()
 }

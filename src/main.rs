@@ -1163,11 +1163,13 @@ fn uncached(f: &InFile, off: usize) -> bool {
     unsafe { libc::preadv2(f.f.as_raw_fd(), &iov, 1, off as libc::off_t, libc::RWF_NOWAIT) != 1 }
 }
 
+const READ_AHEAD_THREADS: usize = 2;
+
 /// Cold page cache: asks the kernel for the whole input at once, in the order it will be parsed, from a few
 /// threads of their own, so the disk works at full speed from the first moment whatever the parse is doing.
 /// An input that is cached already (16 probes all answer without the disk) is left alone.
 #[cfg(target_os = "linux")]
-fn read_ahead(queue: Vec<(&'static InFile, usize, usize)>, threads: usize) {
+fn read_ahead(queue: Vec<(&'static InFile, usize, usize)>, _threads: usize) {
     use std::os::unix::io::AsRawFd;
     let n = queue.len();
     if n == 0 || !(0..16).any(|i| uncached(queue[i * n / 16].0, (queue[i * n / 16].1 + queue[i * n / 16].2) / 2)) {
@@ -1175,9 +1177,7 @@ fn read_ahead(queue: Vec<(&'static InFile, usize, usize)>, threads: usize) {
     }
     let queue = std::sync::Arc::new(queue);
     let next = std::sync::Arc::new(AtomicUsize::new(0));
-    // two threads: the kernel takes each 128 KiB hint at once, so more only crowd the parse threads (box, cold, 20M:
-    // 1 thread 0.41 s, 2 threads 0.40 s, 3 threads 0.45 s, 4 threads 0.49 s, 16 sendfile threads 0.48 s)
-    for _ in 0..threads.div_ceil(4) {
+    for _ in 0..READ_AHEAD_THREADS {
         let (queue, next) = (queue.clone(), next.clone());
         // never joined: these only start reads, and the end of the process ends them. A thread that cannot start,
         // or a hint the kernel refuses, costs speed only: every byte is still read by `read_span`.
@@ -1187,11 +1187,13 @@ fn read_ahead(queue: Vec<(&'static InFile, usize, usize)>, threads: usize) {
                 break;
             }
             let (f, s, e) = queue[i];
-            // 128 KiB a call: the kernel caps one request at its readahead size
+            // readahead(2) in 512 KiB calls: cold A/B on 20M (drop_caches before every run), median of 16:
+            // 2 threads x 512 KiB 444 ms, 1 thread fadvise 449, 4 threads x 128 KiB fadvise 469. Calls of 1.5 MiB and
+            // up were much slower on another disk (the kernel stops queueing them as one read)
             let mut o = s;
             while o < e {
-                let l = (e - o).min(128 << 10);
-                unsafe { libc::posix_fadvise(f.f.as_raw_fd(), o as libc::off_t, l as libc::off_t, libc::POSIX_FADV_WILLNEED) };
+                let l = (e - o).min(512 << 10);
+                unsafe { libc::readahead(f.f.as_raw_fd(), o as libc::off64_t, l) };
                 o += l;
             }
         });

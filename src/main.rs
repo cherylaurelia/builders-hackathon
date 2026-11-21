@@ -1002,8 +1002,14 @@ unsafe impl Send for Table {}
 impl Table {
     fn new(cap: usize) -> Table {
         assert!(cap.is_power_of_two() && cap >= 1024 && cap < (1 << 31));
+        let slots = map_zeroed(cap * 16);
+        // every event does one random lookup here: huge pages keep the TLB walks (and stalled prefetches) away
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::madvise(slots as *mut libc::c_void, cap * 16, libc::MADV_HUGEPAGE);
+        }
         Table {
-            slots: map_zeroed(cap * 16) as *mut Slot,
+            slots: slots as *mut Slot,
             keys: map_zeroed(cap * 16) as *mut SStr,
             best: map_zeroed(cap * 4) as *mut AtomicU32,
             cap,

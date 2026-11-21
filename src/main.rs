@@ -2246,7 +2246,9 @@ fn main() {
                         write_users(&path, &[], cat_names, &cx.names).unwrap_or_else(|e| die(&format!("write user_daily: {e}")));
                     }
                     n_rows.fetch_add(w.file.n, Relaxed);
-                    w
+                    // this thread gives its own buffers back (rows, events, clicks) instead of leaving them to the exit:
+                    // the kernel would free them all on one thread while the run waits
+                    drop(w);
                 })
             })
             .collect();
@@ -2277,8 +2279,10 @@ fn main() {
             }
         }
         write_camps(&cd.join("part-0.parquet"), &camp_rows).unwrap_or_else(|e| die(&format!("write campaign_daily: {e}")));
-        let results: Vec<Work> = hs.into_iter().map(|h| h.join().unwrap_or_else(|_| die("a worker panicked"))).collect();
-        (camp_rows, results)
+        for h in hs {
+            h.join().unwrap_or_else(|_| die("a worker panicked"));
+        }
+        camp_rows
     });
     lap(&format!("sessions aggregated, {} user rows and {} campaign rows written", n_rows.load(Relaxed), camp_rows.len()));
     // every worker is joined: the records and the ID table have been read for the last time, so their memory goes back

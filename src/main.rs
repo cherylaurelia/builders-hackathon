@@ -416,11 +416,13 @@ fn prefetch<T>(p: *const T) {
 // ---------------------------------------------------------------- the ID table
 
 /// One user ID. `up` = 0: the ID is its own person (or the root of its link tree); else 1 + the slot above it.
+/// `px` = this slot's number xor its person's, once the links are flattened: 0 for a root and for every ID added
+/// later, so a lookup turns a slot into a person with one xor and no branch.
 #[repr(C)]
 struct Slot {
     key: AtomicU64,
     up: AtomicU32,
-    _pad: u32,
+    px: AtomicU32,
 }
 
 /// Every user ID seen in links, events and clicks: open addressing on the key, lock free, never resized.
@@ -457,9 +459,10 @@ impl IdTable {
         );
     }
 
+    /// Where the search for `key` starts: the first slot of a cache line (4 slots).
     #[inline(always)]
     fn home(&self, key: u64) -> usize {
-        (mix(key) >> (64 - self.bits)) as usize
+        (mix(key) >> (64 - self.bits)) as usize & !3
     }
 
     /// `home(key)`, with its cache line on the way: the lookup comes a few lines of input later.
@@ -476,9 +479,26 @@ impl IdTable {
         self.slot_from(self.home(key) as u32, key, ins)
     }
 
-    /// `slot` given `home(key)`.
+    /// `slot` given `home(key)`. A key sits in the first free slot from its home at the time it was added, and
+    /// slots never empty again, so it is in the four slots of its home line unless the line was full by then:
+    /// those four are compared without a branch between them (which of them holds the key is a coin toss to the
+    /// branch predictor), and only a key not among them takes the scan.
     #[inline(always)]
     fn slot_from(&self, home: u32, key: u64, ins: &mut usize) -> u32 {
+        // SAFETY: home is a multiple of 4 below the (power of two, >= 2^16) slot count
+        let s = unsafe { self.slots.as_ptr().add(home as usize) };
+        let eq = |j: usize| (unsafe { (*s.add(j)).key.load(Relaxed) } == key) as u32;
+        let m = eq(0) | eq(1) << 1 | eq(2) << 2 | eq(3) << 3;
+        if m != 0 {
+            return home + m.trailing_zeros();
+        }
+        self.slot_scan(home, key, ins)
+    }
+
+    /// `slot_from` for a key that is not in its home line (yet): linear probing from `home`, adding the key in the
+    /// first free slot.
+    #[inline(never)]
+    fn slot_scan(&self, home: u32, key: u64, ins: &mut usize) -> u32 {
         let mask = self.slots.len() - 1;
         let mut i = home as usize;
         loop {
@@ -517,10 +537,7 @@ impl IdTable {
     /// The person of the ID in `slot`, once the links are flattened.
     #[inline(always)]
     fn person(&self, slot: u32) -> u32 {
-        match unsafe { self.slots.get_unchecked(slot as usize) }.up.load(Relaxed) {
-            0 => slot,
-            u => u - 1,
-        }
+        slot ^ unsafe { self.slots.get_unchecked(slot as usize) }.px.load(Relaxed)
     }
 
     /// The root above `x`, halving the path on the way.
@@ -1934,7 +1951,9 @@ fn build_links(ids: &IdTable, names: &Interner, files: &[InFile], threads: usize
                 }
                 if ids.slots[i].up.load(Relaxed) != 0 {
                     // i hangs under something, so its root is another slot
-                    ids.slots[i].up.store(ids.find(i as u32) + 1, Relaxed);
+                    let root = ids.find(i as u32);
+                    ids.slots[i].up.store(root + 1, Relaxed);
+                    ids.slots[i].px.store(i as u32 ^ root, Relaxed);
                 }
             }
         },

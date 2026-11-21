@@ -824,6 +824,7 @@ struct EvParse {
     ub: Vec<Vec<UEvent>>,
     bad: Vec<(Packed, i64)>, // (event_id, ingest_ts) of invalid or late lines: they still win dedup
     eb: Vec<Vec<ERec>>,
+    ck: Vec<Vec<PClick>>, // this thread's valid clicks, by user_id bucket
 }
 
 /// A surviving event, routed to its person's bucket.
@@ -861,13 +862,13 @@ fn to_pevents(v: Vec<UEvent>, mut f: impl FnMut(&UEvent) -> Option<PEvent>) -> V
     unsafe { Vec::from_raw_parts(dst, k, bytes / size_of::<PEvent>()) }
 }
 
-/// A valid click, routed to its person's bucket.
+/// A valid click, routed to its person's bucket: 40 bytes.
 #[derive(Clone, Copy)]
 struct PClick {
     nh: u64,
     name: SStr,
-    ts: i64,
-    cid: Bytes,
+    cid: Packed,
+    ts: u32, // ms since ws - WEEK: a click ts is in [ws - WEEK, we)
     camp: u16,
 }
 
@@ -975,29 +976,41 @@ fn main() {
 
     // 2. events: parse. A valid, non-late event goes to its user_id bucket; an invalid one to a side list.
     //    Every event also leaves a (hash(event_id), location) record in its event_id bucket.
+    //    The click chunks are the last tasks of the same par: nothing about clicks waits for dedup, and the
+    //    small last tasks even out the threads' finishing times.
     let ev_files = csv_files(&data.join("events"));
     let ev_chunks = chunks(&ev_files);
     let ev_est = ev_files.iter().map(|f| f.len()).sum::<usize>() / 60; // lines are ~75 bytes
+    let ck_files = csv_files(&data.join("clicks"));
+    let ck_chunks = chunks(&ck_files);
+    let ck_est = ck_files.iter().map(|f| f.len()).sum::<usize>() / 40; // lines are ~50 bytes
     let tid = AtomicUsize::new(0);
     let mut parsed = par(
         threads,
-        ev_chunks.len(),
+        ev_chunks.len() + ck_chunks.len(),
         || EvParse {
             t: tid.fetch_add(1, Relaxed),
             ub: sized::<UEvent>(UB, ev_est, threads),
             bad: Vec::new(),
             eb: sized::<ERec>(EB, ev_est, threads),
+            ck: sized::<PClick>(UB, ck_est, threads),
         },
         |st, i| {
-            let (f, s, e) = ev_chunks[i];
-            parse_events(&ctx, f, s, e, st);
+            if i < ev_chunks.len() {
+                let (f, s, e) = ev_chunks[i];
+                parse_events(&ctx, f, s, e, st);
+            } else {
+                let (f, s, e) = ck_chunks[i - ev_chunks.len()];
+                parse_clicks(&ctx, f, s, e, &mut st.ck);
+            }
         },
     );
     parsed.sort_by_key(|p| p.t); // locations name threads by t
     if parsed.len() > 127 {
         die("too many threads");
     }
-    lap("events parsed");
+    let clicks: Vec<Vec<Vec<PClick>>> = parsed.iter_mut().map(|p| std::mem::take(&mut p.ck)).collect();
+    lap("events and clicks parsed");
 
     // 3. duplicates: per event_id bucket, find hashes seen more than once (2-4% of events). Among the copies of
     //    one event_id the smallest ingest_ts is kept, so every other valid copy is marked dropped.
@@ -1073,21 +1086,6 @@ fn main() {
     .map(|x| x.3)
     .sum();
     lap(&format!("duplicates marked: {n_dups} copies share a hash"));
-
-    // 4. clicks
-    let ck_files = csv_files(&data.join("clicks"));
-    let ck_chunks = chunks(&ck_files);
-    let ck_est = ck_files.iter().map(|f| f.len()).sum::<usize>() / 40; // lines are ~50 bytes
-    let clicks = par(
-        threads,
-        ck_chunks.len(),
-        || sized::<PClick>(UB, ck_est, threads),
-        |out, i| {
-            let (f, s, e) = ck_chunks[i];
-            parse_clicks(&ctx, f, s, e, out);
-        },
-    );
-    lap("clicks parsed");
 
     // 4b. per user_id bucket, which is also the person bucket of an unlinked ID: user_id -> person through that
     //     bucket's slice of the link table. Events and clicks stay where they are, rewritten in place, unless
@@ -1595,7 +1593,7 @@ fn parse_click(ctx: &Ctx, [cid, uid, camp, ts]: [Bytes; 4]) -> Option<PClick> {
     }
     let camp = *ctx.campaigns.get(camp)?;
     // routed by user_id for now; phase 4b swaps in the person
-    Some(PClick { nh: hash_bytes(uid), name: SStr::new(uid), ts: t, cid, camp })
+    Some(PClick { nh: hash_bytes(uid), name: SStr::new(uid), cid: Packed::new(cid), ts: (t - (ctx.ws - WEEK)) as u32, camp })
 }
 
 /// Parses the click lines that start in [start, end) of `file` (header skipped) into `out`, bucketed by user_id.
@@ -1684,7 +1682,8 @@ unsafe fn fast_click(ctx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, out
         let u = std::slice::from_raw_parts(up, ul);
         (hash_bytes(u), SStr::new(u))
     };
-    out[uid_bucket(nh)].push(PClick { nh, name, ts: t, cid: std::slice::from_raw_parts(cp, cl), camp });
+    let cid = Packed::new(std::slice::from_raw_parts(cp, cl));
+    out[uid_bucket(nh)].push(PClick { nh, name, cid, ts: (t - (ctx.ws - WEEK)) as u32, camp });
 }
 
 struct Agg {
@@ -2061,7 +2060,7 @@ fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<
     for t in clicks {
         for c in &t[p] {
             if let Some(id) = person_find(&agg.pslots, &agg.pnames, c.nh, &c.name) {
-                agg.ctmp.push(CTmp { pc: (id as u64) << 16 | c.camp as u64, cid: Packed::new(c.cid), ts: (c.ts - base) as u32 });
+                agg.ctmp.push(CTmp { pc: (id as u64) << 16 | c.camp as u64, cid: c.cid, ts: c.ts });
                 agg.cstart[id as usize + 2] += 1;
             }
         }

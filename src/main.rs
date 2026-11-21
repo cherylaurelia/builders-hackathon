@@ -713,6 +713,7 @@ impl IdTable {
     /// slots never empty again, so it is in the four slots of its home line unless the line was full by then:
     /// those four are compared without a branch between them (which of them holds the key is a coin toss to the
     /// branch predictor), and only a key not among them takes the scan.
+    #[cfg(test)]
     #[inline(always)]
     fn slot_from(&self, home: u32, key: u64, ins: &mut usize) -> u32 {
         // SAFETY: home is a multiple of 4 below the (power of two, >= 2^16) slot count
@@ -763,6 +764,45 @@ impl IdTable {
             return None;
         }
         Some(self.slot_scan(home, key, ins))
+    }
+
+    /// `slot_in_line` for a key that is probably new (the link builder): a key that is not in its home line goes
+    /// straight into the line's first empty slot as it was read, without a second look at the slots before it
+    /// (each holds another key, for good). When another thread takes that slot first, `slot_scan` goes on from it:
+    /// it may hold this very key now.
+    #[inline(always)]
+    fn slot_new_in_line(&self, home: u32, key: u64, ins: &mut usize) -> Option<u32> {
+        // SAFETY: as in `slot_from`
+        let s = unsafe { self.slots.as_ptr().add(home as usize) };
+        let (eq, empty): (u32, u32);
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        // SAFETY: as in `slot_in_line`
+        unsafe {
+            use std::arch::x86_64::*;
+            let (a, b) = (_mm256_loadu_si256(s as *const __m256i), _mm256_loadu_si256((s as *const __m256i).add(1)));
+            // bits 0 and 2 of a half are its two keys: slot j of the line at bit 2 * j
+            let m = |x: __m256i| (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, x))) & 5 | (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, x))) & 5) << 4) as u32;
+            (eq, empty) = (m(_mm256_set1_epi64x(key as i64)), m(_mm256_setzero_si256()));
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        {
+            let k = [0, 1, 2, 3].map(|j| unsafe { (*s.add(j)).key.load(Relaxed) });
+            let m = |x: u64| (k[0] == x) as u32 | ((k[1] == x) as u32) << 2 | ((k[2] == x) as u32) << 4 | ((k[3] == x) as u32) << 6;
+            (eq, empty) = (m(key), m(0));
+        }
+        if eq != 0 {
+            return Some(home + eq.trailing_zeros() / 2);
+        }
+        if empty == 0 {
+            return None;
+        }
+        let j = empty.trailing_zeros() / 2;
+        // SAFETY: j < 4, a slot of the line
+        if unsafe { (*s.add(j as usize)).key.compare_exchange(0, key, Relaxed, Relaxed) }.is_ok() {
+            self.added(ins);
+            return Some(home + j);
+        }
+        Some(self.slot_scan(home + j, key, ins))
     }
 
     /// The line after the one at `home`, with its cache line on the way.
@@ -918,6 +958,7 @@ fn split<const N: usize>(line: &'static [u8]) -> Option<[Bytes; N]> {
 }
 
 /// Bit k set when b[k] is `,`, `"` or `\n`, for the first min(64, len) bytes.
+#[cfg(test)]
 #[inline(always)]
 fn special_mask(b: &[u8]) -> u64 {
     if b.len() < 64 {
@@ -1036,7 +1077,9 @@ unsafe fn masks32(p: *const u8) -> [u64; 3] {
 }
 
 /// Calls `f` with the N unquoted fields of every well-formed line that starts in [start, end)
-/// of `file`, skipping the header line. Same dialect as `split`, in one SIMD pass over the chunk.
+/// of `file`, skipping the header line. Same dialect as `split`, in one SIMD pass over the chunk. The tests'
+/// reference for the parsers.
+#[cfg(test)]
 #[inline]
 #[allow(unused_assignments)]
 fn for_records<const N: usize>(file: Bytes, start: usize, end: usize, mut f: impl FnMut([Bytes; N])) {
@@ -1900,6 +1943,25 @@ unsafe fn split_click(line: *const u8) -> Option<(Cut, usize)> {
     Some((Cut { s, e }, b3.trailing_zeros() as usize + 1))
 }
 
+/// `split::<2>` of the link line at `line` (72 bytes must be readable), as `split_click`: its two fields, and its
+/// length with its `\n`. None unless the whole line is in its first 64 bytes.
+#[inline(always)]
+unsafe fn split_link(line: *const u8) -> Option<(Cut, usize)> {
+    let [c, q, n] = masks64(line);
+    let b = c | n;
+    let b1 = drop_low(b);
+    if b1 == 0 {
+        return None;
+    }
+    let m = b1 ^ b1.wrapping_sub(1); // through the second boundary
+    let (s, e, bad) = window(b & m, q & m);
+    // the first boundary is a comma, the second the newline
+    if ((n & m) ^ (b1 & b1.wrapping_neg())) | bad != 0 {
+        return None;
+    }
+    Some((Cut { s, e }, b1.trailing_zeros() as usize + 1))
+}
+
 /// (user + sys CPU seconds, instructions retired) of this process so far; instructions only on macOS
 fn usage() -> (f64, u64) {
     let mut u: libc::rusage = unsafe { std::mem::zeroed() };
@@ -2047,9 +2109,6 @@ struct Batch {
     tx: [u64; BATCH],   // ts (ms after `Ctx::base`) << 32 | pay, or campaign
     home: [u32; BATCH], // where the search for `ukey` starts
 }
-
-/// Lines between asking for an ID's cache line and using it (the link builder's ring).
-const RING: usize = 16;
 
 /// One parse thread's output.
 struct Shard {
@@ -2707,94 +2766,187 @@ fn small_tables(data: &Path) -> Small {
     Small { products: IdMap::new(&products), campaigns: IdMap::new(&campaigns).with_short(&campaigns), cat_names, cat_rank, unknown_cat, camp_ids, camp_channel }
 }
 
+/// Link lines whose IDs are on their way from the ID table at a time (`LinkBatch`).
+const LINKS: usize = 32;
+
+/// The link lines a thread has parsed whose IDs wait for their lines of the ID table (`IdTable::aim`), as the
+/// events of a `Batch` do: when LINKS of them wait, `join` adds their IDs and joins them.
+struct LinkBatch {
+    n: usize,
+    key: [[u64; 2]; LINKS],
+    home: [[u32; 2]; LINKS],
+    ins: usize,
+    lines: usize,
+}
+
+impl LinkBatch {
+    fn new() -> LinkBatch {
+        LinkBatch { n: 0, key: [[0; 2]; LINKS], home: [[0; 2]; LINKS], ins: 0, lines: 0 }
+    }
+
+    /// A link line with the IDs `ka` and `kb` joins the batch.
+    #[inline(always)]
+    fn push(&mut self, ids: &IdTable, names: &Interner, ka: u64, kb: u64) {
+        let i = self.n;
+        // SAFETY: n < LINKS between calls: a full batch is joined at once
+        unsafe {
+            *self.key.get_unchecked_mut(i) = [ka, kb];
+            *self.home.get_unchecked_mut(i) = [ids.aim(ka), ids.aim(kb)];
+        }
+        self.n = i + 1;
+        self.lines += 1;
+        if i + 1 == LINKS {
+            self.join(ids, names);
+        }
+    }
+
+    /// Adds the IDs of the waiting lines to the table and joins the two of each line. Call when the batch is full
+    /// and at the end of every chunk.
+    ///
+    /// Three passes, so nothing waits on a chain of memory: the IDs become slots (an ID that is not in its home
+    /// line and finds it full asks for the next line and is looked up from there after the others), then what each
+    /// slot hangs under is asked for, then the lines are joined.
+    #[inline(never)]
+    fn join(&mut self, ids: &IdTable, names: &Interner) {
+        let n = self.n.min(LINKS);
+        self.n = 0;
+        let mut slot = [[0u32; 2]; LINKS];
+        let mut late = [0u8; 2 * LINKS];
+        let mut nl = 0;
+        for i in 0..n {
+            for j in 0..2 {
+                match ids.slot_new_in_line(self.home[i][j], self.key[i][j], &mut self.ins) {
+                    Some(s) => slot[i][j] = s,
+                    None => {
+                        self.home[i][j] = ids.next_line(self.home[i][j]);
+                        late[nl] = (2 * i + j) as u8;
+                        nl += 1;
+                    }
+                }
+            }
+        }
+        for &t in &late[..nl] {
+            let (i, j) = (t as usize / 2, t as usize % 2);
+            // its home line holds four other keys for good, so the search may start at the line after it
+            slot[i][j] = ids.slot_scan(self.home[i][j], self.key[i][j], &mut self.ins);
+        }
+        for s in slot[..n].iter().flatten() {
+            let u = ids.slots[*s as usize].up.load(Relaxed);
+            if u != 0 {
+                prefetch(&ids.slots[u as usize - 1]);
+            }
+        }
+        for &[x, y] in &slot[..n] {
+            if x != y {
+                ids.union(names, x, y);
+            }
+        }
+    }
+}
+
+/// Bit 4 * j + 2 set when slot `i + j` of the table hangs under another (its `up` is not 0), for j in 0..4; `i` is
+/// the first slot of a cache line.
+#[inline(always)]
+fn linked4(ids: &IdTable, i: usize) -> u32 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    // SAFETY: the line is 64 readable bytes (4 slots of 16, the table starts on a page); each `up` is read whole
+    unsafe {
+        use std::arch::x86_64::*;
+        let s = ids.slots.as_ptr().add(i) as *const __m256i;
+        let z = _mm256_setzero_si256();
+        // a slot is two keys' worth of 32-bit words: key, key, up, px
+        let m = |x: __m256i| _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(x, z))) as u32;
+        return !(m(_mm256_loadu_si256(s)) | m(_mm256_loadu_si256(s.add(1))) << 8) & 0x4444;
+    }
+    #[allow(unreachable_code)]
+    (0..4).fold(0, |m, j| m | ((ids.slots[i + j].up.load(Relaxed) != 0) as u32) << (4 * j + 2))
+}
+
 /// rules.md "Linked IDs": every link line joins its two IDs in the ID table. Returns the number of lines joined.
 fn build_links(ids: &IdTable, names: &Interner, files: &[InFile], threads: usize) -> usize {
     let mut work = Vec::new();
     chunks_of(0, files, 128 << 10, &mut work);
-    // A. parse, add both IDs, join them
-    //    in three steps HALF lines apart, so the cache lines each step needs are on their way before it:
-    //    keys -> (aim) -> slots -> (aim at what they hang under) -> union
-    const HALF: usize = RING / 2;
+    // A. parse, add both IDs, join them: a batch of lines at a time (`LinkBatch`). A line that ends in its first
+    //    64 bytes is split with one mask per kind of byte (`split_link`), any other by `split`
     let parts = par(
         threads,
         work.len(),
-        || (Vec::<u8>::new(), 0usize, 0usize),
-        |(buf, lines, ins), i| {
+        || (Vec::<u8>::new(), LinkBatch::new()),
+        |(buf, bt), i| {
             let (_, fi, s, e) = work[i];
             let (len, start, end) = read_span(&files[fi], s, e, buf);
-            // SAFETY: the fields live in `buf`, which outlives this call; nothing keeps them
-            let text: Bytes = unsafe { std::mem::transmute(&buf[..len]) };
-            let mut keys = [(0u64, 0u64, 0u32, 0u32); HALF];
-            let mut ends = [(0u32, 0u32); HALF];
-            let mut n = 0usize;
-            let mut step = |n: usize, new: Option<(u64, u64)>, ins: &mut usize| {
-                let i = n % HALF;
-                if n >= 2 * HALF {
-                    let (x, y) = ends[i];
-                    if x != y {
-                        ids.union(names, x, y);
-                    }
-                }
-                if n >= HALF {
-                    let (ka, kb, ha, hb) = keys[i];
-                    if ka != 0 {
-                        let (x, y) = (ids.slot_from(ha, ka, ins), ids.slot_from(hb, kb, ins));
-                        for z in [x, y] {
-                            let u = ids.slots[z as usize].up.load(Relaxed);
-                            if u != 0 {
-                                prefetch(&ids.slots[u as usize - 1]);
+            let (base, text) = (buf.as_ptr(), &buf[..len]);
+            let first = start.saturating_sub(1);
+            if let Some(nl) = memchr::memchr(b'\n', &text[first..]) {
+                let mut p = first + nl + 1; // the header line is skipped
+                let stop = end.min(len);
+                while p < stop {
+                    // SAFETY: read_span leaves PAD readable bytes of `buf` past len: split_link reads 64 from the
+                    // line's start, and an ID's 9 bytes start before the line's end
+                    unsafe {
+                        let line = base.add(p);
+                        if let Some((mut f, n)) = split_link(line) {
+                            let ((sa, la), (sb, lb)) = (f.next(), f.next());
+                            if la != 0 && lb != 0 {
+                                bt.push(ids, names, names.key_at(line.add(sa), la), names.key_at(line.add(sb), lb));
                             }
+                            p += n;
+                            continue;
                         }
-                        ends[i] = (x, y);
-                    } else {
-                        ends[i] = (0, 0);
                     }
+                    let eol = memchr::memchr(b'\n', &text[p..]).map_or(len, |i| p + i);
+                    // SAFETY: the fields live in `buf`, which outlives this use; nothing keeps them
+                    if let Some([a, b]) = split::<2>(unsafe { std::mem::transmute::<&[u8], Bytes>(&text[p..eol]) }) {
+                        if !a.is_empty() && !b.is_empty() {
+                            bt.push(ids, names, names.key(a), names.key(b));
+                        }
+                    }
+                    p = eol + 1;
                 }
-                keys[i] = match new {
-                    Some((ka, kb)) => (ka, kb, ids.aim(ka), ids.aim(kb)),
-                    None => (0, 0, 0, 0),
-                };
-            };
-            for_records::<2>(text, start, end, |[a, b]| {
-                if a.is_empty() || b.is_empty() {
-                    return;
-                }
-                step(n, Some((names.key(a), names.key(b))), ins);
-                n += 1;
-                *lines += 1;
-            });
-            for _ in 0..2 * HALF {
-                step(n, None, ins);
-                n += 1;
             }
+            bt.join(ids, names);
         },
     );
-    // B. flatten, one pass over the table: every linked ID points straight at its root
+    // B. flatten, one pass over the table: every linked ID points straight at its root. The linked slots of a
+    //    stretch are found a cache line at a time and wait, what they hang under asked for, until WAIT of them do
     const SPAN: usize = 1 << 15;
-    const AHEAD: usize = 24;
+    const WAIT: usize = 32;
     let n = ids.slots.len();
     par(
         threads,
         n.div_ceil(SPAN),
         || (),
         |_, t| {
-            for i in t * SPAN..((t + 1) * SPAN).min(n) {
-                if i + AHEAD < n {
-                    let u = ids.slots[i + AHEAD].up.load(Relaxed);
-                    if u != 0 {
-                        prefetch(&ids.slots[u as usize - 1]);
-                    }
+            let mut wait = [(0u32, 0u32); WAIT + 4];
+            let mut nw = 0;
+            let settle = |wait: &[(u32, u32)]| {
+                for &(i, p) in wait {
+                    // i hangs under p, so its root is p or above it
+                    let root = if ids.slots[p as usize].up.load(Relaxed) == 0 { p } else { ids.find(p) };
+                    ids.slots[i as usize].up.store(root + 1, Relaxed);
+                    ids.slots[i as usize].px.store(i ^ root, Relaxed);
                 }
-                if ids.slots[i].up.load(Relaxed) != 0 {
-                    // i hangs under something, so its root is another slot
-                    let root = ids.find(i as u32);
-                    ids.slots[i].up.store(root + 1, Relaxed);
-                    ids.slots[i].px.store(i as u32 ^ root, Relaxed);
+            };
+            // the table is a power of two (>= 2^16) slots: whole lines of 4
+            for i in (t * SPAN..((t + 1) * SPAN).min(n)).step_by(4) {
+                let mut m = linked4(ids, i);
+                while m != 0 {
+                    let s = i + (m.trailing_zeros() >> 2) as usize;
+                    m &= m - 1;
+                    let p = ids.slots[s].up.load(Relaxed) - 1; // not 0: an ID that hangs under another does so for good
+                    prefetch(&ids.slots[p as usize]);
+                    wait[nw] = (s as u32, p);
+                    nw += 1;
+                }
+                if nw >= WAIT {
+                    settle(&wait[..nw]);
+                    nw = 0;
                 }
             }
+            settle(&wait[..nw]);
         },
     );
-    parts.iter().map(|p| p.1).sum()
+    parts.iter().map(|p| p.1.lines).sum()
 }
 
 /// rules.md "Events" 1, 3, 4 for one line given as its 7 fields: the generic path of `fast_event`.
@@ -5366,5 +5518,109 @@ mod tests {
         assert!(root(0) == ids[3] && root(1) == ids[3] && root(2) == ids[3] && root(3) == ids[3]);
         assert!(root(4) == ids[4]);
         assert!(root(5) == ids[6] && root(6) == ids[6]);
+    }
+
+    /// `build_links` against a plain union-find over the lines `split` takes: files larger than a chunk, IDs of
+    /// every kind (short, 9 bytes, long, not ASCII), quoted fields, self links, empty sides, malformed lines, lines
+    /// past the 64-byte masks, a file that is only its header and one without a last newline.
+    #[test]
+    fn link_files_join_people() {
+        let dir = std::env::temp_dir().join(format!("sessions-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = Rng(11);
+        let id = |r: &mut Rng| -> String {
+            let k = r.below(12_000);
+            match r.below(40) {
+                0 => format!("U{k:08}"),
+                1 => format!("u{}", k % 1000),
+                2 => format!("a-long-user-id-{k}"),
+                3 => format!("u\u{e9}{k:06}"),
+                _ => format!("u{k:08}"),
+            }
+        };
+        let mut texts = Vec::new();
+        for (f, lines) in [40_000, 0, 9_000, 25_000].into_iter().enumerate() {
+            let mut t = String::from("user_id_a,user_id_b\n");
+            for _ in 0..lines {
+                let (a, b) = (id(&mut r), id(&mut r));
+                let mut q = |v: &str| if r.below(5) == 0 { format!("\"{v}\"") } else { v.to_string() };
+                let (qa, qb) = (q(&a), q(&b));
+                t += &match r.below(60) {
+                    0 => format!("{a},{a}"),
+                    1 => format!(",{b}"),
+                    2 => format!("{a},"),
+                    3 => format!("{a},{b},{a}"),
+                    4 => format!("\"{a},{b}"),
+                    5 => String::new(),
+                    6 => a.clone(),
+                    7 => format!("{a},\"\""),
+                    8 => format!("{a} , {b}"),
+                    9 => format!("{a},{b}\r"),
+                    10 => format!("{a}{},{b}", "x".repeat(70)),
+                    11 => format!("{qa},{b}{}", "y".repeat(40)),
+                    _ => format!("{qa},{qb}"),
+                };
+                t.push('\n');
+            }
+            if f == 2 {
+                t.pop(); // no newline at the end of this file
+            }
+            std::fs::write(dir.join(format!("part-{f}.csv")), &t).unwrap();
+            texts.push(t);
+        }
+        // the reference: every line `split` takes with two non-empty IDs joins them
+        let mut num: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut up: Vec<usize> = Vec::new();
+        fn root(up: &mut [usize], mut x: usize) -> usize {
+            while up[x] != x {
+                up[x] = up[up[x]];
+                x = up[x];
+            }
+            x
+        }
+        let mut joined = 0;
+        for t in &texts {
+            let t: Bytes = Box::leak(t.clone().into_bytes().into_boxed_slice());
+            for line in t.split(|&c| c == b'\n').skip(1) {
+                let Some([a, b]) = split::<2>(line) else { continue };
+                if a.is_empty() || b.is_empty() {
+                    continue;
+                }
+                joined += 1;
+                let [x, y] = [a, b].map(|v| {
+                    let n = up.len();
+                    let i = *num.entry(v.to_vec()).or_insert(n);
+                    if i == n {
+                        up.push(n);
+                    }
+                    i
+                });
+                let (x, y) = (root(&mut up, x), root(&mut up, y));
+                up[x] = y;
+            }
+        }
+        let mut best: HashMap<usize, Vec<u8>> = HashMap::new();
+        for (v, &i) in &num {
+            let e = best.entry(root(&mut up, i)).or_insert_with(|| v.clone());
+            if v < e {
+                *e = v.clone();
+            }
+        }
+        assert!(joined > 60_000 && num.len() > 15_000 && best.len() > 100, "{joined} {} {}", num.len(), best.len());
+
+        let c = ctx();
+        let files = csv_files(&dir);
+        assert_eq!(files.len(), 4);
+        assert_eq!(build_links(&c.ids, &c.names, &files, 3), joined);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let mut ins = 0;
+        for (v, &i) in &num {
+            let person = c.ids.person(c.ids.slot(c.names.key(v), &mut ins));
+            let mut name = Vec::new();
+            c.names.bytes(c.ids.slots[person as usize].key.load(Relaxed), &mut name);
+            assert_eq!(&name, &best[&root(&mut up, i)], "ID {:?}", String::from_utf8_lossy(v));
+        }
+        assert_eq!(ins, 0, "an ID of the links was not in the table");
     }
 }

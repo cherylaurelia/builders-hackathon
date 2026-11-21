@@ -1632,6 +1632,7 @@ struct Work {
     cout: Vec<u64>,
     cinfo: Vec<(u16, Packed)>,
     lps: Vec<u32>,
+    tmp: Vec<u64>,
     sessions: Vec<Sess>,
     day_groups: Vec<(usize, usize)>,
     cats: Vec<(u16, i64)>,
@@ -1656,6 +1657,7 @@ impl Work {
             cout: Vec::new(),
             cinfo: Vec::new(),
             lps: Vec::new(),
+            tmp: Vec::new(),
             sessions: Vec::new(),
             day_groups: Vec::new(),
             cats: Vec::new(),
@@ -1671,8 +1673,37 @@ struct Sess {
     revenue: i64,
 }
 
+/// Sorts (ts << 32 | ref) keys by ts (the order of equal ts does not matter): insertion sort when short,
+/// a 3-pass LSD radix sort on the 31 ts bits when long.
 #[inline]
-fn sort_small(v: &mut [u64]) {
+fn sort_small(v: &mut [u64], tmp: &mut Vec<u64>) {
+    if v.len() > 192 {
+        tmp.clear();
+        tmp.resize(v.len(), 0);
+        let mut cnt = [0u32; 2048];
+        let (mut src, mut dst): (&mut [u64], &mut [u64]) = (v, &mut tmp[..]);
+        for shift in [32, 43, 54] {
+            cnt.fill(0);
+            for &x in src.iter() {
+                cnt[((x >> shift) & 2047) as usize] += 1;
+            }
+            let mut acc = 0u32;
+            for c in cnt.iter_mut() {
+                let t = *c;
+                *c = acc;
+                acc += t;
+            }
+            for &x in src.iter() {
+                let b = ((x >> shift) & 2047) as usize;
+                unsafe { *dst.get_unchecked_mut(cnt[b] as usize) = x };
+                cnt[b] += 1;
+            }
+            std::mem::swap(&mut src, &mut dst);
+        }
+        // three passes: the sorted keys are in tmp
+        dst.copy_from_slice(src);
+        return;
+    }
     if v.len() <= 24 {
         for i in 1..v.len() {
             unsafe {
@@ -1800,9 +1831,9 @@ fn person_bucket(ctx: &Ctx, tab: &Table, st: &[TS], drops: &[Vec<Vec<u32>>], b: 
         let lp = lp as usize;
         let (a, z) = (w.cnt[lp] as usize, w.cnt[lp + 1] as usize);
         let es = &mut ev[a..z];
-        sort_small(es);
+        sort_small(es, &mut w.tmp);
         let cs = &mut ck[w.ccnt[lp] as usize..w.ccnt[lp + 1] as usize];
-        sort_small(cs);
+        sort_small(cs, &mut w.tmp);
         person(ctx, tab.key(lp << 8 | b).sstr(), es, cs, w);
     }
     w.lps = lps;

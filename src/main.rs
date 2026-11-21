@@ -4213,6 +4213,20 @@ impl Thrift {
     }
 }
 
+/// Asks the kernel to start writing an output file's pages to its disk now, without waiting for them. Left to
+/// itself the kernel writes them when the container's cgroup is torn down, on one thread, after the program has
+/// ended and before `docker run` returns (GCP twin, /output on ext4, 22 MB at 20M events: 22 ms of 646). Asked for
+/// here, the work is done on the thread that wrote the file while the other threads still write theirs. Only a
+/// hint: where it does nothing or fails (tmpfs) the file is complete in the page cache all the same.
+#[cfg(target_os = "linux")]
+fn start_writeback(f: &std::fs::File) {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: a system call on an open descriptor; no memory is passed
+    let _hint_only = unsafe { libc::sync_file_range(f.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE) };
+}
+#[cfg(not(target_os = "linux"))]
+fn start_writeback(_f: &std::fs::File) {}
+
 const T_INT32: i32 = 1;
 const T_INT64: i32 = 2;
 const T_BYTES: i32 = 6;
@@ -4400,7 +4414,9 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
     t.b.extend_from_slice(&len.to_le_bytes());
     t.b.extend_from_slice(b"PAR1");
     out.extend_from_slice(&t.b);
-    f.write_all(&out)
+    f.write_all(&out)?;
+    start_writeback(&f);
+    Ok(())
 }
 
 fn plain_bytes<'a>(buf: &mut Vec<u8>, vals: impl Iterator<Item = &'a [u8]>) {

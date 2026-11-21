@@ -1753,10 +1753,14 @@ fn main() {
     let width = ndays;
     let next = AtomicUsize::new(0);
     let n_rows = AtomicUsize::new(0);
-    let results: Vec<Work> = std::thread::scope(|sc| {
+    // A thread that has emptied the queue hands its campaign cells to this thread, then writes its user file; this
+    // thread merges the cells and writes campaign_daily meanwhile instead of after the last file.
+    let (tx, rx) = std::sync::mpsc::channel::<(Vec<Cred>, Vec<u32>)>();
+    let (camp_rows, _results) = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..threads)
             .map(|t| {
                 let (cx, shards, order, next, n_rows, ud, cat_names) = (&cx, &shards, &order, &next, &n_rows, &ud, &cat_names);
+                let tx = tx.clone();
                 sc.spawn(move || {
                     let mut w = Work::new(cx);
                     loop {
@@ -1766,6 +1770,7 @@ fn main() {
                         }
                         partition_work(cx, shards, order[i].1, &mut w);
                     }
+                    tx.send((std::mem::take(&mut w.cred), std::mem::take(&mut w.assist))).unwrap_or_else(|_| die("campaign merger gone"));
                     // thread 0 writes even with no rows: the table needs at least one file
                     if t == 0 || !w.rows.is_empty() {
                         write_users(&ud.join(format!("part-{t}.parquet")), &w.rows, cat_names, &cx.names)
@@ -1776,36 +1781,37 @@ fn main() {
                 })
             })
             .collect();
-        hs.into_iter().map(|h| h.join().unwrap_or_else(|_| die("a worker panicked"))).collect()
-    });
-    lap(&format!("sessions aggregated, {} user rows written", n_rows.load(Relaxed)));
-
-    // campaign_daily
-    let mut cred = vec![[0i64; 3]; (ncamp + 1) * width];
-    let mut assist = vec![0i64; (ncamp + 1) * width];
-    for r in &results {
-        for (a, b) in cred.iter_mut().zip(&r.cred) {
-            a[0] += b.sessions as i64;
-            a[1] += b.purchasing as i64;
-            a[2] += b.revenue;
-        }
-        for (a, b) in assist.iter_mut().zip(&r.assist) {
-            *a += *b as i64;
-        }
-    }
-    let mut camp_rows = Vec::new();
-    for k in 0..=ncamp {
-        for d in 0..width {
-            let c = cred[k * width + d];
-            let a = assist[k * width + d];
-            if c[0] > 0 || a > 0 {
-                let (id, ch): (Bytes, Bytes) = if k == ncamp { (b"organic", b"organic") } else { (camp_ids[k], camp_channel[k]) };
-                camp_rows.push((id, ch, (day0 + d as i64) as i32, c[0], c[1], c[2], a));
+        drop(tx);
+        // campaign_daily
+        let mut cred = vec![[0i64; 3]; (ncamp + 1) * width];
+        let mut assist = vec![0i64; (ncamp + 1) * width];
+        for _ in 0..threads {
+            let (c, a) = rx.recv().unwrap_or_else(|_| die("a worker ended without its campaign cells"));
+            for (x, y) in cred.iter_mut().zip(&c) {
+                x[0] += y.sessions as i64;
+                x[1] += y.purchasing as i64;
+                x[2] += y.revenue;
+            }
+            for (x, y) in assist.iter_mut().zip(&a) {
+                *x += *y as i64;
             }
         }
-    }
-    write_camps(&cd.join("part-0.parquet"), &camp_rows).unwrap_or_else(|e| die(&format!("write campaign_daily: {e}")));
-    lap(&format!("written: {} campaign rows", camp_rows.len()));
+        let mut camp_rows = Vec::new();
+        for k in 0..=ncamp {
+            for d in 0..width {
+                let c = cred[k * width + d];
+                let a = assist[k * width + d];
+                if c[0] > 0 || a > 0 {
+                    let (id, ch): (Bytes, Bytes) = if k == ncamp { (b"organic", b"organic") } else { (camp_ids[k], camp_channel[k]) };
+                    camp_rows.push((id, ch, (day0 + d as i64) as i32, c[0], c[1], c[2], a));
+                }
+            }
+        }
+        write_camps(&cd.join("part-0.parquet"), &camp_rows).unwrap_or_else(|e| die(&format!("write campaign_daily: {e}")));
+        let results: Vec<Work> = hs.into_iter().map(|h| h.join().unwrap_or_else(|_| die("a worker panicked"))).collect();
+        (camp_rows, results)
+    });
+    lap(&format!("sessions aggregated, {} user rows and {} campaign rows written", n_rows.load(Relaxed), camp_rows.len()));
     if std::env::var_os("SESS_DEBUG").is_some() {
         if let Ok(t) = std::fs::read_to_string("/proc/self/smaps_rollup") {
             for l in t.lines().filter(|l| l.starts_with("Rss") || l.starts_with("AnonHuge") || l.starts_with("Anonymous")) {

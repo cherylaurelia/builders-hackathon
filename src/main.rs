@@ -89,6 +89,72 @@ impl Hasher for BytesHasher {
 }
 type BytesMap<V> = HashMap<Bytes, V, BuildHasherDefault<BytesHasher>>;
 
+/// A small table's byte string -> u16 (product -> category, campaign -> index) for lookups from the parsers.
+/// A key of 1..=15 bytes is one 128-bit value (zero padded, length in byte 15, like `SStr`): a lookup is one
+/// `hash16` and one 128-bit compare per probe, with no copy of the key. Other keys stay in `long`.
+struct KeyMap {
+    keys: Vec<u128>, // 0: empty slot (a stored key's length byte is never 0)
+    vals: Vec<u16>,
+    mask: usize,
+    long: BytesMap<u16>,
+}
+impl KeyMap {
+    fn new(m: &BytesMap<u16>) -> KeyMap {
+        let n = (2 * m.len()).next_power_of_two().max(16);
+        let mut t = KeyMap { keys: vec![0; n], vals: vec![0; n], mask: n - 1, long: BytesMap::default() };
+        for (&k, &v) in m {
+            if (1..=15).contains(&k.len()) {
+                let mut x = [0u8; 16];
+                x[..k.len()].copy_from_slice(k);
+                let w = u128::from_le_bytes(x);
+                let mut i = hash16(w, k.len()) as usize & t.mask;
+                while t.keys[i] != 0 {
+                    i = (i + 1) & t.mask;
+                }
+                t.keys[i] = w | (k.len() as u128) << 120;
+                t.vals[i] = v;
+            } else {
+                t.long.insert(k, v);
+            }
+        }
+        t
+    }
+    /// The value of the key of `len` (1..=15) bytes given as `load16` of it.
+    #[inline(always)]
+    fn find(&self, w: u128, len: usize) -> Option<u16> {
+        let key = w | (len as u128) << 120;
+        let mut i = hash16(w, len) as usize & self.mask;
+        loop {
+            let k = self.keys[i];
+            if k == key {
+                return Some(self.vals[i]);
+            }
+            if k == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    fn get(&self, b: &[u8]) -> Option<u16> {
+        if (1..=15).contains(&b.len()) {
+            let mut x = [0u8; 16];
+            x[..b.len()].copy_from_slice(b);
+            self.find(u128::from_le_bytes(x), b.len())
+        } else {
+            self.long.get(b).copied()
+        }
+    }
+    /// `get` of the `len` bytes at `p`; 16 bytes from `p` must be readable.
+    #[inline(always)]
+    unsafe fn get_at(&self, p: *const u8, len: usize) -> Option<u16> {
+        if len.wrapping_sub(1) < 15 {
+            self.find(load16(p, len), len)
+        } else {
+            self.long.get(std::slice::from_raw_parts(p, len)).copied()
+        }
+    }
+}
+
 /// An ID of up to 15 bytes stored inline (zero padded, length in the last byte), else a pointer to it.
 /// Inline IDs compare as one 128-bit value: no pointer chase into the input files.
 #[derive(Clone, Copy)]
@@ -887,8 +953,8 @@ struct Ctx {
     day0: i64,
     ndays: usize,
     ncamp: usize, // organic is index ncamp
-    products: BytesMap<u16>,
-    campaigns: BytesMap<u16>,
+    products: KeyMap,
+    campaigns: KeyMap,
     unknown_cat: u16,
     cat_rank: Vec<u32>,
 }
@@ -961,7 +1027,7 @@ fn main() {
         camp_ids.push(c);
         camp_channel.push(ch);
     }
-    (cat_names, products, unknown_cat, cat_rank, camp_ids, camp_channel, campaigns)
+    (cat_names, KeyMap::new(&products), unknown_cat, cat_rank, camp_ids, camp_channel, KeyMap::new(&campaigns))
         })
     };
 
@@ -1413,7 +1479,7 @@ fn parse_event(ctx: &Ctx, [eid, uid, ts, ingest, etype, pid, price]: [Bytes; 7])
     if r.kind == PURCHASE {
         let Some(p) = parse_price(price) else { return Some(r) };
         r.price = p;
-        r.cat = ctx.products.get(pid).copied().unwrap_or(ctx.unknown_cat);
+        r.cat = ctx.products.get(pid).unwrap_or(ctx.unknown_cat);
     }
     if ingest - t > DAY {
         return Some(r);
@@ -1565,7 +1631,7 @@ unsafe fn fast_event(ctx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, st:
         let (rp, rl) = f(6);
         let Some(p) = parse_price(std::slice::from_raw_parts(rp, rl)) else { return st.reject(h, eid, ingest) };
         price = p;
-        cat = ctx.products.get(std::slice::from_raw_parts(pp, pl)).copied().unwrap_or(ctx.unknown_cat);
+        cat = ctx.products.get_at(pp, pl).unwrap_or(ctx.unknown_cat);
     }
     let (uh, uid) = if ul <= 15 {
         let v = load16(up, ul);
@@ -1586,7 +1652,7 @@ fn parse_click(ctx: &Ctx, [cid, uid, camp, ts]: [Bytes; 4]) -> Option<PClick> {
     if t < ctx.ws - WEEK || t >= ctx.we {
         return None;
     }
-    let camp = *ctx.campaigns.get(camp)?;
+    let camp = ctx.campaigns.get(camp)?;
     // routed by user_id for now; phase 4b swaps in the person
     Some(PClick { nh: hash_bytes(uid), name: SStr::new(uid), cid: Packed::new(cid), ts: (t - (ctx.ws - WEEK)) as u32, camp })
 }
@@ -1669,7 +1735,7 @@ unsafe fn fast_click(ctx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, out
     if t < ctx.ws - WEEK || t >= ctx.we {
         return;
     }
-    let Some(&camp) = ctx.campaigns.get(std::slice::from_raw_parts(kp, kl)) else { return };
+    let Some(camp) = ctx.campaigns.get_at(kp, kl) else { return };
     let (nh, name) = if ul <= 15 {
         let v = load16(up, ul);
         (hash16(v, ul), SStr((v | (ul as u128) << 120).to_le_bytes()))
@@ -3156,38 +3222,17 @@ mod tests {
         }
     }
 
-    fn line(r: &mut Rng) -> String {
-        if r.below(200) == 0 {
-            return String::new();
+    fn id(r: &mut Rng, c: char) -> String {
+        match r.below(12) {
+            0 => String::new(),
+            1 => format!("{c}{}", "x".repeat(r.below(40))),
+            2 => format!(" {c}{}", r.below(1000)),
+            _ => format!("{c}{:x}", r.next() % (1u64 << (4 * (4 + r.below(8))))),
         }
-        let id = |r: &mut Rng, c: char| -> String {
-            match r.below(12) {
-                0 => String::new(),
-                1 => format!("{c}{}", "x".repeat(r.below(40))),
-                2 => format!(" {c}{}", r.below(1000)),
-                _ => format!("{c}{:x}", r.next() % (1u64 << (4 * (4 + r.below(8))))),
-            }
-        };
-        let dirty = r.below(3) == 0;
-        let mut f: Vec<String> = vec![
-            id(r, 'e'),
-            id(r, 'u'),
-            ts_value(r),
-            if r.below(10) == 0 { ts_value(r) } else { "2028-02-22T00:00:00Z".to_string() },
-            r.pick(&["view", "cart", "purchase", "view", "cart", "purchase", "Purchase", "cart ", "", "views", "purchas"]).to_string(),
-            r.pick(&["p1", "p2", "p3", "P1", "", "p9999", "p2\r"]).to_string(),
-            r.pick(&["", "100", "0250", "0", "10000000", "10000001", "-5", "1.5", "12\r", "٢٥٠", "00000000000000000000000000001"]).to_string(),
-        ];
-        if !dirty {
-            let ms = 1835049600000u64 + r.below(14 * 86_400_000) as u64;
-            f[2] = r.pick(&[&ms.to_string()[..], "2028-02-21T05:00:00Z", "2028-03-01T12:30:00+05:30", "2028-02-29T23:59:59Z"]).to_string();
-            f[4] = r.pick(&["view", "cart", "purchase"]).to_string();
-            f[5] = r.pick(&["p1", "p2", "p3"]).to_string();
-        }
-        if r.below(3) == 0 {
-            f[2] = r.pick(&["2028-02-21T05:00:00Z", "2028-02-20T00:00:00Z"]).to_string();
-            f[3] = r.pick(&["2028-02-22T05:00:00Z", "2028-02-22T05:00:01Z", "2028-02-21T04:00:00Z", "2028-03-10T00:00:00Z"]).to_string();
-        }
+    }
+
+    /// Quotes the fields (well, or badly when `dirty`), sometimes breaks the field count, and joins them.
+    fn dirt(r: &mut Rng, mut f: Vec<String>, dirty: bool) -> String {
         for v in f.iter_mut() {
             *v = match if dirty { r.below(14) } else { [0, 1, 2, 3, 8, 9, 10, 11, 12, 13][r.below(10)] } {
                 0..=3 => format!("\"{v}\""),
@@ -3205,37 +3250,85 @@ mod tests {
                 _ => v.clone(),
             };
         }
+        let n = f.len();
         match if dirty { r.below(40) } else { 99 } {
             0 => {
                 f.pop();
             }
             1 => f.push(String::new()),
-            2 => f.insert(r.below(7), "x".to_string()),
-            3 => f[r.below(7)] = "x".repeat(100 + r.below(60)),
+            2 => f.insert(r.below(n), "x".to_string()),
+            3 => f[r.below(n)] = "x".repeat(100 + r.below(60)),
             _ => {}
         }
         f.join(",")
+    }
+
+    fn line(r: &mut Rng) -> String {
+        if r.below(200) == 0 {
+            return String::new();
+        }
+        let dirty = r.below(3) == 0;
+        let mut f: Vec<String> = vec![
+            id(r, 'e'),
+            id(r, 'u'),
+            ts_value(r),
+            if r.below(10) == 0 { ts_value(r) } else { "2028-02-22T00:00:00Z".to_string() },
+            r.pick(&["view", "cart", "purchase", "view", "cart", "purchase", "Purchase", "cart ", "", "views", "purchas"]).to_string(),
+            r.pick(&["p1", "p2", "p3", "P1", "", "p9999", "p2\r", "p_long_product_identifier", "p1\0"]).to_string(),
+            r.pick(&["", "100", "0250", "0", "10000000", "10000001", "-5", "1.5", "12\r", "٢٥٠", "00000000000000000000000000001"]).to_string(),
+        ];
+        if !dirty {
+            let ms = 1835049600000u64 + r.below(14 * 86_400_000) as u64;
+            f[2] = r.pick(&[&ms.to_string()[..], "2028-02-21T05:00:00Z", "2028-03-01T12:30:00+05:30", "2028-02-29T23:59:59Z"]).to_string();
+            f[4] = r.pick(&["view", "cart", "purchase"]).to_string();
+            f[5] = r.pick(&["p1", "p2", "p3", "p_long_product_identifier"]).to_string();
+        }
+        if r.below(3) == 0 {
+            f[2] = r.pick(&["2028-02-21T05:00:00Z", "2028-02-20T00:00:00Z"]).to_string();
+            f[3] = r.pick(&["2028-02-22T05:00:00Z", "2028-02-22T05:00:01Z", "2028-02-21T04:00:00Z", "2028-03-10T00:00:00Z"]).to_string();
+        }
+        dirt(r, f, dirty)
+    }
+
+    fn click_line(r: &mut Rng) -> String {
+        if r.below(200) == 0 {
+            return String::new();
+        }
+        let dirty = r.below(3) == 0;
+        let camps = ["c_1", "c_2", "c_3", "C_1", "", "c_1 ", "c_1\0", "c_long_campaign_id_17", "c_long_campaign_id_1"];
+        let mut f = vec![id(r, 'k'), id(r, 'u'), r.pick(&camps).to_string(), ts_value(r)];
+        if !dirty {
+            let ms = 1835049600000u64 + r.below(20 * 86_400_000) as u64 - 7 * 86_400_000;
+            f[2] = r.pick(&["c_1", "c_2", "c_long_campaign_id_17"]).to_string();
+            f[3] = r.pick(&[&ms.to_string()[..], "2028-02-14T05:00:00Z", "2028-03-01T12:30:00+05:30", "2028-02-29T23:59:59Z"]).to_string();
+        }
+        dirt(r, f, dirty)
     }
 
     fn ctx() -> Ctx {
         let mut products = BytesMap::default();
         products.insert(&b"p1"[..], 0u16);
         products.insert(&b"p2"[..], 1u16);
+        products.insert(&b"p_long_product_identifier"[..], 1u16);
+        let mut campaigns = BytesMap::default();
+        for (i, c) in ["c_1", "c_2", "c_long_campaign_id_17", "c_9"].iter().enumerate() {
+            campaigns.insert(c.as_bytes(), i as u16);
+        }
         Ctx {
             ws: parse_ts(b"2028-02-20T00:00:00Z").unwrap(),
             we: parse_ts(b"2028-03-05T00:00:00Z").unwrap(),
             day0: 0,
             ndays: 14,
             ncamp: 0,
-            products,
-            campaigns: BytesMap::default(),
+            products: KeyMap::new(&products),
+            campaigns: KeyMap::new(&campaigns),
             unknown_cat: 2,
             cat_rank: vec![0, 1, 2],
         }
     }
 
     fn fresh() -> EvParse {
-        EvParse { t: 3, ub: (0..UB).map(|_| Vec::new()).collect(), eb: (0..EB).map(|_| Vec::new()).collect() }
+        EvParse { t: 3, ub: (0..UB).map(|_| Vec::new()).collect(), eb: (0..EB).map(|_| Vec::new()).collect(), ck: Vec::new() }
     }
 
     type Flat = (Vec<(u64, Vec<u8>, i64, u32, u16, u8)>, Vec<(u64, Vec<u8>, i64, u64)>);
@@ -3281,6 +3374,65 @@ mod tests {
             assert!(fa == fb, "round {round}: fast parse differs\n{}", std::str::from_utf8(file).unwrap());
         }
         assert!(kept > 1000, "too few kept events ({kept}) to mean anything");
+    }
+
+    #[test]
+    fn fast_click_matches_reference() {
+        let c = ctx();
+        let mut r = Rng(0x0dd_ba11_cafe_f00d);
+        let mut kept = 0;
+        for round in 0..300 {
+            let mut text = String::from("click_id,user_id,campaign_id,ts\n");
+            for _ in 0..r.below(400) {
+                text += &click_line(&mut r);
+                text.push('\n');
+            }
+            if round % 3 == 0 {
+                text += &click_line(&mut r); // no trailing newline
+            }
+            let file: Bytes = Box::leak(text.into_bytes().into_boxed_slice());
+            let mut cuts = vec![0, file.len()];
+            for _ in 0..r.below(4) {
+                cuts.push(r.below(file.len() + 1));
+            }
+            cuts.sort();
+            let mut a: Vec<Vec<PClick>> = (0..UB).map(|_| Vec::new()).collect();
+            let mut b: Vec<Vec<PClick>> = (0..UB).map(|_| Vec::new()).collect();
+            for w in cuts.windows(2) {
+                parse_clicks(&c, file, w[0], w[1], &mut a);
+                for_records::<4>(file, w[0], w[1], |f| {
+                    if let Some(k) = parse_click(&c, f) {
+                        b[uid_bucket(k.nh)].push(k);
+                    }
+                });
+            }
+            let flat = |v: &Vec<Vec<PClick>>| -> Vec<(u64, Vec<u8>, Vec<u8>, u32, u16)> {
+                v.iter().flatten().map(|k| (k.nh, k.name.get().to_vec(), k.cid.get().to_vec(), k.ts, k.camp)).collect()
+            };
+            let (fa, fb) = (flat(&a), flat(&b));
+            kept += fb.len();
+            assert!(fa == fb, "round {round}: fast click parse differs\n{}", std::str::from_utf8(file).unwrap());
+        }
+        assert!(kept > 1000, "too few kept clicks ({kept}) to mean anything");
+    }
+
+    #[test]
+    fn keymap_matches_bytesmap() {
+        let mut r = Rng(5);
+        let key = |r: &mut Rng| -> Vec<u8> { (0..r.below(21)).map(|_| [b'a', b'b', 0, b'_', 0xff][r.below(5)]).collect() };
+        let mut m = BytesMap::default();
+        for i in 0..3000u16 {
+            let k: Bytes = Box::leak(key(&mut r).into_boxed_slice());
+            m.insert(k, i);
+        }
+        let t = KeyMap::new(&m);
+        for _ in 0..200_000 {
+            let mut k = key(&mut r);
+            assert_eq!(t.get(&k), m.get(&k[..]).copied(), "{k:?}");
+            let n = k.len();
+            k.extend_from_slice(&[0xAA; 16]);
+            assert_eq!(unsafe { t.get_at(k.as_ptr(), n) }, m.get(&k[..n]).copied());
+        }
     }
 
     #[test]

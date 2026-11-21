@@ -3098,14 +3098,11 @@ unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
                 let home = (spread(ukey) >> hshift) as usize & !3;
                 prefetch(slots.add(home));
                 *bh.add(n) = home as u32;
-                // ingest_ts: F1 when its 20 bytes are a date, a time and a Z, and the field ends there. The quotes
-                // are in place, so the byte after the Z ends the field when it is a comma or a (closing) quote
+                // ingest_ts: always valid F1 (rules.md, Timestamps), so the field is `YYYY-MM-DDTHH:MM:SSZ`. Its
+                // date is one seen before or is checked now (`day_fill`, with the time); the time of day of a
+                // date seen before is converted as it stands, without a look at what its bytes are
                 let rest = line.add(o as usize);
                 let ip = rest.add(tz(sb));
-                let zend = (ip.add(19) as *const u16).read_unaligned();
-                if (zend != u16::from_le_bytes(*b"Z,")) & (zend != u16::from_le_bytes(*b"Z\"")) {
-                    break 'usual;
-                }
                 let (ia, ia2) = ((ip as *const u64).read_unaligned(), (ip.add(3) as *const u64).read_unaligned());
                 let di = _pext_u64(ia2, DAY_BITS) as usize;
                 if ((*dm.add(di)).a != ia) | ((*dm.add(di)).a2 != ia2) {
@@ -3113,10 +3110,7 @@ unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
                         break 'usual;
                     }
                 }
-                let (isecs, ibad) = hms_at(&*k, ip.add(11));
-                if ibad != 0 || isecs >= DAY_SECS {
-                    break 'usual;
-                }
+                let (isecs, _) = hms_at(&*k, ip.add(11));
                 let ingest = (*dm.add(di)).ms + (isecs * 1000) as i64;
                 *bb.add(n) = ingest;
                 'kept: {
@@ -4923,7 +4917,8 @@ mod tests {
             id(r, 'e'),
             id(r, 'u'),
             ts_value(r),
-            if r.below(10) == 0 { ts_value(r) } else { "2028-02-22T00:00:00Z".to_string() },
+            // ingest_ts: always valid F1 (rules.md, Timestamps); the one-pass loop relies on it
+            r.pick(&["2028-02-22T00:00:00Z", "2028-02-22T00:00:00Z", "2028-02-20T00:00:01Z", "2028-02-29T23:59:59Z", "2028-03-01T12:30:00Z", "2028-03-09T18:07:45Z", "2027-12-31T23:59:59Z", "2031-01-01T00:00:00Z"]).to_string(),
             r.pick(&["view", "cart", "purchase", "view", "cart", "purchase", "Purchase", "cart ", "", "views", "purchas"]).to_string(),
             r.pick(&["p1", "p2", "p3", "P1", "", "p9999", "p2\r"]).to_string(),
             r.pick(&["", "100", "0250", "0", "10000000", "10000001", "-5", "1.5", "12\r", "٢٥٠", "00000000000000000000000000001"]).to_string(),
@@ -5263,10 +5258,11 @@ mod tests {
                 _ => format!("{c}{}", b36(r, 8)),
             }
         }
-        fn mutate(r: &mut Rng, mut l: String) -> String {
+        // one byte of a line in ten changed, outside `keep` (an event's ingest_ts, which stays valid F1)
+        fn mutate(r: &mut Rng, mut l: String, keep: std::ops::RangeInclusive<usize>) -> String {
             if r.below(10) == 0 && !l.is_empty() {
                 let k = r.below(l.len());
-                if l.is_char_boundary(k) && l.is_char_boundary(k + 1) {
+                if !keep.contains(&k) && l.is_char_boundary(k) && l.is_char_boundary(k + 1) {
                     match r.below(3) {
                         0 => l.replace_range(k..k + 1, r.pick(&["\"", ",", "\r", "\u{1}", "é", " ", "0", "Z", ":", "x", "\n", "\u{7f}"])),
                         1 => {
@@ -5289,18 +5285,22 @@ mod tests {
                     id(&mut r, 'e'),
                     id(&mut r, 'u'),
                     ts(&mut r, t0, ms),
-                    if r.below(30) == 0 { ts(&mut r, t0, ing) } else { f1(ing) },
+                    f1(ing),
                     r.pick(&["view", "view", "view", "view", "cart", "cart", "purchase", "purchase", "Purchase", "views", "car", ""]).to_string(),
                     r.pick(&["p1", "p2", "p39594", "p17893", "p8823", "p310", ""]).to_string(),
                     r.pick(&["", "", "", "41607", "720", "0", "10000000", "10000001", "-5", "1.5"]).to_string(),
                 ];
-                let l = f.map(|v| quote(&mut r, v)).join(",");
-                ev += &mutate(&mut r, l);
+                let f = f.map(|v| quote(&mut r, v));
+                let at = f[0].len() + f[1].len() + f[2].len() + 3;
+                let keep = at..=at + f[3].len();
+                ev += &mutate(&mut r, f.join(","), keep);
                 ev.push('\n');
                 let ms = r.below(25 * 86_400_000) as u64;
                 let f = [id(&mut r, 'k'), id(&mut r, 'u'), format!("c_{}", r.below(45) * 37), ts(&mut r, t0, ms)];
                 let l = f.map(|v| quote(&mut r, v)).join(",");
-                ck += &mutate(&mut r, l);
+                #[allow(clippy::reversed_empty_ranges)]
+                let none = 1..=0;
+                ck += &mutate(&mut r, l, none);
                 ck.push('\n');
             }
             if round % 3 == 0 {

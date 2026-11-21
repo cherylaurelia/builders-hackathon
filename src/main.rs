@@ -74,6 +74,26 @@ impl Hasher for BytesHasher {
 }
 type BytesMap<V> = HashMap<Bytes, V, BuildHasherDefault<BytesHasher>>;
 
+/// Byte masks of the first n bytes of a 16-byte value, low and high 8 bytes.
+const MLO: [u64; 16] = {
+    let mut m = [0u64; 16];
+    let mut n = 0;
+    while n < 16 {
+        m[n] = if n >= 8 { u64::MAX } else { (1u64 << (n * 8)) - 1 };
+        n += 1;
+    }
+    m
+};
+const MHI: [u64; 16] = {
+    let mut m = [0u64; 16];
+    let mut n = 9;
+    while n < 16 {
+        m[n] = (1u64 << ((n - 8) * 8)) - 1;
+        n += 1;
+    }
+    m
+};
+
 /// A string of up to 15 bytes stored inline (zero padded, length in the top byte), else (pointer, length | LONG).
 /// The inline form is canonical, so two inline values are equal exactly when their 16 bytes are.
 #[derive(Clone, Copy)]
@@ -106,11 +126,7 @@ impl SStr {
         let p = b.as_ptr();
         let lo = (p as *const u64).read_unaligned();
         let hi = (p.add(8) as *const u64).read_unaligned();
-        if n >= 8 {
-            SStr(lo, (hi & ((1u64 << ((n - 8) * 8)) - 1)) | (n as u64) << 56)
-        } else {
-            SStr(lo & ((1u64 << (n * 8)) - 1), (n as u64) << 56)
-        }
+        SStr(lo & MLO[n], (hi & MHI[n]) | (n as u64) << 56)
     }
     #[inline]
     fn get(&self) -> &[u8] {
@@ -483,6 +499,18 @@ unsafe fn tokenize<const N: usize>(p: *const u8) -> Tok<N> {
     if c.count_ones() as usize != N - 1 {
         return Tok::Bad(len);
     }
+    if q != 0 {
+        // A quote may only open a field (at its first byte) and close the same field (at its last byte), and a
+        // quoted field has 2+ bytes. `fs` = field starts; adding a field's start bit to the run of non-separator
+        // bits it begins carries into the separator that ends the field, so `ends` = last byte of each field
+        // whose first byte is a quote.
+        let sep = c | (1u128 << len);
+        let qs = q & ((c << 1) | 1);
+        let ends = ((!sep).wrapping_add(qs) & sep) >> 1;
+        if q != qs | ends || qs & ends != 0 {
+            return Tok::Bad(len);
+        }
+    }
     let mut s = [0u32; N];
     let mut e = [0u32; N];
     let mut cm = c;
@@ -498,16 +526,10 @@ unsafe fn tokenize<const N: usize>(p: *const u8) -> Tok<N> {
     e[N - 1] = len as u32;
     if q != 0 {
         for i in 0..N {
-            let (a, b) = (s[i], e[i]);
-            let fl = b - a;
-            let qf = (q >> a) & ((1u128 << fl) - 1);
-            if qf != 0 {
-                if fl < 2 || qf != (1 | (1u128 << (fl - 1))) {
-                    return Tok::Bad(len);
-                }
-                s[i] = a + 1;
-                e[i] = b - 1;
-            }
+            // a field that starts with a quote is quoted (and was checked above): drop both quotes
+            let x = (*p.add(s[i] as usize) == b'"') as u32 & (s[i] < e[i]) as u32;
+            s[i] += x;
+            e[i] -= x;
         }
     }
     Tok::Ok(len, s, e)
@@ -655,9 +677,27 @@ fn offset(b: &[u8]) -> Option<(i64, i64)> {
     Some((oh, om))
 }
 
+/// 8 ASCII bytes (the first one the most significant digit) as a number; None unless all are digits.
+#[inline(always)]
+fn swar8(x: u64) -> Option<u64> {
+    let d = x.wrapping_sub(0x3030_3030_3030_3030);
+    if (d | d.wrapping_add(0x7676_7676_7676_7676)) & 0x8080_8080_8080_8080 != 0 {
+        return None;
+    }
+    let d = (d * 10 + (d >> 8)) & 0x00FF_00FF_00FF_00FF;
+    let d = (d * 100 + (d >> 16)) & 0x0000_FFFF_0000_FFFF;
+    Some((d * 10000 + (d >> 32)) & 0xFFFF_FFFF)
+}
+
 /// F3: digits only. More than 18 significant digits is far outside any window: None either way.
 #[inline]
 fn f3(b: &[u8]) -> Option<i64> {
+    if b.len() == 13 && b[0] != b'0' {
+        let hi = swar8(u64::from_le_bytes(b[..8].try_into().unwrap()))?;
+        // the last 5 digits, as 8 with 3 leading zeros
+        let lo = swar8(u64::from_le_bytes(b[5..13].try_into().unwrap()) & !0xFF_FFFF | 0x30_3030)?;
+        return Some((hi * 100_000 + lo) as i64);
+    }
     let mut v: i64 = 0;
     let mut i = 0;
     while i < b.len() && b[i] == b'0' {
@@ -679,7 +719,7 @@ fn f3(b: &[u8]) -> Option<i64> {
 /// The calendar dates near the window, by `YYYY-MM-` prefix: a date found here is valid; one not found is either
 /// invalid or so far from the window that any timestamp on it is out of every window (the caller falls back).
 struct Dates {
-    pre: Vec<(u64, i64, u32, u32)>, // ("YYYY-MM-" as le u64, epoch day of day 0 of that month, first dd, last dd)
+    pre: [(u64, i64, u32, u32); 4], // ("YYYY-MM-" as le u64, epoch day of day 0 of that month, first dd, last dd)
 }
 impl Dates {
     fn new(d0: i64, d1: i64) -> Dates {
@@ -695,14 +735,30 @@ impl Dates {
                 None => pre.push((k, day - d, d as u32, d as u32)),
             }
         }
-        Dates { pre }
+        if pre.len() > 4 {
+            die("date range spans more than 4 months");
+        }
+        let mut a = [(u64::MAX, 0, 1, 0); 4]; // never matches: no ts field holds 8 bytes of 0xFF
+        a[..pre.len()].copy_from_slice(&pre);
+        Dates { pre: a }
     }
     /// `YYYY-MM-DDTHH:MM:SS` (first 19 bytes of b) as epoch seconds; None if invalid or not a listed date.
     #[inline(always)]
     fn secs(&self, b: &[u8]) -> Option<i64> {
         let b: &[u8; 19] = b[..19].try_into().ok()?;
         let k = u64::from_le_bytes(b[..8].try_into().unwrap());
-        let p = self.pre.iter().find(|p| p.0 == k)?;
+        let i = if k == self.pre[0].0 {
+            0
+        } else if k == self.pre[1].0 {
+            1
+        } else if k == self.pre[2].0 {
+            2
+        } else if k == self.pre[3].0 {
+            3
+        } else {
+            return None;
+        };
+        let p = &self.pre[i];
         let (d1, d2) = (b[8].wrapping_sub(b'0') as u32, b[9].wrapping_sub(b'0') as u32);
         if d1 > 9 || d2 > 9 || b[10] != b'T' {
             return None;

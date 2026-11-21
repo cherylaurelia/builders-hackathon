@@ -2065,9 +2065,11 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
             let words = (n / 2).next_power_of_two().max(64);
             filter.clear();
             filter.resize(words, 0);
+            // the bucket is the top bits of spread(key): the word and the two bits come from the bits below them
+            let (qb, wb) = (buckets.trailing_zeros(), words.trailing_zeros());
             let at = |k: u64| {
-                let h = mix(k);
-                ((h >> 10) as usize & (words - 1), 1u64 << (2 * (h & 31)) | 1u64 << (2 * ((h >> 5) & 31)))
+                let h = spread(k) << qb;
+                ((h >> (64 - wb)) as usize, 1u64 << (2 * ((h >> (59 - wb)) & 31)) | 1u64 << (2 * ((h >> (54 - wb)) & 31)))
             };
             for s in shards {
                 for blk in s.lg[b].slices(LG_BLOCK) {

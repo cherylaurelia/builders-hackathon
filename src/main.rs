@@ -591,7 +591,6 @@ struct Ctx {
     day0: i64,
     ndays: usize,
     ncamp: usize, // organic is index ncamp
-    links: Vec<PreMap<(Bytes, u64)>>, // by uid_bucket: linked ID -> (person name, its hash)
     products: BytesMap<u16>,
     campaigns: BytesMap<u16>,
     unknown_cat: u16,
@@ -663,11 +662,11 @@ fn main() {
     let ncamp = camp_ids.len();
     lap("small tables");
 
-    // 1. links
-    let links = build_links(&csv_files(&data.join("links")), threads);
-    lap(&format!("links: {} linked ids", links.iter().map(|m| m.len()).sum::<usize>()));
+    // 1. links, on their own thread: nothing needs them until phase 4b
+    let link_files = csv_files(&data.join("links"));
+    let links_job = std::thread::spawn(move || build_links(&link_files, (threads / 4).max(1)));
 
-    let ctx = Ctx { ws, we, day0, ndays, ncamp, links, products, campaigns, unknown_cat, cat_rank };
+    let ctx = Ctx { ws, we, day0, ndays, ncamp, products, campaigns, unknown_cat, cat_rank };
 
     // 2. events: parse into event_id buckets
     let ev_files = csv_files(&data.join("events"));
@@ -746,6 +745,9 @@ fn main() {
     );
     lap("clicks parsed");
 
+    let links = links_job.join().unwrap_or_else(|_| die("link builder panicked"));
+    lap(&format!("links joined: {} linked ids", links.iter().map(|m| m.len()).sum::<usize>()));
+
     // 4b. per user_id bucket: user_id -> person through that bucket's slice of the link table
     let n_ev: usize = routed.iter().flatten().map(|v| v.len()).sum();
     let n_ck: usize = clicks.iter().flatten().map(|v| v.len()).sum();
@@ -754,7 +756,7 @@ fn main() {
         UB,
         || (sized::<PEvent>(PB, n_ev, threads), sized::<PClick>(PB, n_ck, threads)),
         |(oe, oc), u| {
-            let map = &ctx.links[u];
+            let map = &links[u];
             let person = |h: u64, s: Bytes| map.get(&PreHashed { h, s }).copied().unwrap_or((s, h));
             for t in &routed {
                 for e in &t[u] {

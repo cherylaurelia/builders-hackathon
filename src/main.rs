@@ -1053,11 +1053,7 @@ fn main() {
         || sized::<PClick>(UB, ck_est, threads),
         |out, i| {
             let (f, s, e) = ck_chunks[i];
-            for_records::<4>(f, s, e, |fields| {
-                if let Some(c) = parse_click(&ctx, fields) {
-                    out[uid_bucket(c.nh)].push(c);
-                }
-            });
+            parse_clicks(&ctx, f, s, e, out);
         },
     );
     lap("clicks parsed");
@@ -1570,6 +1566,95 @@ fn parse_click(ctx: &Ctx, [cid, uid, camp, ts]: [Bytes; 4]) -> Option<PClick> {
     let camp = *ctx.campaigns.get(camp)?;
     // routed by user_id for now; phase 4b swaps in the person
     Some(PClick { nh: hash_bytes(uid), name: SStr::new(uid), ts: t, cid, camp })
+}
+
+/// Parses the click lines that start in [start, end) of `file` (header skipped) into `out`, bucketed by user_id.
+/// Same split as `parse_events`: a line with its `\n` in its first 128 bytes and 144 readable bytes takes
+/// `fast_click`, any other goes through `split` + `parse_click`.
+fn parse_clicks(ctx: &Ctx, file: Bytes, start: usize, end: usize, out: &mut [Vec<PClick>]) {
+    let len = file.len();
+    let first = start.saturating_sub(1);
+    let Some(nl) = memchr::memchr(b'\n', &file[first..]) else { return };
+    let mut p = first + nl + 1;
+    let fast_end = len.saturating_sub(144);
+    while p < end && p < len {
+        if p < fast_end {
+            // SAFETY: p + 144 <= len
+            unsafe {
+                let line = file.as_ptr().add(p);
+                let [c0, q0, n0] = masks64(line);
+                let [c1, q1, n1] = masks64(line.add(64));
+                let n = n0 as u128 | (n1 as u128) << 64;
+                if n != 0 {
+                    let e = n.trailing_zeros() as usize;
+                    let lm = (1u128 << e) - 1;
+                    fast_click(ctx, line, e, (c0 as u128 | (c1 as u128) << 64) & lm, (q0 as u128 | (q1 as u128) << 64) & lm, out);
+                    p += e + 1;
+                    continue;
+                }
+            }
+        }
+        let e = memchr::memchr(b'\n', &file[p..]).map_or(len, |i| p + i);
+        if let Some(c) = split::<4>(&file[p..e]).and_then(|f| parse_click(ctx, f)) {
+            out[uid_bucket(c.nh)].push(c);
+        }
+        p = e + 1;
+    }
+}
+
+/// `split::<4>` + `parse_click` for the line of `e` (< 128) bytes at `line`, given its comma and quote bits `c` and
+/// `q`; line[e] is its `\n` and line[..144] is readable. The line is in the file, which lives for the whole run.
+#[inline(always)]
+unsafe fn fast_click(ctx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, out: &mut [Vec<PClick>]) {
+    if c.count_ones() != 3 {
+        return;
+    }
+    // well quoted: see `fast_event`
+    let b = c | (1u128 << e);
+    let s = (b << 1) | 1;
+    let ends = b >> 1;
+    let x = q & s;
+    let y = (q << 1) & b;
+    if (q & !(s | ends)) | (x & ends) | (y.wrapping_sub(x) & b) != 0 {
+        return;
+    }
+    let mut fs = [0usize; 4];
+    let mut fe = [0usize; 4];
+    let mut cc = c;
+    let mut at = 0;
+    for i in 0..3 {
+        let k = cc.trailing_zeros() as usize;
+        cc &= cc - 1;
+        fs[i] = at;
+        fe[i] = k;
+        at = k + 1;
+    }
+    fs[3] = at;
+    fe[3] = e;
+    for i in 0..4 {
+        // a quoted field starts with `"` (an empty unquoted field starts on its `,` or `\n`)
+        let qd = (*line.add(fs[i]) == b'"') as usize;
+        fs[i] += qd;
+        fe[i] -= qd;
+    }
+    let f = |i: usize| (line.add(fs[i]), fe[i] - fs[i]);
+    let ((cp, cl), (up, ul), (kp, kl), (tp, tl)) = (f(0), f(1), f(2), f(3));
+    if cl == 0 || ul == 0 {
+        return;
+    }
+    let Some(t) = ts_at(tp, tl) else { return };
+    if t < ctx.ws - WEEK || t >= ctx.we {
+        return;
+    }
+    let Some(&camp) = ctx.campaigns.get(std::slice::from_raw_parts(kp, kl)) else { return };
+    let (nh, name) = if ul <= 15 {
+        let v = load16(up, ul);
+        (hash16(v, ul), SStr((v | (ul as u128) << 120).to_le_bytes()))
+    } else {
+        let u = std::slice::from_raw_parts(up, ul);
+        (hash_bytes(u), SStr::new(u))
+    };
+    out[uid_bucket(nh)].push(PClick { nh, name, ts: t, cid: std::slice::from_raw_parts(cp, cl), camp });
 }
 
 struct Agg {

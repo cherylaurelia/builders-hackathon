@@ -545,8 +545,11 @@ impl IdTable {
 
     /// `slot_from` that does not leave the line at `home`: None when the line is full of other keys, so the key
     /// is (or will be added) further on. The caller asks for the next line (`next_line`) and comes back when
-    /// it is in the cache, instead of waiting for it here. Slots fill in order, so a line with a free last slot is
-    /// where the scan for a missing key ends.
+    /// it is in the cache, instead of waiting for it here.
+    ///
+    /// None is exact: a slot never changes once it holds a key, so four keys read here that are not `key` are
+    /// the line's four keys for good. A slot read as empty may have been filled since (by another thread, even
+    /// with this very key), so any empty one sends the lookup through `slot_scan`, which takes each slot in turn.
     #[inline(always)]
     fn slot_in_line(&self, home: u32, key: u64, ins: &mut usize) -> Option<u32> {
         // SAFETY: as in `slot_from`
@@ -556,7 +559,7 @@ impl IdTable {
         if m != 0 {
             return Some(home + m.trailing_zeros());
         }
-        if k[3] != 0 {
+        if (k[0] != 0) & (k[1] != 0) & (k[2] != 0) & (k[3] != 0) {
             return None;
         }
         Some(self.slot_scan(home, key, ins))

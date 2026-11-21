@@ -1760,14 +1760,32 @@ fn uncached(f: &InFile, off: usize) -> bool {
 
 const READ_AHEAD_THREADS: usize = 2;
 
+/// True when `f` is on a file system that keeps its files in memory (tmpfs, ramfs): nothing of it waits on a disk.
+/// Such a file answers the probe of `uncached` with "not supported", which reads as not cached.
+#[cfg(target_os = "linux")]
+fn in_memory(f: &InFile) -> bool {
+    use std::os::unix::io::AsRawFd;
+    const TMPFS: i64 = 0x0102_1994;
+    const RAMFS: i64 = 0x8584_58f6;
+    // SAFETY: fstatfs fills the zeroed struct or fails; a failure counts as a disk
+    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::fstatfs(f.f.as_raw_fd(), &mut s) } == 0;
+    ok && matches!(s.f_type as i64, TMPFS | RAMFS)
+}
+
 /// Cold page cache: asks the kernel for the whole input at once, in the order it will be parsed, from a few
 /// threads of their own, so the disk works at full speed from the first moment whatever the parse is doing.
-/// An input that is cached already (16 probes all answer without the disk) is left alone.
+/// An input that is cached already (16 probes all answer without the disk, or are of files kept in memory) is
+/// left alone: on a tmpfs the threads only took two CPUs from the link builder for the calls they made.
 #[cfg(target_os = "linux")]
 fn read_ahead(queue: Vec<(&'static InFile, usize, usize)>, _threads: usize) {
     use std::os::unix::io::AsRawFd;
     let n = queue.len();
-    if n == 0 || !(0..16).any(|i| uncached(queue[i * n / 16].0, (queue[i * n / 16].1 + queue[i * n / 16].2) / 2)) {
+    let cold = |i: usize| {
+        let (f, s, e) = queue[i * n / 16];
+        !in_memory(f) && uncached(f, (s + e) / 2)
+    };
+    if n == 0 || !(0..16).any(cold) {
         return;
     }
     let queue = std::sync::Arc::new(queue);
@@ -2623,10 +2641,11 @@ impl IdMap {
     fn new(ids: &[(Bytes, u16)]) -> IdMap {
         let cap = (ids.len() * 2).next_power_of_two().max(16);
         let mut m = IdMap { slots: filled(cap, (0, 0)), shift: 64 - cap.trailing_zeros(), other: BytesMap::default(), rkeys: Vec::new(), rvals: Vec::new(), rshift: 0 };
+        // an ID given twice keeps its first number: a lookup stops at the first slot that holds the key
         for &(id, v) in ids {
             match pack(id) {
                 0 => {
-                    m.other.insert(id, v);
+                    m.other.entry(id).or_insert(v);
                 }
                 k => {
                     let mut i = (spread(k) >> m.shift) as usize;
@@ -2735,9 +2754,9 @@ fn small_tables(data: &Path) -> Small {
     // products -> categories; "unknown" is its own category, never one of the file's
     let mut cat_names: Vec<Bytes> = Vec::new();
     let mut cat_idx: BytesMap<u16> = BytesMap::default();
-    let mut products: Vec<(Bytes, u16)> = Vec::new();
-    let mut seen: BytesMap<()> = BytesMap::default();
-    for (p, c) in small_table(&data.join("products.csv")) {
+    let rows = small_table(&data.join("products.csv"));
+    let mut products: Vec<(Bytes, u16)> = Vec::with_capacity(rows.len());
+    for (p, c) in rows {
         let n = cat_names.len() as u16;
         let ci = *cat_idx.entry(c).or_insert_with(|| {
             cat_names.push(c);
@@ -2745,9 +2764,10 @@ fn small_tables(data: &Path) -> Small {
         });
         products.push((p, ci));
     }
-    // product_id is unique per rules.md; were one repeated, its last line would count
+    // product_id is unique per rules.md; were one repeated, its last line would count: of the entries of one ID
+    // an `IdMap` answers with the first it was given
     products.reverse();
-    products.retain(|&(p, _)| seen.insert(p, ()).is_none());
+    let mut seen: BytesMap<()> = BytesMap::default();
     let unknown_cat = cat_names.len() as u16;
     cat_names.push(b"unknown");
     if cat_names.len() > 256 {
@@ -3395,19 +3415,18 @@ unsafe fn tags_match(g: *const DTags, tag: u16) -> (u32, u32) {
     }
 }
 
-/// A record's position in `mark_duplicates`: shard << DUP_POS_T | index in that shard's stream of the bucket. With at
-/// most 127 shards a position + 1 is at most 127 << DUP_POS_T < DUP_GRP: a table slot at or above DUP_GRP holds a
-/// group number + DUP_GRP instead.
-const DUP_POS_T: u32 = 25;
-const DUP_GRP: u32 = (127 << DUP_POS_T) + 1;
+/// A record's position in its bucket for `mark_duplicates`: block << DUP_BLK | index in the block, where the
+/// blocks of the bucket are numbered through all shards (`Dedup::blocks`) and an index is below LG_BLOCK. A table
+/// slot holds a position + 1, below DUP_GRP, or DUP_GRP + the number of the group the slot's tag has become.
+const DUP_BLK: u32 = 9;
+const DUP_GRP: u32 = 1 << 31;
+const _: () = assert!(LG_BLOCK <= 1 << DUP_BLK);
 
-/// The copies of one event key met so far: the earliest ingested of them (`ing`, exact) and its event (`loc`,
+/// The copies of one event key met so far: the earliest ingested of them as its record (`rec.loc` is its event,
 /// 0 = it has none). `more` chains the other keys that share the tag and the group: 1 + their `DGroup`, 0 = none.
 #[derive(Clone, Copy)]
 struct DGroup {
-    key: u64,
-    ing: i64,
-    loc: u32,
+    rec: LRec,
     more: u32,
 }
 
@@ -3415,6 +3434,7 @@ struct DGroup {
 struct Dedup {
     tags: Vec<DTags>,
     pos: Vec<[u32; DUP_G]>, // per slot that holds a tag: the record that brought it (position + 1), or DUP_GRP + its group
+    blocks: Vec<&'static [LRec]>, // the bucket's blocks, every shard's in turn (the records outlive the pass)
     groups: Vec<DGroup>,
     total: usize,
 }
@@ -3428,11 +3448,10 @@ const DUP_DROPS: usize = 16;
 struct DupRun<'a> {
     cx: &'a Ctx,
     far: &'a HashMap<(u64, u32), i64>,
-    shards: &'a [Shard],
-    b: usize,
+    blocks: &'a [&'static [LRec]],
     pos: *mut u32, // `Dedup::pos` of this bucket's table, by slot
     groups: &'a mut Vec<DGroup>,
-    pend: [(u32, LRec); DUP_PEND], // (slot, record); slot u32::MAX = none
+    pend: [(u32, *const LRec); DUP_PEND], // (slot, record); slot u32::MAX = none
     pk: usize,
     drops: [u32; DUP_DROPS], // `LRec::loc`, 0 = none
     dk: usize,
@@ -3443,18 +3462,17 @@ impl DupRun<'_> {
     /// The record at position `p` (+ 1) of this bucket.
     #[inline(always)]
     fn rec(&self, p: u32) -> *const LRec {
-        let (t, i) = ((p - 1) as usize >> DUP_POS_T, (p - 1) as usize & ((1 << DUP_POS_T) - 1));
-        // SAFETY: i < the stream's length, so block i / LG_BLOCK holds it
-        unsafe { self.shards[t].lg[self.b].blocks[i / LG_BLOCK].add(i % LG_BLOCK) }
+        let (k, i) = (((p - 1) >> DUP_BLK) as usize, ((p - 1) & ((1 << DUP_BLK) - 1)) as usize);
+        &self.blocks[k][i]
     }
 
-    /// The record `r` found its tag in `slot`: it is settled once DUP_PEND more have come, when the record or
+    /// The record at `r` found its tag in `slot`: it is settled once DUP_PEND more have come, when the record or
     /// the group in that slot has had time to arrive.
     #[inline(always)]
-    fn met(&mut self, slot: u32, r: &LRec) {
+    fn met(&mut self, slot: u32, r: *const LRec) {
         let k = self.pk;
         let (old_slot, old) = self.pend[k];
-        self.pend[k] = (slot, *r);
+        self.pend[k] = (slot, r);
         self.pk = (k + 1) % DUP_PEND;
         // SAFETY: a slot that holds a tag has its position written
         let p = unsafe { *self.pos.add(slot as usize) };
@@ -3464,7 +3482,8 @@ impl DupRun<'_> {
             prefetch(self.groups.as_ptr().wrapping_add((p - DUP_GRP) as usize));
         }
         if old_slot != u32::MAX {
-            self.settle(old_slot, old);
+            // SAFETY: a record of a live stream
+            self.settle(old_slot, unsafe { *old });
         }
     }
 
@@ -3482,6 +3501,16 @@ impl DupRun<'_> {
         }
     }
 
+    /// True when the copy `a` was ingested before the copy `b` of its key. `LRec::ing` grows with the ingest_ts
+    /// (and is one value for all that are late whatever their ts), except for the few kept exact on the side.
+    #[inline(always)]
+    fn earlier(&self, a: &LRec, b: &LRec) -> bool {
+        if a.ing != ING_FAR && b.ing != ING_FAR {
+            return a.ing < b.ing;
+        }
+        self.cx.ingest_of(a, self.far) < self.cx.ingest_of(b, self.far)
+    }
+
     /// The record `r` joins the copies of its key among the records that brought the tag of `slot`: the earlier
     /// ingested of it and the earliest so far stays, the other one's event is dropped. Copies with one ingest_ts
     /// are identical: the one met first stays.
@@ -3493,37 +3522,35 @@ impl DupRun<'_> {
         let mut g = if p < DUP_GRP {
             // the tag's first repeat: the record it met starts the group
             // SAFETY: the address of a record of a live stream
-            let f = unsafe { *self.rec(p) };
+            let rec = unsafe { *self.rec(p) };
             self.cands += 1;
-            let g = self.new_group(DGroup { key: f.key, ing: self.cx.ingest_of(&f, self.far), loc: f.loc, more: 0 });
+            let g = self.new_group(DGroup { rec, more: 0 });
             // SAFETY: as in `met`
             unsafe { *self.pos.add(slot as usize) = DUP_GRP + g as u32 };
             g
         } else {
             (p - DUP_GRP) as usize
         };
-        let ri = self.cx.ingest_of(&r, self.far);
         loop {
-            let e = &mut self.groups[g];
-            if e.key == r.key {
+            let e = self.groups[g];
+            if e.rec.key == r.key {
                 let mut lose = r.loc;
-                if ri < e.ing {
-                    lose = e.loc;
-                    (e.ing, e.loc) = (ri, r.loc);
+                if self.earlier(&r, &e.rec) {
+                    lose = e.rec.loc;
+                    self.groups[g].rec = r;
                 }
                 if lose != 0 {
                     self.drop_rec(lose);
                 }
                 return;
             }
-            let more = e.more;
-            if more == 0 {
+            if e.more == 0 {
                 // another key on this tag: its own copies, told apart by key
-                let n = self.new_group(DGroup { key: r.key, ing: ri, loc: r.loc, more: 0 });
+                let n = self.new_group(DGroup { rec: r, more: 0 });
                 self.groups[g].more = n as u32 + 1;
                 return;
             }
-            g = (more - 1) as usize;
+            g = (e.more - 1) as usize;
         }
     }
 
@@ -3542,7 +3569,8 @@ impl DupRun<'_> {
         for j in 0..DUP_PEND {
             let (slot, r) = self.pend[(self.pk + j) % DUP_PEND];
             if slot != u32::MAX {
-                self.settle(slot, r);
+                // SAFETY: a record of a live stream
+                self.settle(slot, unsafe { *r });
             }
         }
         for loc in self.drops {
@@ -3560,33 +3588,32 @@ impl DupRun<'_> {
 /// One pass over the bucket's records puts each in a table of groups of 16 slots, probed with one SIMD compare of
 /// the group's 16-bit tags: about 3 bytes of tags a record, which stay in the core's cache, and the slots'
 /// positions in an array that is only written. A record's group and tag are the two halves of one product (its
-/// hash below the bucket's bits times the number of groups), a full group spills into the next. A record whose tag
-/// is already there joins the copies of its key behind that slot (`DupRun::settle`): all copies of a key share its
-/// tag and group, so they all meet there; a few other keys do too and are told apart by key.
+/// hash below the bucket's bits times the size of the table), a full group spills into the next. A record whose
+/// tag is already there joins the copies of its key behind that slot (`DupRun::settle`): all copies of a key share
+/// its tag and group, so they all meet there; a few other keys do too and are told apart by key.
 fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -> usize {
     let far = far_map(shards); // empty unless an ingest_ts is far from the window
     let far = &far;
-    if shards.len() > 127 || shards.iter().any(|s| s.lg.iter().any(|l| l.len(LG_BLOCK) >> DUP_POS_T != 0)) {
-        die("too many events for the duplicate finder");
-    }
     let qb = buckets.trailing_zeros();
     // a thread's table starts with room for 1 MiB of tags and 1 MiB of positions (327,000 records a bucket), however
     // small the buckets: blocks of that size are in huge pages (`huge_alloc`), smaller ones in 4 KiB pages, where
     // every probe of a group and every position written is a miss of the first-level TLB
-    let new = || Dedup { tags: huge_vec((1 << 20) / 32), pos: huge_vec((1 << 20) / 64), groups: Vec::new(), total: 0 };
-    par(threads, buckets, new, |d, b| dedup_bucket(cx, far, shards, qb, b, d))
-        .iter()
-        .map(|d| d.total)
-        .sum()
+    let new = || Dedup { tags: huge_vec((1 << 20) / 32), pos: huge_vec((1 << 20) / 64), blocks: Vec::new(), groups: Vec::new(), total: 0 };
+    par(threads, buckets, new, |d, b| dedup_bucket(cx, far, shards, qb, b, d)).iter().map(|d| d.total).sum()
 }
 
 /// The event-key bucket `b` of `mark_duplicates` (`qb` = log2 of the number of buckets).
 #[inline(never)]
 fn dedup_bucket(cx: &Ctx, far: &HashMap<(u64, u32), i64>, shards: &[Shard], qb: u32, b: usize, d: &mut Dedup) {
-    let n: usize = shards.iter().map(|s| s.lg[b].len(LG_BLOCK)).sum();
+    d.blocks.clear();
+    for s in shards {
+        // SAFETY: the blocks of the streams live in the arenas, which are never unmapped before the pass is over
+        d.blocks.extend(s.lg[b].slices(LG_BLOCK).map(|x| unsafe { std::mem::transmute::<&[LRec], &'static [LRec]>(x) }));
+    }
+    let n: usize = d.blocks.iter().map(|x| x.len()).sum();
     // 10 records a group of 16 slots on average: more slots than records, so a probe always ends
     let ng = n / 10 + 1;
-    if ng >= 1 << 26 {
+    if ng >= 1 << 26 || d.blocks.len() >= 1 << (31 - DUP_BLK) {
         die("too many events for the duplicate finder");
     }
     d.tags.clear();
@@ -3602,11 +3629,10 @@ fn dedup_bucket(cx: &Ctx, far: &HashMap<(u64, u32), i64>, shards: &[Shard], qb: 
     let mut run = DupRun {
         cx,
         far,
-        shards,
-        b,
+        blocks: &d.blocks,
         pos: pb as *mut u32,
         groups: &mut d.groups,
-        pend: [(u32::MAX, LRec { key: 0, ing: 0, loc: 0 }); DUP_PEND],
+        pend: [(u32::MAX, std::ptr::null()); DUP_PEND],
         pk: 0,
         drops: [0; DUP_DROPS],
         dk: 0,
@@ -3623,50 +3649,52 @@ fn dedup_bucket(cx: &Ctx, far: &HashMap<(u64, u32), i64>, shards: &[Shard], qb: 
     // The records of a block that met their tag, as (slot, index in the block): they go to `met` after the block,
     // so the loop over the block calls nothing and keeps what it needs in registers
     let mut dups = [(0u32, 0u32); LG_BLOCK];
-    // ahead of record i: its stream RA records on
+    // ahead of record i: its stream RA records on, and the tags of the group of the record LA on
     const RA: usize = 40;
-    for (t, s) in shards.iter().enumerate() {
-        let mut me = ((t as u32) << DUP_POS_T) + 1;
-        let blks: Vec<&[LRec]> = s.lg[b].slices(LG_BLOCK).collect();
-        for (k, &blk) in blks.iter().enumerate() {
-            let (n, p) = (blk.len(), blk.as_ptr());
-            // the records ahead of the last RA are in the next block (or nowhere: any address will do)
-            let np = blks.get(k + 1).map_or(p, |x| x.as_ptr());
-            let (mut nd, mut i) = (0, 0);
-            while i < n {
-                prefetch(if i + RA < n { p.wrapping_add(i + RA) } else { np.wrapping_add(i + RA - n) });
-                let end = (i + 4).min(n);
-                while i < end {
-                    // SAFETY: i < n <= LG_BLOCK; off is a multiple of 32 below span, a group of the table, whose
-                    // 16 slots are 32 bytes of `tags` and 64 of `pos`; nd <= i
-                    unsafe {
-                        let (mut off, tag) = place((*p.add(i)).key);
-                        loop {
-                            let (eq, empty) = tags_match(tb.add(off) as *const DTags, tag);
-                            if eq != 0 {
-                                *dups.get_unchecked_mut(nd) = (((off + eq.trailing_zeros() as usize) >> 1) as u32, i as u32);
-                                nd += 1;
-                                break;
-                            }
-                            if empty != 0 {
-                                let at = off + empty.trailing_zeros() as usize;
-                                *(tb.add(at) as *mut u16) = tag;
-                                *(pb.add(2 * at) as *mut u32) = me + i as u32;
-                                break;
-                            }
-                            off += 32;
-                            if off == span {
-                                off = 0;
-                            }
+    const LA: usize = 8;
+    for (k, &blk) in d.blocks.iter().enumerate() {
+        let (n, p) = (blk.len(), blk.as_ptr());
+        let me = ((k as u32) << DUP_BLK) + 1;
+        // the records ahead of the last RA are in the next block (or nowhere: any address will do)
+        let np = d.blocks.get(k + 1).map_or(p, |x| x.as_ptr());
+        let (mut nd, mut i) = (0, 0);
+        while i < n {
+            prefetch(if i + RA < n { p.wrapping_add(i + RA) } else { np.wrapping_add(i + RA - n) });
+            let end = (i + 4).min(n);
+            while i < end {
+                // SAFETY: i < n <= LG_BLOCK; off is a multiple of 32 below span, a group of the table, whose 16
+                // slots are 32 bytes of `tags` and 64 of `pos`; nd <= i
+                unsafe {
+                    prefetch(tb.wrapping_add(place((*p.add(if i + LA < n { i + LA } else { i })).key).0));
+                    let (mut off, tag) = place((*p.add(i)).key);
+                    loop {
+                        let (eq, empty) = tags_match(tb.add(off) as *const DTags, tag);
+                        if eq != 0 {
+                            *dups.get_unchecked_mut(nd) = (((off + eq.trailing_zeros() as usize) >> 1) as u32, i as u32);
+                            nd += 1;
+                            break;
+                        }
+                        if empty != 0 {
+                            let at = off + empty.trailing_zeros() as usize;
+                            *(tb.add(at) as *mut u16) = tag;
+                            *(pb.add(2 * at) as *mut u32) = me + i as u32;
+                            break;
+                        }
+                        off += 32;
+                        if off == span {
+                            off = 0;
                         }
                     }
-                    i += 1;
                 }
+                i += 1;
             }
-            for &(slot, i) in &dups[..nd] {
-                run.met(slot, &blk[i as usize]);
-            }
-            me += n as u32;
+        }
+        // the positions of the slots they met are asked for before the first of them is read
+        for &(slot, _) in &dups[..nd] {
+            prefetch(run.pos.wrapping_add(slot as usize));
+        }
+        for &(slot, i) in &dups[..nd] {
+            run.met(slot, &blk[i as usize]);
         }
     }
     run.finish();

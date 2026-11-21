@@ -3948,37 +3948,37 @@ fn plain_i64(buf: &mut Vec<u8>, vals: impl Iterator<Item = i64>) {
     }
 }
 
-
-fn page_slices<'a>(segs: &[&'a [UserRow]], lo: usize, hi: usize, out: &mut Vec<&'a [UserRow]>) {
-    out.clear();
-    let mut base = 0;
-    for &s in segs {
-        let (a, b) = (base, base + s.len());
-        if b > lo && a < hi {
-            out.push(&s[lo.max(a) - a..hi.min(b) - a]);
-        }
-        base = b;
-    }
-}
-
 /// Appends the ID of key `k` as a PLAIN byte array: 4-byte length, then the bytes.
 #[inline]
 fn put_name(b: &mut Vec<u8>, names: &Interner, k: u64, tmp: &mut Vec<u8>) {
     if k & INTERNED == 0 {
-        // a packed ID: five digit pairs to ten bytes, the zero digits past its length cut off
-        let mut buf = [0u8; 10];
-        for (i, sh) in [48, 36, 24, 12, 0].into_iter().enumerate() {
-            buf[2 * i..2 * i + 2].copy_from_slice(&PAIRS[((k >> sh) & 0xfff) as usize].to_le_bytes());
-        }
+        // a packed ID: five digit pairs to ten bytes after the length, the zero digits past its length cut off
         let len = 10 - (k.trailing_zeros() / 6) as usize;
-        b.extend_from_slice(&(len as u32).to_le_bytes());
-        b.extend_from_slice(&buf[..len]);
+        let mut buf = [0u8; 16];
+        buf[..4].copy_from_slice(&(len as u32).to_le_bytes());
+        for (i, sh) in [48, 36, 24, 12, 0].into_iter().enumerate() {
+            buf[4 + 2 * i..6 + 2 * i].copy_from_slice(&PAIRS[((k >> sh) & 0xfff) as usize].to_le_bytes());
+        }
+        put16(b, buf, 4 + len);
         return;
     }
     tmp.clear();
     names.bytes(k, tmp);
     b.extend_from_slice(&(tmp.len() as u32).to_le_bytes());
     b.extend_from_slice(tmp);
+}
+
+/// Appends the first `n` (at most 16) of the bytes `v` with one 16-byte store instead of a copy of `n` bytes.
+#[inline(always)]
+fn put16(b: &mut Vec<u8>, v: [u8; 16], n: usize) {
+    debug_assert!(n <= 16);
+    b.reserve(16);
+    // SAFETY: the reserve leaves room for 16 bytes past the length, and n <= 16 of them are now written
+    unsafe {
+        let l = b.len();
+        std::ptr::write_unaligned(b.as_mut_ptr().add(l) as *mut [u8; 16], v);
+        b.set_len(l + n);
+    }
 }
 
 /// The 6-bit digit pairs of a packed ID as two bytes: 4096 entries, the first character in the low byte.
@@ -4032,18 +4032,33 @@ fn put_delta(b: &mut Vec<u8>, v: &[i64]) {
             if w == 0 {
                 continue;
             }
-            let (mut acc, mut nb) = (0u128, 0u32);
-            for &x in &r[k * 32..k * 32 + 32] {
-                acc |= (x as u128) << nb;
-                nb += w;
-                if nb >= 64 {
-                    b.extend_from_slice(&(acc as u64).to_le_bytes());
-                    acc >>= 64;
-                    nb -= 64;
+            // 32 values of w bits: 4w bytes, written as whole 64-bit words into room reserved for them plus one
+            // word (the last, partial word is stored whole and only its bytes in use are kept)
+            let bytes = 4 * w as usize;
+            b.reserve(bytes + 8);
+            // SAFETY: the full words end at or before `bytes` and the last store at most 8 bytes later, all inside
+            // the reserved room
+            unsafe {
+                let base = b.as_mut_ptr().add(b.len());
+                let (mut acc, mut nb, mut o) = (0u64, 0u32, 0usize);
+                for &x in &r[k * 32..k * 32 + 32] {
+                    acc |= x << nb; // nb < 64; bits past 64 come back below
+                    let nn = nb + w;
+                    if nn >= 64 {
+                        std::ptr::write_unaligned(base.add(o) as *mut u64, acc.to_le());
+                        o += 8;
+                        acc = if nn > 64 { x >> (w - (nn - 64)) } else { 0 };
+                        nb = nn - 64;
+                    } else {
+                        nb = nn;
+                    }
                 }
-            }
-            if nb > 0 {
-                b.extend_from_slice(&acc.to_le_bytes()[..nb.div_ceil(8) as usize]);
+                if nb > 0 {
+                    std::ptr::write_unaligned(base.add(o) as *mut u64, acc.to_le());
+                    o += nb.div_ceil(8) as usize;
+                }
+                debug_assert_eq!(o, bytes);
+                b.set_len(b.len() + bytes);
             }
         }
         i += m;
@@ -4051,21 +4066,25 @@ fn put_delta(b: &mut Vec<u8>, v: &[i64]) {
 }
 
 /// One run of the RLE/bit-packed hybrid: `run` copies of the `vb`-byte value `idx`.
+#[inline(always)]
 fn put_run(b: &mut Vec<u8>, run: usize, idx: u32, vb: usize) {
+    // at most 10 bytes of ULEB128 and 4 of the value: one 16-byte store
+    let mut buf = [0u8; 16];
     let mut v = (run as u64) << 1;
+    let mut n = 0;
     while v >= 0x80 {
-        b.push(v as u8 | 0x80);
+        buf[n] = v as u8 | 0x80;
         v >>= 7;
+        n += 1;
     }
-    b.push(v as u8);
-    b.extend_from_slice(&idx.to_le_bytes()[..vb]);
+    buf[n] = v as u8;
+    buf[n + 1..n + 5].copy_from_slice(&idx.to_le_bytes());
+    put16(b, buf, n + 1 + vb);
 }
 
 fn write_users(path: &Path, rows: &[UserRow], cat_names: &[Bytes], names: &Interner) -> std::io::Result<()> {
-    let segs: &[&[UserRow]] = &[rows];
     let mut tmp = Vec::with_capacity(64);
-    let n: usize = segs.iter().map(|s| s.len()).sum();
-    let mut part: Vec<&[UserRow]> = Vec::new();
+    let n = rows.len();
     let mut run: Vec<u8> = Vec::new();
     let mut vals: Vec<i64> = Vec::new();
     // user_id is dictionary encoded: one entry per run of equal IDs (a person's days are consecutive rows), and
@@ -4075,7 +4094,7 @@ fn write_users(path: &Path, rows: &[UserRow], cat_names: &[Bytes], names: &Inter
     write_parquet(path, &USER_COLS, n, |c, lo, hi, b| {
         if c == 0 && lo == DICT_PAGE {
             let mut prev: Option<u64> = None;
-            for r in segs.iter().flat_map(|s| s.iter()) {
+            for r in rows {
                 if prev != Some(r.name) {
                     put_name(b, names, r.name, &mut tmp);
                     entries += 1;
@@ -4085,13 +4104,13 @@ fn write_users(path: &Path, rows: &[UserRow], cat_names: &[Bytes], names: &Inter
             (idx, last) = (u32::MAX, None);
             return entries;
         }
-        page_slices(segs, lo, hi, &mut part);
+        let part = &rows[lo..hi];
         match c {
             0 => {
                 let w = (usize::BITS - (entries.max(2) - 1).leading_zeros()) as usize;
                 b.push(w as u8);
                 let mut count = 0;
-                for r in part.iter().flat_map(|s| s.iter()) {
+                for r in part.iter() {
                     if last == Some(r.name) {
                         count += 1;
                     } else {
@@ -4109,12 +4128,12 @@ fn write_users(path: &Path, rows: &[UserRow], cat_names: &[Bytes], names: &Inter
             }
             1..=4 => {
                 vals.clear();
-                vals.extend(part.iter().flat_map(|s| s.iter()).map(|r| match c {
-                    1 => r.day as i64,
-                    2 => r.sessions as i64,
-                    3 => r.events as i64,
-                    _ => r.revenue,
-                }));
+                match c {
+                    1 => vals.extend(part.iter().map(|r| r.day as i64)),
+                    2 => vals.extend(part.iter().map(|r| r.sessions as i64)),
+                    3 => vals.extend(part.iter().map(|r| r.events as i64)),
+                    _ => vals.extend(part.iter().map(|r| r.revenue)),
+                }
                 put_delta(b, &vals);
             }
             _ => {
@@ -4128,7 +4147,7 @@ fn write_users(path: &Path, rows: &[UserRow], cat_names: &[Bytes], names: &Inter
                 }
                 run.push(v as u8);
                 let (mut cur, mut k) = (0u8, 0);
-                for r in part.iter().flat_map(|s| s.iter()) {
+                for r in part.iter() {
                     cur |= ((r.top != NO_CAT) as u8) << k;
                     k += 1;
                     if k == 8 {
@@ -4141,7 +4160,7 @@ fn write_users(path: &Path, rows: &[UserRow], cat_names: &[Bytes], names: &Inter
                 }
                 b.extend_from_slice(&((run.len()) as u32).to_le_bytes());
                 b.extend_from_slice(&run);
-                for r in part.iter().flat_map(|s| s.iter()) {
+                for r in part.iter() {
                     if r.top != NO_CAT {
                         let v = cat_names[r.top as usize];
                         b.extend_from_slice(&(v.len() as u32).to_le_bytes());

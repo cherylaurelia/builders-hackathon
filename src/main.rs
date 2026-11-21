@@ -45,6 +45,13 @@ fn mix(mut x: u64) -> u64 {
     x ^ (x >> 33)
 }
 
+/// One multiplication: the high bits of the product depend on every bit of `x`. Enough to pick a table slot or a
+/// bucket by the high bits; `mix` where the low bits are used too.
+#[inline(always)]
+fn spread(x: u64) -> u64 {
+    x.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
 #[inline]
 fn hash_bytes(b: &[u8]) -> u64 {
     const K: u64 = 0x9E3779B97F4A7C15;
@@ -419,7 +426,7 @@ impl IdTable {
 
     #[inline(always)]
     fn home(&self, key: u64) -> usize {
-        (mix(key) >> (64 - self.bits)) as usize
+        (spread(key) >> (64 - self.bits)) as usize
     }
 
     /// `home(key)`, with its cache line on the way: the lookup comes a few lines of input later.
@@ -1462,7 +1469,7 @@ impl Shard {
     /// Any parsed event: its dedup record. `loc` = 0 for an invalid or late one.
     #[inline(always)]
     fn log(&mut self, cx: &Ctx, ekey: u64, ingest: i64, loc: u64) {
-        let q = (mix(ekey) >> cx.qshift) as usize;
+        let q = (spread(ekey) >> cx.qshift) as usize;
         push_wc(&mut self.lg[q], &mut self.lg_wc[q], &mut self.lg_n[q], &mut self.arena, LG_BLOCK, LRec { key: ekey, ingest, loc });
     }
 

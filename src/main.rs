@@ -144,15 +144,6 @@ impl SStr {
             mix(self.0 ^ self.1.rotate_left(29).wrapping_mul(0x9E3779B97F4A7C15))
         }
     }
-    /// Byte-wise order. Inline: big-endian (bytes, zero padding, length) orders exactly like the bytes.
-    #[inline]
-    fn less(self, o: SStr) -> bool {
-        if !self.is_long() && !o.is_long() {
-            (self.0.swap_bytes(), self.1.swap_bytes()) < (o.0.swap_bytes(), o.1.swap_bytes())
-        } else {
-            self.get() < o.get()
-        }
-    }
 }
 impl PartialEq for SStr {
     #[inline]
@@ -314,14 +305,84 @@ impl<T: Copy> Blocks<T> {
 
 // ---------------------------------------------------------------- the ID table
 
-/// One slot: state 0 empty, 1 being written, 2 ready. `pid` is the person id: the slot of the person's smallest ID.
-#[repr(C, align(32))]
-struct Slot {
-    st: AtomicU32,
-    pid: AtomicU32,
-    lo: AtomicU64,
-    hi: AtomicU64,
+/// An ID as a 12-byte table key: up to 11 bytes inline (zero padded, length in the top byte of `b`), else
+/// (address, length | 0xFF << 24). The inline form is canonical: two inline keys are equal when (a, b) are.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+struct Key {
+    a: u64,
+    b: u32,
 }
+const MHI32: [u32; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFFFF, 0xFF_FFFF];
+impl Key {
+    #[inline(always)]
+    fn is_long(self) -> bool {
+        self.b >> 24 == 0xFF
+    }
+    fn long(s: &'static [u8]) -> Key {
+        if s.len() >= 1 << 24 {
+            die("ID longer than 16 MB");
+        }
+        Key { a: s.as_ptr() as u64, b: s.len() as u32 | 0xFF << 24 }
+    }
+    fn new(s: &'static [u8]) -> Key {
+        if s.len() > 11 {
+            return Key::long(s);
+        }
+        let mut x = [0u8; 12];
+        x[..s.len()].copy_from_slice(s);
+        x[11] = s.len() as u8;
+        Key { a: u64::from_le_bytes(x[..8].try_into().unwrap()), b: u32::from_le_bytes(x[8..].try_into().unwrap()) }
+    }
+    /// Same as `new`, but reads 12 bytes at the start of `s`: the caller guarantees they are mapped.
+    #[inline(always)]
+    unsafe fn fast(s: &'static [u8]) -> Key {
+        let n = s.len();
+        if n > 11 {
+            return Key::long(s);
+        }
+        let p = s.as_ptr();
+        Key { a: (p as *const u64).read_unaligned() & MLO[n], b: ((p.add(8) as *const u32).read_unaligned() & MHI32[n]) | (n as u32) << 24 }
+    }
+    #[inline]
+    fn bytes(&self) -> &[u8] {
+        if self.is_long() {
+            unsafe { std::slice::from_raw_parts(self.a as *const u8, (self.b & 0xFF_FFFF) as usize) }
+        } else {
+            unsafe { std::slice::from_raw_parts(self as *const Key as *const u8, (self.b >> 24) as usize) }
+        }
+    }
+    #[inline(always)]
+    fn same(self, o: Key) -> bool {
+        self == o || (self.is_long() && o.is_long() && self.bytes() == o.bytes())
+    }
+    #[inline(always)]
+    fn hash(self) -> u64 {
+        if self.is_long() {
+            hash_bytes(self.bytes())
+        } else {
+            mix(self.a ^ (self.b as u64).wrapping_mul(0x9E3779B97F4A7C15))
+        }
+    }
+    /// As an SStr (for output).
+    fn sstr(self) -> SStr {
+        if self.is_long() {
+            SStr::new(unsafe { std::slice::from_raw_parts(self.a as *const u8, (self.b & 0xFF_FFFF) as usize) })
+        } else {
+            let n = (self.b >> 24) as u64;
+            SStr(self.a, (self.b & 0xFF_FFFF) as u64 | n << 56)
+        }
+    }
+}
+
+/// One 16-byte slot: `b` = key.b | person id << 32, 0 when empty; the person id reads BUSY while the slot is being
+/// written. The person id is the slot of the person's smallest ID.
+#[repr(C, align(16))]
+struct Slot {
+    a: AtomicU64,
+    b: AtomicU64,
+}
+const BUSY: u32 = u32::MAX;
 
 struct Table {
     s: &'static [Slot],
@@ -338,35 +399,42 @@ impl Table {
         (h >> self.shift) as usize
     }
     #[inline]
-    fn key(&self, i: usize) -> SStr {
-        SStr(self.s[i].lo.load(Relaxed), self.s[i].hi.load(Relaxed))
+    fn key(&self, i: usize) -> Key {
+        Key { a: self.s[i].a.load(Relaxed), b: self.s[i].b.load(Relaxed) as u32 }
+    }
+    fn set_pid(&self, i: usize, pid: u32) {
+        let b = self.s[i].b.load(Relaxed);
+        self.s[i].b.store(b & 0xFFFF_FFFF | (pid as u64) << 32, Relaxed);
+    }
+    fn used(&self, i: usize) -> bool {
+        self.s[i].b.load(Relaxed) != 0
     }
     /// The person id of ID `k` (hash `h`); an ID seen for the first time becomes its own person.
     #[inline]
-    fn get_or_insert(&self, k: SStr, h: u64) -> u32 {
+    fn get_or_insert(&self, k: Key, h: u64) -> u32 {
         let mut i = self.home(h);
         let mut probes = 0;
         loop {
             let sl = &self.s[i];
-            let mut st = sl.st.load(Acquire);
-            if st == 0 {
-                match sl.st.compare_exchange(0, 1, Acquire, Acquire) {
+            let mut b = sl.b.load(Acquire);
+            if b == 0 {
+                match sl.b.compare_exchange(0, k.b as u64 | (BUSY as u64) << 32, Acquire, Acquire) {
                     Ok(_) => {
-                        sl.lo.store(k.0, Relaxed);
-                        sl.hi.store(k.1, Relaxed);
-                        sl.pid.store(i as u32, Relaxed);
-                        sl.st.store(2, Release);
+                        sl.a.store(k.a, Relaxed);
+                        sl.b.store(k.b as u64 | (i as u64) << 32, Release);
                         return i as u32;
                     }
-                    Err(x) => st = x,
+                    Err(x) => b = x,
                 }
             }
-            while st == 1 {
-                std::hint::spin_loop();
-                st = sl.st.load(Acquire);
-            }
-            if SStr(sl.lo.load(Relaxed), sl.hi.load(Relaxed)) == k {
-                return sl.pid.load(Relaxed);
+            if b as u32 == k.b {
+                while (b >> 32) as u32 == BUSY {
+                    std::hint::spin_loop();
+                    b = sl.b.load(Acquire);
+                }
+                if (Key { a: sl.a.load(Relaxed), b: k.b }).same(k) {
+                    return (b >> 32) as u32;
+                }
             }
             i = (i + 1) & self.mask;
             probes += 1;
@@ -401,7 +469,7 @@ fn union(tab: &Table, parent: &[AtomicU32], a: u32, b: u32) {
         if ra == rb {
             return;
         }
-        let (lo, hi) = if tab.key(ra as usize).less(tab.key(rb as usize)) { (ra, rb) } else { (rb, ra) };
+        let (lo, hi) = if tab.key(ra as usize).bytes() < tab.key(rb as usize).bytes() { (ra, rb) } else { (rb, ra) };
         if parent[hi as usize].compare_exchange(0, lo + 1, AcqRel, Relaxed).is_ok() {
             return;
         }
@@ -1161,7 +1229,7 @@ fn main() {
         par(threads, cap.div_ceil(per), || (), |_, i| {
             for x in i * per..((i + 1) * per).min(cap) {
                 if parent[x].load(Relaxed) != 0 {
-                    tab.s[x].pid.store(find(parent, x as u32), Relaxed);
+                    tab.set_pid(x, find(parent, x as u32));
                 }
             }
         });
@@ -1190,7 +1258,7 @@ fn main() {
     let n_ck: usize = st.iter().flat_map(|s| s.cb.iter()).map(|b| b.len).sum();
     lap(&format!("parsed: {n_er} events, {n_ev} kept, {n_ck} clicks"));
     if std::env::var_os("C2_DIAG").is_some() {
-        let used = tab.s.iter().filter(|s| s.st.load(Relaxed) != 0).count();
+        let used = (0..cap).filter(|&i| tab.used(i)).count();
         eprintln!("id table: {used} of {cap} slots used");
     }
 
@@ -1254,6 +1322,15 @@ fn main() {
 const BATCH: usize = 32;
 
 #[inline(always)]
+fn key(b: Bytes, fast: bool) -> Key {
+    if fast {
+        unsafe { Key::fast(b) }
+    } else {
+        Key::new(b)
+    }
+}
+
+#[inline(always)]
 fn sstr(b: Bytes, fast: bool) -> SStr {
     if fast {
         unsafe { SStr::fast(b) }
@@ -1263,7 +1340,8 @@ fn sstr(b: Bytes, fast: bool) -> SStr {
 }
 
 fn link_chunk(tab: &Table, s: &mut TS, (f, a, b): (Bytes, usize, usize)) {
-    let mut batch = [(SStr(0, 0), 0u64, SStr(0, 0), 0u64); BATCH];
+    let z = Key { a: 0, b: 0 };
+    let mut batch = [(z, 0u64, z, 0u64); BATCH];
     let mut n = 0;
     let mut lines = Lines::<2>::new(f, a, b);
     loop {
@@ -1272,7 +1350,7 @@ fn link_chunk(tab: &Table, s: &mut TS, (f, a, b): (Bytes, usize, usize)) {
         if let Some(([x, y], fast)) = next {
             // Linked IDs, rule 1: drop lines where either field is empty
             if !x.is_empty() && !y.is_empty() {
-                let (x, y) = (sstr(x, fast), sstr(y, fast));
+                let (x, y) = (key(x, fast), key(y, fast));
                 let (hx, hy) = (x.hash(), y.hash());
                 prefetch(&tab.s[tab.home(hx)]);
                 prefetch(&tab.s[tab.home(hy)]);
@@ -1298,7 +1376,7 @@ fn link_chunk(tab: &Table, s: &mut TS, (f, a, b): (Bytes, usize, usize)) {
 #[derive(Clone, Copy)]
 struct PendEv {
     eid: SStr,
-    uid: SStr,
+    uid: Key,
     uh: u64,
     eh: u64,
     ingest: u32,
@@ -1321,7 +1399,7 @@ fn ingest_secs(ctx: &Ctx, b: &[u8]) -> Option<i64> {
 fn event_chunk(ctx: &Ctx, tab: &Table, s: &mut TS, f: Bytes, a: usize, b: usize) {
     let t = s.t as u32;
     let z = SStr(0, 0);
-    let mut batch = [PendEv { eid: z, uid: z, uh: 0, eh: 0, ingest: 0, ts: 0, pay: 0, cathi: 0 }; BATCH];
+    let mut batch = [PendEv { eid: z, uid: Key { a: 0, b: 0 }, uh: 0, eh: 0, ingest: 0, ts: 0, pay: 0, cathi: 0 }; BATCH];
     let mut n = 0;
     let mut lines = Lines::<7>::new(f, a, b);
     loop {
@@ -1356,7 +1434,7 @@ fn event_chunk(ctx: &Ctx, tab: &Table, s: &mut TS, f: Bytes, a: usize, b: usize)
                     } else {
                         break 'drop;
                     };
-                    let us = sstr(uid, fast);
+                    let us = key(uid, fast);
                     let uh = us.hash();
                     prefetch(&tab.s[tab.home(uh)]);
                     batch[n] = PendEv { eid: es, uid: us, uh, eh, ingest, ts: (ts - ctx.base) as u32, pay, cathi };
@@ -1388,7 +1466,7 @@ fn event_chunk(ctx: &Ctx, tab: &Table, s: &mut TS, f: Bytes, a: usize, b: usize)
 
 #[derive(Clone, Copy)]
 struct PendCk {
-    uid: SStr,
+    uid: Key,
     uh: u64,
     ts: u32,
     camp: u16,
@@ -1396,7 +1474,7 @@ struct PendCk {
 }
 
 fn click_chunk(ctx: &Ctx, tab: &Table, s: &mut TS, f: Bytes, a: usize, b: usize) {
-    let mut batch = [PendCk { uid: SStr(0, 0), uh: 0, ts: 0, camp: 0, cid: Packed(0) }; BATCH];
+    let mut batch = [PendCk { uid: Key { a: 0, b: 0 }, uh: 0, ts: 0, camp: 0, cid: Packed(0) }; BATCH];
     let mut n = 0;
     let mut lines = Lines::<4>::new(f, a, b);
     loop {
@@ -1413,7 +1491,7 @@ fn click_chunk(ctx: &Ctx, tab: &Table, s: &mut TS, f: Bytes, a: usize, b: usize)
                     break 'line;
                 }
                 let Some(ci) = ctx.camps.get(sstr(camp, fast)) else { break 'line };
-                let us = sstr(uid, fast);
+                let us = key(uid, fast);
                 let uh = us.hash();
                 prefetch(&tab.s[tab.home(uh)]);
                 batch[n] = PendCk { uid: us, uh, ts: (t - ctx.base) as u32, camp: ci, cid: Packed::new(cid) };
@@ -1690,7 +1768,7 @@ fn person_bucket(ctx: &Ctx, tab: &Table, st: &[TS], drops: &[Vec<Vec<u32>>], b: 
         sort_small(es);
         let cs = &mut ck[w.ccnt[lp] as usize..w.ccnt[lp + 1] as usize];
         sort_small(cs);
-        person(ctx, tab.key(lp << 8 | b), es, cs, w);
+        person(ctx, tab.key(lp << 8 | b).sstr(), es, cs, w);
     }
     w.lps = lps;
     w.out = ev;

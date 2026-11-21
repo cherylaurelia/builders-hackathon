@@ -3463,7 +3463,8 @@ fn credit_clicks(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
 
 /// A person's many clicks by ts. One counting pass on the 30-minute bin of the ts puts them in order up to the bin
 /// (`cnt`: an entry per bin, a multiple of 8 of them, + 3), then an insertion pass orders the few clicks of each
-/// bin. With over 32 clicks a bin on average they are sorted by comparisons instead.
+/// bin. With over 32 clicks a bin on average, or when the insertion pass turns out to move that many (the clicks
+/// crowd into a few bins), they are sorted by comparisons instead.
 fn sort_clicks(v: &mut [CRec], tmp: &mut Vec<CRec>, cnt: &mut [u32]) {
     let (n, bins) = (v.len(), cnt.len() - 3);
     if n > 32 * bins {
@@ -3484,6 +3485,7 @@ fn sort_clicks(v: &mut [CRec], tmp: &mut Vec<CRec>, cnt: &mut [u32]) {
         tmp[*f as usize] = *c;
         *f += 1;
     }
+    let mut moves = 0;
     for i in 1..n {
         let c = tmp[i];
         let mut j = i;
@@ -3492,6 +3494,11 @@ fn sort_clicks(v: &mut [CRec], tmp: &mut Vec<CRec>, cnt: &mut [u32]) {
             j -= 1;
         }
         tmp[j] = c;
+        moves += i - j;
+        if moves > 32 * n {
+            tmp.sort_unstable_by_key(|c| c.ts());
+            break;
+        }
     }
     v.copy_from_slice(tmp);
 }
@@ -4232,6 +4239,32 @@ mod tests {
             buf.resize(p.len() + 16, 0x5a); // 16 readable bytes after the ID
             let got = unsafe { m.get_short(buf.as_ptr(), p.len()) };
             assert_eq!(got, m.get(&p), "id {p:?}");
+        }
+    }
+
+    #[test]
+    fn clicks_sort_by_ts_whatever_their_bins() {
+        // spread over the window, crowded into one bin (in falling order: the insertion pass gives up), too many
+        // for the counting pass, and just a few
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let bins = 1016usize;
+        let span = (bins as u32 - 1) * GAP as u32;
+        let cases: Vec<Vec<u32>> = vec![
+            (0..5000).map(|_| (rng.next() % span as u64) as u32).collect(),
+            (0..20000).rev().map(|i| 700_000_000 + i).collect(),
+            (0..40000).map(|_| (rng.next() % span as u64) as u32).collect(),
+            vec![5, 3, 3, 1],
+            vec![],
+        ];
+        for ts in cases {
+            let mut v: Vec<CRec> = ts.iter().enumerate().map(|(i, &t)| CRec::new(i as u64, 0, t, (i % 7) as u32)).collect();
+            let (mut tmp, mut cnt) = (Vec::new(), vec![0u32; bins + 3]);
+            sort_clicks(&mut v, &mut tmp, &mut cnt);
+            assert!(v.windows(2).all(|p| p[0].ts() <= p[1].ts()));
+            let mut ids: Vec<u64> = v.iter().map(|c| c.cid).collect();
+            ids.sort_unstable();
+            assert!(ids.iter().enumerate().all(|(i, &x)| x == i as u64) && ids.len() == ts.len());
+            assert!(v.iter().all(|c| ts[c.cid as usize] == c.ts()));
         }
     }
 

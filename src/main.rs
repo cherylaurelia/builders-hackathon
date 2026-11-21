@@ -2214,7 +2214,7 @@ fn main() {
     // A thread that has emptied the queue hands its campaign cells to this thread, then writes its user file; this
     // thread merges the cells and writes campaign_daily meanwhile instead of after the last file.
     let (tx, rx) = std::sync::mpsc::channel::<(Vec<Cred>, Vec<i64>, Vec<u32>)>();
-    let (camp_rows, _results) = std::thread::scope(|sc| {
+    let camp_rows = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..threads)
             .map(|t| {
                 let (cx, shards, order, next, n_rows, ud, cat_names) = (&cx, &shards, &order, &next, &n_rows, &ud, &cat_names);

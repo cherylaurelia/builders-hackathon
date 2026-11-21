@@ -1336,6 +1336,26 @@ fn read_span(f: &InFile, s: usize, e: usize, buf: &mut Vec<u8>) -> (usize, usize
     (len, s - bs, e - bs)
 }
 
+/// `masks64(p)` as far as it matters to a caller that only uses the bits up to the first newline: with AVX2, when
+/// that newline is in the first 32 bytes the other 32 are not looked at (their bits come back 0).
+#[inline(always)]
+unsafe fn masks_to_newline(p: *const u8) -> [u64; 3] {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        let m = |v: __m256i, c: u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 as u64;
+        let a = _mm256_loadu_si256(p as *const __m256i);
+        let n = m(a, b'\n');
+        if n != 0 {
+            return [m(a, b','), m(a, b'"'), n];
+        }
+        let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        return [m(a, b',') | m(b, b',') << 32, m(a, b'"') | m(b, b'"') << 32, m(b, b'\n') << 32];
+    }
+    #[allow(unreachable_code)]
+    masks64(p)
+}
+
 /// Calls `fast(st, line, e, [c0, c1, q0, q1])` for every line that starts in [start, end) of the `len` bytes at
 /// `buf` and has its `\n` in its first 128 bytes: line[e], and the comma bits c0 (bytes 0..64) and c1 (64..128)
 /// and quote bits q0, q1 of line[..e]. A longer line goes whole to `slow`. The header line is skipped. `buf` must
@@ -1362,7 +1382,8 @@ unsafe fn scan_lines<S>(
             let lm = (n0 & n0.wrapping_neg()) - 1;
             (n0.trailing_zeros() as usize, [c0 & lm, 0, q0 & lm, 0])
         } else {
-            let [c1, q1, n1] = masks64(line.add(64));
+            // an event line is 64 to 95 bytes long 999 times in 1000: its newline is in the next 32 bytes
+            let [c1, q1, n1] = masks_to_newline(line.add(64));
             if n1 == 0 {
                 let e = memchr::memchr(b'\n', &file[p..]).map_or(len, |i| p + i);
                 slow(st, std::mem::transmute::<&[u8], Bytes>(&file[p..e]));
@@ -1434,14 +1455,20 @@ impl Fields {
     }
 }
 
-/// The N (<= 8) fields of the line of `e` (< 128) bytes, given its comma and quote bits (see `scan_lines`); None
-/// when the line is malformed (`split::<N>` says the same).
+/// The N (<= 8) fields of the line of `e` (< 128) bytes, given its comma and quote bits (see `scan_lines`).
+/// Err(false): the line is malformed (`split::<N>` says the same). Err(true): not decided here, the line has more
+/// than 4 commas past its first 64 bytes; the caller asks `split::<N>`.
 #[inline(always)]
-fn fast_split<const N: usize>(e: usize, [c0, c1, q0, q1]: [u64; 4]) -> Option<Fields> {
+fn fast_split<const N: usize>(e: usize, [c0, c1, q0, q1]: [u64; 4]) -> Result<Fields, bool> {
     const { assert!(N >= 1 && N <= 8) };
+    // commas taken from the second word: an event line, 64 to 95 bytes long, has 1 to 3 there
+    let late = if N - 1 < 4 { N - 1 } else { 4 };
     let n0 = c0.count_ones();
     if (n0 + c1.count_ones()) as usize != N - 1 {
-        return None;
+        return Err(false);
+    }
+    if N - 1 - n0 as usize > late {
+        return Err(true);
     }
     // Well quoted <=> every quote sits at a field's first or last byte (s, ends), none is both (a lone `"`), and
     // per field a first-byte quote (x) comes with a last-byte quote (y, moved onto the boundary after it). Then
@@ -1457,15 +1484,18 @@ fn fast_split<const N: usize>(e: usize, [c0, c1, q0, q1]: [u64; 4]) -> Option<Fi
     let d1 = y1.wrapping_sub(x1).wrapping_sub(borrow as u64);
     // a quote is in place when it is a start or an end and not both: s ^ ends
     if (q0 & !(s0 ^ ends0)) | (d0 & b0) | (q1 & !(s1 ^ ends1)) | (d1 & b1) != 0 {
-        return None;
+        return Err(false);
     }
-    // The comma offsets, one a byte: N - 1 slots from each word (a slot past a word's last comma holds 64 or
-    // 128), the second word's moved up behind the first word's n0. Byte N - 1 is the newline: the field ends.
+    // The comma offsets, one a byte: N - 1 slots from the first word and `late` from the second (a slot past a
+    // word's last comma holds 64 or 128), the second word's moved up behind the first word's n0. Byte N - 1 is
+    // the newline: the field ends.
     let (mut a, mut b) = (c0, c1);
     let (mut p0, mut p1) = (0u64, 0u64);
     for j in 0..N - 1 {
         p0 |= (a.trailing_zeros() as u64) << (8 * j);
         a &= a.wrapping_sub(1);
+    }
+    for j in 0..late {
         p1 |= (64 + b.trailing_zeros() as u64) << (8 * j);
         b &= b.wrapping_sub(1);
     }
@@ -1478,7 +1508,7 @@ fn fast_split<const N: usize>(e: usize, [c0, c1, q0, q1]: [u64; 4]) -> Option<Fi
     let quoted = pdep(pext(x0, s0) | pext(x1, s1) << s0.count_ones(), ONES);
     // no byte borrows from the one above: a quoted field has its two quotes inside it
     let at = starts.wrapping_add(quoted);
-    Some(Fields { at, len: ends.wrapping_sub(at).wrapping_sub(quoted) })
+    Ok(Fields { at, len: ends.wrapping_sub(at).wrapping_sub(quoted) })
 }
 
 /// (user + sys CPU seconds, instructions retired) of this process so far; instructions only on macOS
@@ -2200,7 +2230,16 @@ fn event_fields(cx: &Ctx, [eid, uid, ts, ingest, etype, pid, price]: [Bytes; 7],
 /// line[e] is its `\n` and line[..144] is readable.
 #[inline(always)]
 unsafe fn fast_event(cx: &Ctx, line: *const u8, e: usize, m: [u64; 4], st: &mut Shard) {
-    let Some(f) = fast_split::<7>(e, m) else { return };
+    let f = match fast_split::<7>(e, m) {
+        Ok(f) => f,
+        Err(false) => return,
+        Err(true) => {
+            if let Some(f) = split::<7>(std::mem::transmute::<&[u8], Bytes>(std::slice::from_raw_parts(line, e))) {
+                event_fields(cx, f, st);
+            }
+            return;
+        }
+    };
     let (ep, el) = (line.add(f.at(0)), f.len(0));
     if el == 0 {
         return;
@@ -2264,7 +2303,8 @@ fn click_fields(cx: &Ctx, [cid, uid, camp, ts]: [Bytes; 4], st: &mut Shard) {
 
 #[inline(always)]
 unsafe fn fast_click(cx: &Ctx, line: *const u8, e: usize, m: [u64; 4], st: &mut Shard) {
-    let Some(f) = fast_split::<4>(e, m) else { return };
+    // 3 commas: never more than 4 in the second word, so never Err(true)
+    let Ok(f) = fast_split::<4>(e, m) else { return };
     if f.len(0) == 0 || f.len(1) == 0 {
         return;
     }
@@ -3931,8 +3971,9 @@ mod tests {
     /// of the 64-byte boundary.
     #[test]
     fn fast_split_matches_split() {
-        fn check<const N: usize>(r: &mut Rng, rounds: usize) -> usize {
+        fn check<const N: usize>(r: &mut Rng, rounds: usize) -> (usize, usize) {
             let mut good = 0;
+            let mut undecided = 0usize;
             for _ in 0..rounds {
                 let nf = if r.below(12) == 0 { r.below(10) } else { N };
                 let total = r.below(127);
@@ -3967,11 +4008,20 @@ mod tests {
                         0,
                         usize::MAX,
                         7 + line.len() + 1,
-                        &mut (&mut got, &mut seen),
+                        &mut (&mut got, &mut seen, &mut undecided),
                         |st, _, e, m| {
                             if *st.1 == 0 {
                                 assert_eq!(e, line.len());
-                                *st.0 = fast_split::<N>(e, m).map(|f| std::array::from_fn::<_, N, _>(|i| (f.at(i), f.len(i))));
+                                *st.0 = match fast_split::<N>(e, m) {
+                                    Ok(f) => Some(std::array::from_fn::<_, N, _>(|i| (f.at(i), f.len(i)))),
+                                    Err(false) => None,
+                                    // undecided: only with over 4 commas past byte 64, and then `split` decides
+                                    Err(true) => {
+                                        assert!(m[1].count_ones() > 4 && m[0].count_ones() + m[1].count_ones() == N as u32 - 1);
+                                        *st.2 += 1;
+                                        split::<N>(text).map(|f| f.map(|x| (if x.is_empty() { 0 } else { x.as_ptr() as usize - text.as_ptr() as usize }, x.len())))
+                                    }
+                                };
                             }
                             *st.1 += 1;
                         },
@@ -3987,13 +4037,15 @@ mod tests {
                 assert!(same && seen == 1, "{line:?}: {got:?} vs {want:?}");
                 good += want.is_some() as usize;
             }
-            good
+            (good, undecided)
         }
         let mut r = Rng(0x0dd_ba11_5eed);
-        assert!(check::<7>(&mut r, 400_000) > 50_000);
-        assert!(check::<4>(&mut r, 400_000) > 50_000);
-        assert!(check::<1>(&mut r, 20_000) > 1_000);
-        assert!(check::<8>(&mut r, 100_000) > 10_000);
+        let (good, undecided) = check::<7>(&mut r, 400_000);
+        assert!(good > 50_000 && undecided > 1_000, "{good} {undecided}");
+        let (good, undecided) = check::<4>(&mut r, 400_000);
+        assert!(good > 50_000 && undecided == 0);
+        assert!(check::<1>(&mut r, 20_000).0 > 1_000);
+        assert!(check::<8>(&mut r, 100_000).0 > 10_000);
     }
 
     /// `parse_clicks` against `for_records` + `click_fields`.

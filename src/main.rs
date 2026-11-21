@@ -2582,6 +2582,19 @@ fn event_fields(cx: &Ctx, [eid, uid, ts, ingest, etype, pid, price]: [Bytes; 7],
     }
 }
 
+/// The `pay` of a purchase (its event_type is the `kl` bytes that start `w`; its price is the next field of `b`,
+/// its product the `pl` bytes at `rest + ps`); None for a bad price and for any other type: 3% of the events.
+#[inline(never)]
+unsafe fn purchase(cx: &Ctx, rest: *const u8, kl: usize, w: u64, mut b: Cut, ps: usize, pl: usize) -> Option<u32> {
+    if kl != 8 || w != u64::from_le_bytes(*b"purchase") {
+        return None;
+    }
+    let (cs, cl) = b.next();
+    let p = parse_price(std::slice::from_raw_parts(rest.add(cs), cl))?;
+    let cat = cx.products.get_at(rest.add(ps), pl).unwrap_or(cx.unknown_cat);
+    Some((cat as u32) << 24 | p)
+}
+
 /// `event_fields` for the line at `line` with its first three fields `a` and, from `rest`, its other four `b`
 /// (`split_event`); line[..144] is readable.
 #[inline(always)]
@@ -2602,15 +2615,16 @@ unsafe fn fast_event(cx: &Ctx, line: *const u8, mut a: Cut, rest: *const u8, mut
         _ => return st.log(cx, ekey, ingest, 0),
     };
     let w = (rest.add(ks) as *const u64).read_unaligned();
-    let pay = match kl {
-        4 if w as u32 == u32::from_le_bytes(*b"view") || w as u32 == u32::from_le_bytes(*b"cart") => 0,
-        8 if w == u64::from_le_bytes(*b"purchase") => {
-            let (cs, cl) = b.next();
-            let Some(p) = parse_price(std::slice::from_raw_parts(rest.add(cs), cl)) else { return st.log(cx, ekey, ingest, 0) };
-            let cat = cx.products.get_at(rest.add(ps), pl).unwrap_or(cx.unknown_cat);
-            (cat as u32) << 24 | p
+    // view or cart in one test, no branch between the two: which of them it is is a coin toss to the predictor
+    let x = w as u32;
+    let plain = (kl == 4) & ((x == u32::from_le_bytes(*b"view")) | (x == u32::from_le_bytes(*b"cart")));
+    let pay = if plain {
+        0
+    } else {
+        match purchase(cx, rest, kl, w, b, ps, pl) {
+            Some(pay) => pay,
+            None => return st.log(cx, ekey, ingest, 0),
         }
-        _ => return st.log(cx, ekey, ingest, 0),
     };
     st.keep(cx, ekey, ingest, cx.names.key_at(line.add(us), ul), ts, pay);
 }

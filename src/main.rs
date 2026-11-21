@@ -234,19 +234,79 @@ struct Arena {
 }
 
 impl Arena {
-    const CHUNK: usize = 32 << 20;
+    // small in the unit tests: they make hundreds of shards, each with a chunk of its own
+    const CHUNK: usize = if cfg!(test) { 1 << 20 } else { 32 << 20 };
 
     #[inline]
     fn alloc(&mut self, bytes: usize) -> *mut u8 {
         if self.cur + bytes > self.end {
-            let n = bytes.max(Self::CHUNK);
-            self.cur = map_anon(n) as usize;
-            self.end = self.cur + n;
+            self.cur = region().take(bytes.max(Self::CHUNK));
+            self.end = self.cur + bytes.max(Self::CHUNK);
         }
         let p = self.cur;
         self.cur += bytes;
         p as *mut u8
     }
+}
+
+/// The address space every arena chunk comes from: one reserved stretch (no memory until it is written to), so
+/// that a record in it has a 32-bit name, its offset in units of 4 bytes (`Region::name`).
+struct Region {
+    base: usize,
+    len: usize,
+    next: AtomicUsize,
+}
+
+impl Region {
+    /// `bytes` (a multiple of 64) of zeroed memory.
+    fn take(&self, bytes: usize) -> usize {
+        let at = self.next.fetch_add(bytes, Relaxed);
+        if at + bytes > self.len {
+            die(&format!("the records need more than the {} GiB of address space reserved for them", self.len >> 30));
+        }
+        self.base + at
+    }
+
+    /// The name of the 4-byte aligned address `p` in the region; never 0.
+    #[inline(always)]
+    fn name(&self, p: usize) -> u32 {
+        ((p - self.base) >> 2) as u32
+    }
+
+    #[inline(always)]
+    fn addr(&self, name: u32) -> usize {
+        self.base + ((name as usize) << 2)
+    }
+}
+
+fn region() -> &'static Region {
+    static REGION: std::sync::OnceLock<Region> = std::sync::OnceLock::new();
+    REGION.get_or_init(|| {
+        // 16 GiB is all a 32-bit name reaches, and about 450M events' worth of records; a system that refuses to
+        // reserve that much gets what it allows
+        const HUGE: usize = 2 << 20;
+        let mut len = 16usize << 30;
+        loop {
+            #[cfg(target_os = "linux")]
+            let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
+            #[cfg(not(target_os = "linux"))]
+            let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+            let p = unsafe { libc::mmap(std::ptr::null_mut(), len + HUGE, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0) };
+            if p != libc::MAP_FAILED {
+                let base = (p as usize + HUGE - 1) & !(HUGE - 1);
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    libc::madvise(base as *mut libc::c_void, len, libc::MADV_HUGEPAGE); // a hint: fine if refused
+                }
+                // the first chunk starts 2 MiB in: no record has the name 0
+                return Region { base, len, next: AtomicUsize::new(HUGE) };
+            }
+            if len <= 1 << 30 {
+                die(&format!("mmap of {len} bytes of address space: {}", std::io::Error::last_os_error()));
+            }
+            len /= 2;
+        }
+    })
 }
 
 /// An append-only list of `T` in blocks of `per` records; a record never moves.
@@ -1356,15 +1416,19 @@ struct ERec {
 }
 const DROPPED: u32 = u32::MAX;
 
-/// One parsed event line in its event-key bucket: `loc` is the address of its `ERec`, 0 for an invalid or late event
-/// (it still takes part in dedup).
+/// One parsed event line in its event-key bucket, 16 bytes. `ing`: ingest_ts as whole seconds after
+/// `Ctx::ing_base`, or (bit 31 set) an entry of a shard's `odd_ing` list for one that is not such a number.
+/// `loc`: the `Region::name` of its `ERec`, 0 for an invalid or late event (it still takes part in dedup).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct LRec {
     key: u64,
-    ingest: i64,
-    loc: u64,
+    ing: u32,
+    loc: u32,
 }
+const ING_ODD: u32 = 1 << 31;
+const ING_SHARD_BITS: u32 = 6;
+const ING_INDEX_BITS: u32 = 31 - ING_SHARD_BITS;
 
 /// A valid click in its person partition.
 #[repr(C)]
@@ -1378,11 +1442,11 @@ struct CRec {
 }
 
 const EV_BLOCK: usize = 512;
-const LG_BLOCK: usize = 256;
+const LG_BLOCK: usize = 384;
 /// Records per write-combining buffer (192 bytes each); the blocks above are whole numbers of them.
 const EV_WC: usize = 16;
-const LG_WC: usize = 8;
-const _: () = assert!(EV_BLOCK % EV_WC == 0 && LG_BLOCK % LG_WC == 0 && EV_BLOCK * 12 % 64 == 0 && LG_BLOCK * 24 % 64 == 0 && CK_BLOCK * 24 % 64 == 0 && Arena::CHUNK % 64 == 0);
+const LG_WC: usize = 12;
+const _: () = assert!(EV_BLOCK % EV_WC == 0 && LG_BLOCK % LG_WC == 0 && EV_BLOCK * 12 % 64 == 0 && LG_BLOCK * 16 % 64 == 0 && CK_BLOCK * 24 % 64 == 0 && Arena::CHUNK % 64 == 0);
 const CK_BLOCK: usize = 128;
 
 /// A valid event or click whose user ID is on its way from memory (`IdTable::aim`).
@@ -1401,6 +1465,9 @@ const RING: usize = 16;
 
 /// One parse thread's output.
 struct Shard {
+    id: usize, // which parse thread: names its `odd_ing` entries
+    odd_ing: Vec<i64>,
+    region: &'static Region,
     arena: Arena,
     ev: Vec<Stream<ERec>>,
     ck: Vec<Stream<CRec>>,
@@ -1434,6 +1501,7 @@ struct Ctx {
     ws: i64,
     we: i64,
     base: i64, // ws - 7 days: every kept ts is in [base, base + 2^32)
+    ing_base: i64, // `base` rounded down to a whole second
     day0: i64,
     ndays: usize,
     ncamp: usize, // organic is index ncamp
@@ -1448,15 +1516,18 @@ struct Ctx {
 }
 
 impl Shard {
-    fn new(parts: usize, buckets: usize) -> Shard {
+    fn new(id: usize, parts: usize, buckets: usize) -> Shard {
         Shard {
+            id,
+            odd_ing: Vec::new(),
+            region: region(),
             arena: Arena { cur: 0, end: 0 },
             ev: (0..parts).map(|_| Stream::new()).collect(),
             ck: (0..parts).map(|_| Stream::new()).collect(),
             lg: (0..buckets).map(|_| Stream::new()).collect(),
             ev_wc: vec![Wc { recs: [ERec { person: 0, ts: 0, pay: 0 }; EV_WC] }; parts],
             ev_n: vec![0; parts],
-            lg_wc: vec![Wc { recs: [LRec { key: 0, ingest: 0, loc: 0 }; LG_WC] }; buckets],
+            lg_wc: vec![Wc { recs: [LRec { key: 0, ing: 0, loc: 0 }; LG_WC] }; buckets],
             lg_n: vec![0; buckets],
             buf: Vec::new(),
             ins: 0,
@@ -1504,9 +1575,24 @@ impl Shard {
 
     /// Any parsed event: its dedup record. `loc` = 0 for an invalid or late one.
     #[inline(always)]
-    fn log(&mut self, cx: &Ctx, ekey: u64, ingest: i64, loc: u64) {
+    fn log(&mut self, cx: &Ctx, ekey: u64, ingest: i64, loc: u32) {
+        // ingest_ts is F1 in the data: whole seconds, near the window
+        let d = ingest.wrapping_sub(cx.ing_base);
+        let ing = if d >= 0 && d % 1000 == 0 && d < (ING_ODD as i64) * 1000 { (d / 1000) as u32 } else { self.odd_ingest(ingest) };
         let q = (spread(ekey) >> cx.qshift) as usize;
-        push_wc(&mut self.lg[q], &mut self.lg_wc[q], &mut self.lg_n[q], &mut self.arena, LG_BLOCK, LRec { key: ekey, ingest, loc });
+        push_wc(&mut self.lg[q], &mut self.lg_wc[q], &mut self.lg_n[q], &mut self.arena, LG_BLOCK, LRec { key: ekey, ing, loc });
+    }
+
+    /// Any other ingest_ts keeps its exact value in this shard's list.
+    #[cold]
+    #[inline(never)]
+    fn odd_ingest(&mut self, ingest: i64) -> u32 {
+        let i = self.odd_ing.len();
+        if self.id >> ING_SHARD_BITS != 0 || i >> ING_INDEX_BITS != 0 {
+            die("too many parse threads or too many ingest_ts values that are not whole seconds near the window");
+        }
+        self.odd_ing.push(ingest);
+        ING_ODD | (self.id as u32) << ING_INDEX_BITS | i as u32
     }
 
     /// A valid, non-late event: into its person's partition, plus its dedup record, once its user ID is at hand.
@@ -1522,7 +1608,7 @@ impl Shard {
         let person = cx.ids.person(cx.ids.slot_from(p.home, p.ukey, &mut self.ins));
         let part = (person >> cx.pshift) as usize;
         let rec = push_wc(&mut self.ev[part], &mut self.ev_wc[part], &mut self.ev_n[part], &mut self.arena, EV_BLOCK, ERec { person, ts: p.ts, pay: p.x });
-        self.log(cx, p.a, p.b, rec as u64);
+        self.log(cx, p.a, p.b, self.region.name(rec as usize));
     }
 
     /// A valid click, into its person's partition once its user ID is at hand.
@@ -1627,6 +1713,7 @@ fn main() {
         ws,
         we,
         base: ws - WEEK,
+        ing_base: (ws - WEEK).div_euclid(1000) * 1000,
         day0,
         ndays,
         ncamp,
@@ -1643,10 +1730,11 @@ fn main() {
 
     // 2. events and clicks, from the one queue
     let (np, nq) = (1usize << pbits, 1usize << qbits);
+    let shard_ids = AtomicUsize::new(0);
     let mut shards = par(
         threads,
         work.len(),
-        || Shard::new(np, nq),
+        || Shard::new(shard_ids.fetch_add(1, Relaxed), np, nq),
         |st, i| {
             let (kind, fi, s, e) = work[i];
             let f = if kind == 0 { &ev_files[fi] } else { &ck_files[fi] };
@@ -1672,7 +1760,7 @@ fn main() {
     }
 
     // 3. duplicates
-    let n_dups = mark_duplicates(&shards, nq, threads);
+    let n_dups = mark_duplicates(&cx, &shards, nq, threads);
     lap(&format!("duplicates marked: {n_dups} candidates"));
 
     // 4. per person partition, the largest first; each thread writes its rows when the queue is empty
@@ -2091,11 +2179,26 @@ unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
 /// The filter is one 64-bit word per two events: 32 "seen" bits (even) each with a "twice" bit (odd). A key sets
 /// two seen bits of its word; a key that finds both set sets their twice bits. All copies of a key meet the same
 /// bits, so every copy of a repeated key has both twice bits set at the end; a few other keys do too.
-fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
+fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -> usize {
+    let region = region();
+    // ingest_ts of a dedup record
+    let mut odd: Vec<&[i64]> = vec![&[]; 1 << ING_SHARD_BITS];
+    for s in shards {
+        if !s.odd_ing.is_empty() {
+            odd[s.id] = &s.odd_ing;
+        }
+    }
+    let ingest = |ing: u32| -> i64 {
+        if ing & ING_ODD == 0 {
+            cx.ing_base + ing as i64 * 1000
+        } else {
+            odd[((ing & !ING_ODD) >> ING_INDEX_BITS) as usize][(ing & ((1 << ING_INDEX_BITS) - 1)) as usize]
+        }
+    };
     par(
         threads,
         buckets,
-        || (Vec::<u64>::new(), Vec::<(u64, i64, u64)>::new(), 0usize),
+        || (Vec::<u64>::new(), Vec::<(u64, i64, u32)>::new(), 0usize),
         |(filter, cand, total), b| {
             let n: usize = shards.iter().map(|s| s.lg[b].len(LG_BLOCK)).sum();
             let words = (n / 2).next_power_of_two().max(64);
@@ -2119,7 +2222,7 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
                 s.lg[b].each(LG_BLOCK, |r| {
                     let (w, m) = at(r.key);
                     if (filter[w] >> 1) & m == m {
-                        cand.push((r.key, r.ingest, r.loc));
+                        cand.push((r.key, ingest(r.ing), r.loc));
                     }
                 });
             }
@@ -2139,7 +2242,7 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
                 for k in i..j {
                     if k != keep && cand[k].2 != 0 {
                         // SAFETY: the address of an ERec in a live arena; no other thread touches this record now
-                        unsafe { (*(cand[k].2 as *mut ERec)).person = DROPPED };
+                        unsafe { (*(region.addr(cand[k].2) as *mut ERec)).person = DROPPED };
                     }
                 }
                 i = j;
@@ -3080,6 +3183,7 @@ mod tests {
             ws,
             we: parse_ts(b"2028-03-05T00:00:00Z").unwrap(),
             base: ws - WEEK,
+            ing_base: (ws - WEEK).div_euclid(1000) * 1000,
             day0: 0,
             ndays: 14,
             ncamp: 0,
@@ -3096,9 +3200,9 @@ mod tests {
 
     /// (events as (person, ts, pay), dedup records as (key, ingest, has a record)), each sorted
     type Flat = (Vec<(u32, u32, u32)>, Vec<(u64, i64, bool)>);
-    fn flat(st: &Shard) -> Flat {
+    fn flat(c: &Ctx, st: &Shard) -> Flat {
         let mut ev: Vec<_> = st.ev.iter().flat_map(|s| s.slices(EV_BLOCK)).flatten().map(|r| (r.person, r.ts, r.pay)).collect();
-        let mut lg: Vec<_> = st.lg.iter().flat_map(|s| s.slices(LG_BLOCK)).flatten().map(|r| (r.key, r.ingest, r.loc != 0)).collect();
+        let mut lg: Vec<_> = st.lg.iter().flat_map(|s| s.slices(LG_BLOCK)).flatten().map(|r| (r.key, if r.ing & ING_ODD == 0 { c.ing_base + r.ing as i64 * 1000 } else { st.odd_ing[(r.ing & ((1 << ING_INDEX_BITS) - 1)) as usize] }, r.loc != 0)).collect();
         ev.sort();
         lg.sort();
         (ev, lg)
@@ -3128,7 +3232,7 @@ mod tests {
                 cuts.push(r.below(len + 1));
             }
             cuts.sort();
-            let (mut a, mut b) = (Shard::new(16, 16), Shard::new(16, 16));
+            let (mut a, mut b) = (Shard::new(0, 16, 16), Shard::new(1, 16, 16));
             for w in cuts.windows(2) {
                 unsafe { parse_events(&c, padded.as_ptr(), w[0], w[1], len, &mut a) };
                 for_records::<7>(file, w[0], w[1], |f| event_fields(&c, f, &mut b));
@@ -3136,7 +3240,7 @@ mod tests {
             }
             a.finish();
             b.finish();
-            let (fa, fb) = (flat(&a), flat(&b));
+            let (fa, fb) = (flat(&c, &a), flat(&c, &b));
             kept += fb.0.len();
             assert!(fa == fb, "round {round}: fast parse differs\n{}", std::str::from_utf8(file).unwrap());
         }

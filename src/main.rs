@@ -2004,6 +2004,8 @@ fn map_file(p: &Path) -> Bytes {
 struct InFile {
     f: File,
     len: usize,
+    map: usize,         // where the file is mapped (events and clicks: `map_inputs`), 0 when it is not
+    left: AtomicUsize,  // pieces of the parse queue not yet parsed: the thread that takes it to 0 unmaps the file
 }
 
 /// The `*.csv` files of `dir`, by name.
@@ -2021,7 +2023,7 @@ fn csv_files(dir: &Path) -> Vec<InFile> {
         .map(|p| {
             let f = File::open(p).unwrap_or_else(|e| die(&format!("open {}: {e}", p.display())));
             let len = f.metadata().unwrap_or_else(|e| die(&format!("stat {}: {e}", p.display()))).len() as usize;
-            InFile { f, len }
+            InFile { f, len, map: 0, left: AtomicUsize::new(0) }
         })
         .collect()
 }
@@ -2140,6 +2142,52 @@ fn read_span(f: &InFile, s: usize, e: usize, buf: &mut Vec<u8>) -> (usize, usize
     };
     buf[len..len + PAD].fill(b'\n');
     (len, s - bs, e - bs)
+}
+
+/// Maps the files read-only (SESS_MMAP=0: not at all): the parse then reads the page cache in place instead of
+/// a copy of it.
+#[cfg(target_os = "linux")]
+fn map_inputs(files: &mut [InFile]) {
+    use std::os::unix::io::AsRawFd;
+    if env_num("SESS_MMAP") == Some(0) {
+        return;
+    }
+    for f in files.iter_mut().filter(|f| f.len >= 1 << 16) {
+        // SAFETY: a new read-only mapping of the whole file
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), f.len, libc::PROT_READ, libc::MAP_SHARED, f.f.as_raw_fd(), 0) };
+        if p != libc::MAP_FAILED {
+            f.map = p as usize;
+        }
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn map_inputs(_files: &mut [InFile]) {}
+
+/// One piece of the parse queue is done: the file's mapping goes when it was its last.
+fn piece_done(f: &InFile) {
+    if f.left.fetch_sub(1, Relaxed) == 1 && f.map != 0 {
+        #[cfg(target_os = "linux")]
+        // SAFETY: every piece of the file is parsed, and nothing keeps a pointer into the mapping
+        unsafe {
+            libc::munmap(f.map as *mut libc::c_void, f.len);
+        }
+    }
+}
+
+/// `read_span` without the copy where the file is mapped and the piece ends far enough before the file's end:
+/// (data, len, start, end), the data in the mapping. Every line that starts in [start, end) then has its newline
+/// before `len`, and the bytes the parsers read past `len` are the file's.
+fn span_of(f: &InFile, s: usize, e: usize, buf: &mut Vec<u8>) -> (*const u8, usize, usize, usize) {
+    let bs = s.saturating_sub(1);
+    if f.map != 0 && e + (64 << 10) < f.len {
+        // SAFETY: [bs, e + 64 KiB) is inside the mapping
+        let all = unsafe { std::slice::from_raw_parts(f.map as *const u8, f.len) };
+        if let Some(i) = memchr::memchr(b'\n', &all[e - 1..e + (60 << 10)]) {
+            return (all[bs..].as_ptr(), e - 1 + i + 1 - bs, s - bs, e - bs);
+        }
+    }
+    let (len, start, end) = read_span(f, s, e, buf);
+    (buf.as_ptr(), len, start, end)
 }
 
 /// `x` without its lowest set bit.
@@ -2715,8 +2763,14 @@ fn main() {
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
 
-    let files = |dir: &str| -> &'static [InFile] { Box::leak(csv_files(&data.join(dir)).into_boxed_slice()) };
-    let (link_files, ev_files, ck_files) = (files("links"), files("events"), files("clicks"));
+    let files = |dir: &str, map: bool| -> &'static [InFile] {
+        let mut v = csv_files(&data.join(dir));
+        if map {
+            map_inputs(&mut v);
+        }
+        Box::leak(v.into_boxed_slice())
+    };
+    let (link_files, ev_files, ck_files) = (files("links", false), files("events", true), files("clicks", true));
     let bytes = |v: &[InFile]| v.iter().map(|f| f.len).sum::<usize>();
     let (link_bytes, ev_bytes) = (bytes(&link_files), bytes(&ev_files));
 
@@ -2744,6 +2798,9 @@ fn main() {
     let mut work = Vec::new();
     chunks_of(0, ev_files, chunk, &mut work);
     chunks_of(1, ck_files, chunk, &mut work);
+    for &(kind, fi, _, _) in &work {
+        (if kind == 0 { &ev_files[fi] } else { &ck_files[fi] }).left.fetch_add(1, Relaxed);
+    }
     read_ahead(
         link_files
             .iter()
@@ -2801,16 +2858,18 @@ fn main() {
             let (kind, fi, s, e) = work[i];
             let f = if kind == 0 { &ev_files[fi] } else { &ck_files[fi] };
             let mut buf = std::mem::take(&mut st.buf);
-            let (len, start, end) = read_span(f, s, e, &mut buf);
-            // SAFETY: read_span leaves PAD readable bytes past len, the first a newline
+            let (data, len, start, end) = span_of(f, s, e, &mut buf);
+            // SAFETY: read_span leaves PAD readable bytes past len, the first a newline; span_of's mapped data
+            // has the file's next 64 KiB there, and every line's newline before len
             unsafe {
                 if kind == 0 {
-                    parse_events(&cx, buf.as_ptr(), start, end, len, st);
+                    parse_events(&cx, data, start, end, len, st);
                 } else {
-                    parse_clicks(&cx, buf.as_ptr(), start, end, len, st);
+                    parse_clicks(&cx, data, start, end, len, st);
                 }
             }
             st.buf = buf;
+            piece_done(f);
         },
     );
     // the records of groups not yet full, written by this thread (each parse thread fenced its own before the join)

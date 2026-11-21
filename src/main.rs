@@ -187,6 +187,47 @@ fn pack16(v: u128, len: usize) -> u64 {
     }
 }
 
+/// `pack` of two IDs at once: the `la` bytes at `pa` and the `lb` bytes at `pb` (16 bytes readable at each), one in
+/// each half of a 256-bit register, so the pair costs little more than one `pack16`.
+#[inline(always)]
+unsafe fn pack2(pa: *const u8, la: usize, pb: *const u8, lb: usize) -> (u64, u64) {
+    // an ID of more than 10 bytes does not pack: taken as an empty one it comes out 0
+    let (la, lb) = (if la > 10 { 0 } else { la }, if lb > 10 { 0 } else { lb });
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        // the first `len` bytes of an ID's 16: KEEP read from 16 - len is `len` ones, then zeros
+        static KEEP: [u8; 32] = [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let id = |p: *const u8, len: usize| _mm_and_si128(_mm_loadu_si128(p as *const __m128i), _mm_loadu_si128(KEEP.as_ptr().add(16 - len) as *const __m128i));
+        let c = _mm256_inserti128_si256(_mm256_castsi128_si256(id(pa, la)), id(pb, lb), 1);
+        // classes and offsets as in `pack16`
+        const LO: [u8; 16] = [13, 15, 15, 15, 15, 15, 15, 15, 15, 15, 14, 2, 2, 2, 2, 6];
+        const HI: [u8; 16] = [0, 0, 0, 1, 2, 4, 2, 8, 0, 0, 0, 0, 0, 0, 0, 0];
+        const OFF: [u8; 16] = [0, 0, 0, 47, 54, 54, 59, 59, 0, 0, 0, 0, 0, 0, 0, 0];
+        let tbl = |t: &[u8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr() as *const __m128i));
+        let hi = _mm256_and_si256(_mm256_srli_epi16(c, 4), _mm256_set1_epi8(0x0F));
+        let class = _mm256_and_si256(_mm256_shuffle_epi8(tbl(&LO), c), _mm256_shuffle_epi8(tbl(&HI), hi));
+        let invalid = _mm256_movemask_epi8(_mm256_cmpeq_epi8(class, _mm256_setzero_si256())) as u32;
+        if invalid & (((1u32 << la) - 1) | ((1u32 << lb) - 1) << 16) != 0 {
+            // one of them holds a byte outside the alphabet: each on its own
+            return (pack16(load16(pa, la), la), pack16(load16(pb, lb), lb));
+        }
+        let us = _mm256_cmpeq_epi8(c, _mm256_set1_epi8(b'_' as i8));
+        let off = _mm256_add_epi8(_mm256_shuffle_epi8(tbl(&OFF), hi), _mm256_and_si256(us, _mm256_set1_epi8(4)));
+        let d = _mm256_sub_epi8(c, off);
+        let w = _mm256_maddubs_epi16(d, _mm256_set1_epi16(0x0140));
+        let l = _mm256_madd_epi16(w, _mm256_set1_epi32(0x0001_1000));
+        let key = |l: __m128i| {
+            let lo = _mm_cvtsi128_si64(l) as u64;
+            let l2 = _mm_extract_epi32(l, 2) as u32 as u64;
+            ((lo & 0xffff_ffff) << 36) | ((lo >> 32) << 12) | (l2 >> 12)
+        };
+        return (key(_mm256_castsi256_si128(l)), key(_mm256_extracti128_si256(l, 1)));
+    }
+    #[allow(unreachable_code)]
+    (pack16(load16(pa, la), la), pack16(load16(pb, lb), lb))
+}
+
 /// The IDs that do not pack (longer than 10 bytes, or a byte outside [0-9A-Z_a-z]): each gets a number, exact on
 /// its bytes. Locked and slow; generated data never comes here.
 struct Interner {
@@ -234,6 +275,15 @@ impl Interner {
             if k != 0 {
                 return k;
             }
+        }
+        self.intern(std::slice::from_raw_parts(p, len))
+    }
+
+    /// `key_at` given `pack2`'s answer for the ID (0 = it does not pack).
+    #[inline(always)]
+    unsafe fn key_or(&self, packed: u64, p: *const u8, len: usize) -> u64 {
+        if packed != 0 {
+            return packed;
         }
         self.intern(std::slice::from_raw_parts(p, len))
     }
@@ -2138,8 +2188,10 @@ unsafe fn fast_event(cx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, st: 
         return;
     }
     let Some(ingest) = ts_memo(line.add(f.at(3).0), f.at(3).1, &mut st.days) else { return };
-    let ekey = cx.names.key_at(ep, el);
-    let (ul, pl) = (f.at(1).1, f.at(5).1);
+    let (up, ul, pl) = (line.add(f.at(1).0), f.at(1).1, f.at(5).1);
+    // both IDs at once; the user ID is interned (when it does not pack) only once the event is known to be kept
+    let (ek, uk) = pack2(ep, el, up, ul);
+    let ekey = cx.names.key_or(ek, ep, el);
     let ts = match ts_memo(line.add(f.at(2).0), f.at(2).1, &mut st.days) {
         Some(t) if ul != 0 && pl != 0 && t >= cx.ws && t < cx.we && ingest - t <= DAY => t,
         _ => return st.log(cx, ekey, ingest, 0),
@@ -2155,7 +2207,7 @@ unsafe fn fast_event(cx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, st: 
         }
         _ => return st.log(cx, ekey, ingest, 0),
     };
-    let ukey = cx.names.key_at(line.add(f.at(1).0), ul);
+    let ukey = cx.names.key_or(uk, up, ul);
     st.keep(cx, ekey, ingest, ukey, ts, pay);
 }
 
@@ -2202,7 +2254,9 @@ unsafe fn fast_click(cx: &Ctx, line: *const u8, e: usize, c: u128, q: u128, st: 
         _ => return,
     };
     let Some(camp) = cx.campaigns.get_at(line.add(f.at(2).0), f.at(2).1) else { return };
-    st.click(cx, cx.names.key_at(line.add(f.at(0).0), f.at(0).1), cx.names.key_at(line.add(f.at(1).0), f.at(1).1), t, camp);
+    let (cp, cl, up, ul) = (line.add(f.at(0).0), f.at(0).1, line.add(f.at(1).0), f.at(1).1);
+    let (ck, uk) = pack2(cp, cl, up, ul);
+    st.click(cx, cx.names.key_or(ck, cp, cl), cx.names.key_or(uk, up, ul), t, camp);
 }
 
 unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: usize, st: &mut Shard) {
@@ -3657,6 +3711,41 @@ mod tests {
             hits += (want.is_some() && s.len() >= 20 && before.iter().zip(&days).all(|(x, y)| x.a == y.a && x.b == y.b)) as usize;
         }
         assert!(hits > 20_000, "the memo was hit only {hits} times");
+    }
+
+    #[test]
+    fn pack2_matches_pack() {
+        let mut r = Rng(77);
+        let alphabet: Vec<u8> = (0u8..=255).filter(|&c| PACK[c as usize] != 0).collect();
+        let mut both = 0;
+        for i in 0..400_000 {
+            let mut ids: Vec<Vec<u8>> = (0..2)
+                .map(|_| {
+                    let len = r.below(17);
+                    (0..len).map(|_| alphabet[r.below(63)]).collect()
+                })
+                .collect();
+            if i % 4 == 0 {
+                let which = r.below(2);
+                let len = ids[which].len();
+                if len > 0 {
+                    ids[which][r.below(len)] = r.next() as u8; // usually a byte that does not pack
+                }
+            }
+            let bufs: Vec<Vec<u8>> = ids
+                .iter()
+                .map(|id| {
+                    let mut b = id.clone();
+                    b.extend((0..32).map(|_| r.next() as u8));
+                    b
+                })
+                .collect();
+            let want = (pack(&ids[0]), pack(&ids[1]));
+            let got = unsafe { pack2(bufs[0].as_ptr(), ids[0].len(), bufs[1].as_ptr(), ids[1].len()) };
+            assert_eq!(got, want, "{ids:?}");
+            both += (want.0 != 0 && want.1 != 0) as usize;
+        }
+        assert!(both > 50_000, "too few packable pairs ({both}) to mean anything");
     }
 
     #[test]

@@ -2941,19 +2941,24 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
     if shards.len() > 127 || shards.iter().any(|s| s.lg.iter().any(|l| l.len(LG_BLOCK) >> POS_T != 0)) {
         die("too many events for the duplicate finder");
     }
+    let count = |b: usize| -> usize { shards.iter().map(|s| s.lg[b].len(LG_BLOCK)).sum() };
+    let lines_for = |n: usize| (n / 6).next_power_of_two().max(4); // at most 3/4 full
+    // a thread's table has room for the largest bucket and is in huge pages (`Carve`): every record lands on a line
+    // of its own choosing, and on 4 KiB pages (256 of them for 1 MiB of lines) most of those miss the TLB
+    let max_lines = lines_for((0..buckets).map(count).max().unwrap_or(0));
     par(
         threads,
         buckets,
-        || (Vec::<DLine>::new(), Vec::<(LRec, u32)>::new(), Vec::<(u32, u32)>::new(), Vec::<(u32, u32)>::new(), Vec::<LRec>::new(), 0usize),
+        || (Carve::new(max_lines * 64, 1).take::<DLine>(max_lines), Vec::<(LRec, u32)>::new(), Vec::<(u32, u32)>::new(), Vec::<(u32, u32)>::new(), Vec::<LRec>::new(), 0usize),
         |(table, mem, groups, firsts, grp, total), b| {
-            let n: usize = shards.iter().map(|s| s.lg[b].len(LG_BLOCK)).sum();
-            let lines = (n / 6).next_power_of_two().max(4); // at most 3/4 full
+            let n = count(b);
+            let lines = lines_for(n);
             let mask = lines - 1;
             // Fibonacci hashing: the line is the top bits of key * 2^64 / phi, which depend on every bit of the key
             let shift = 64 - lines.trailing_zeros();
             let fib = |k: u64| k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            table.clear();
-            table.resize(lines, DLine([0; 16]));
+            let table = &mut table[..lines];
+            table.fill(DLine([0; 16]));
             mem.clear();
             groups.clear();
             firsts.clear();

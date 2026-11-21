@@ -2357,3 +2357,138 @@ fn fast_exit(_threads: usize) -> ! {
     std::process::exit(0)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn pick<'a>(&mut self, xs: &'a [&'a [u8]]) -> &'a [u8] {
+            xs[(self.next() % xs.len() as u64) as usize]
+        }
+    }
+
+    fn leak(v: Vec<u8>) -> Bytes {
+        Box::leak(v.into_boxed_slice())
+    }
+
+    /// The fast tokenizer agrees with `split` on random lines made of the bytes that matter.
+    fn tok_vs_split<const N: usize>(seed: u64) {
+        let mut r = Rng(seed);
+        let atoms: [&[u8]; 9] = [b"a", b",", b"\"", b"\"\"", b"xy", b"\r", b" ", b"\"ab\"", b"1234567"];
+        for _ in 0..200_000 {
+            let mut line = Vec::new();
+            let n = (r.next() % 40) as usize;
+            for _ in 0..n {
+                line.extend_from_slice(r.pick(&atoms));
+            }
+            line.truncate(126);
+            let mut buf = line.clone();
+            buf.push(b'\n');
+            buf.resize(buf.len() + 200, b'z');
+            let buf = leak(buf);
+            let want = split::<N>(&buf[..line.len()]).map(|f| f.map(|x| x.to_vec()));
+            let got = match unsafe { tokenize::<N>(buf.as_ptr()) } {
+                Tok::Ok(len, s, e) => {
+                    assert_eq!(len, line.len());
+                    Some(std::array::from_fn::<Vec<u8>, N, _>(|i| buf[s[i] as usize..e[i] as usize].to_vec()))
+                }
+                Tok::Bad(len) => {
+                    assert_eq!(len, line.len());
+                    None
+                }
+                Tok::Long => panic!("short line reported long"),
+            };
+            assert_eq!(got, want, "line {:?}", String::from_utf8_lossy(&line));
+        }
+    }
+
+    #[test]
+    fn tokenize_matches_split() {
+        tok_vs_split::<2>(1);
+        tok_vs_split::<4>(2);
+        tok_vs_split::<7>(3);
+    }
+
+    #[test]
+    fn timestamps_match_general_parser() {
+        // window 2028-02-20 .. 2028-03-05 (holds February 29)
+        let ws = parse_ts(b"2028-02-20T00:00:00Z").unwrap();
+        let we = parse_ts(b"2028-03-05T00:00:00Z").unwrap();
+        let base = ws - WEEK;
+        let dates = Dates::new(base.div_euclid(DAY) - 2, (we - 1).div_euclid(DAY) + 7);
+        let mut r = Rng(7);
+        let digits = |r: &mut Rng, n: usize| (0..n).map(|_| b'0' + (r.next() % 10) as u8).collect::<Vec<u8>>();
+        for _ in 0..300_000 {
+            let mut s: Vec<u8> = match r.next() % 4 {
+                0 => format!("2028-0{}-{:02}T{:02}:{:02}:{:02}Z", 2 + r.next() % 2, r.next() % 32, r.next() % 25, r.next() % 61, r.next() % 61).into_bytes(),
+                1 => format!(
+                    "2028-0{}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
+                    2 + r.next() % 2,
+                    r.next() % 32,
+                    r.next() % 25,
+                    r.next() % 61,
+                    r.next() % 61,
+                    if r.next() % 2 == 0 { '+' } else { '-' },
+                    r.next() % 25,
+                    r.next() % 61
+                )
+                .into_bytes(),
+                2 => {
+                    let mut v = b"18".to_vec();
+                    v.extend(digits(&mut r, 11));
+                    v
+                }
+                _ => {
+                    let n = (r.next() % 22) as usize;
+                    digits(&mut r, n)
+                }
+            };
+            if r.next() % 8 == 0 && !s.is_empty() {
+                let i = (r.next() % s.len() as u64) as usize;
+                s[i] = b"xZT:-+ 0"[(r.next() % 8) as usize];
+            }
+            let want = parse_ts(&s).filter(|&t| t >= base && t < we);
+            let got = parse_ts_near(&s, &dates).filter(|&t| t >= base && t < we);
+            assert_eq!(got, want, "{:?}", String::from_utf8_lossy(&s));
+        }
+    }
+
+    #[test]
+    fn prices() {
+        assert_eq!(parse_price(b"0250"), Some(250));
+        assert_eq!(parse_price(b"000000000000000000000250"), Some(250));
+        assert_eq!(parse_price(b"10000000"), Some(10_000_000));
+        assert_eq!(parse_price(b"10000001"), None);
+        assert_eq!(parse_price(b"0"), None);
+        assert_eq!(parse_price(b"12.5"), None);
+        assert_eq!(parse_price(b""), None);
+        assert_eq!(parse_price(b"99999999999999999999999"), None);
+    }
+
+    #[test]
+    fn keys() {
+        let mut r = Rng(11);
+        for _ in 0..100_000 {
+            let n = (r.next() % 20) as usize;
+            let v: Vec<u8> = (0..n).map(|_| b"aAz 0\x01\xff"[(r.next() % 7) as usize]).collect();
+            let mut buf = v.clone();
+            buf.resize(n + 32, b'q');
+            let buf = leak(buf);
+            let (k1, k2) = (Key::new(&buf[..n]), unsafe { Key::fast(&buf[..n]) });
+            assert!(k1.same(k2) && k1.hash() == k2.hash());
+            assert_eq!(k1.bytes(), &v[..]);
+            assert_eq!(k1.sstr().get(), &v[..]);
+            let s1 = SStr::new(&buf[..n]);
+            let s2 = unsafe { SStr::fast(&buf[..n]) };
+            assert!(s1 == s2 && s1.hash() == s2.hash() && s1.get() == &v[..]);
+        }
+    }
+}

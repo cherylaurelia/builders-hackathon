@@ -1149,22 +1149,7 @@ fn main() {
     let results = par(
         threads,
         PB,
-        || Agg {
-            rows: Vec::new(),
-            cred: vec![[0i64; 3]; (ncamp + 1) * width],
-            assist: vec![0i64; (ncamp + 1) * width],
-            stamp: vec![u32::MAX; ncamp + 1],
-            iv: vec![(0i64, 0i64); ncamp + 1],
-            slots: Vec::new(),
-            entries: Vec::new(),
-            enh: Vec::new(),
-            purs: Vec::new(),
-            keys: Vec::new(),
-            pid: PreMap::default(),
-            names: Vec::new(),
-            seen: vec![0u32; ncamp + 1],
-            sctr: 0,
-        },
+        || Agg::new(ncamp, width),
         |agg, p| person_bucket_work(&ctx, &routed, &clicks, p, agg),
     );
     drop(routed);
@@ -1663,27 +1648,122 @@ struct Agg {
     assist: Vec<i64>,
     stamp: Vec<u32>,
     iv: Vec<(i64, i64)>,
-    // per-bucket scratch, reused across buckets
-    slots: Vec<u64>,
-    entries: Vec<Entry>,
-    enh: Vec<u64>,
-    purs: Vec<Pur>,
-    keys: Vec<u64>,
-    pid: PreMap<u32>,
-    names: Vec<SStr>,
     seen: Vec<u32>,
     sctr: u32,
+    // per-bucket scratch, reused across buckets
+    pslots: Vec<u64>,
+    pnames: Vec<SStr>,
+    pnh: Vec<u64>,
+    pcnt: Vec<u32>,
+    eslots: Vec<ELine>,
+    eheads: Vec<u32>,
+    purs: Vec<Pur>,
+    grp: Vec<Grp>,
+    gstart: Vec<u32>,
+    gpos: Vec<u32>,
+    ctmp: Vec<CTmp>,
+    cl: Vec<Click>,
+    cstart: Vec<u32>,
+    evs: Vec<(u32, u32)>,
+    pbuf: Vec<PBuf>,
 }
 
-/// All of one person's events in one 30-minute bin of the window (`ts - base` divided by GAP).
-/// Two events in a bin are never a session break; two bins apart always are; adjacent bins break
-/// exactly when `min` of the later minus `max` of the earlier exceeds GAP.
-struct Entry {
-    name: SStr,
-    min: u32, // ts - base, ms
+impl Agg {
+    fn new(ncamp: usize, width: usize) -> Agg {
+        Agg {
+            rows: Vec::new(),
+            cred: vec![[0i64; 3]; (ncamp + 1) * width],
+            assist: vec![0i64; (ncamp + 1) * width],
+            stamp: vec![u32::MAX; ncamp + 1],
+            iv: vec![(0i64, 0i64); ncamp + 1],
+            seen: vec![0u32; ncamp + 1],
+            sctr: 0,
+            pslots: Vec::new(),
+            pnames: Vec::new(),
+            pnh: Vec::new(),
+            pcnt: Vec::new(),
+            eslots: Vec::new(),
+            eheads: Vec::new(),
+            purs: Vec::new(),
+            grp: Vec::new(),
+            gstart: Vec::new(),
+            gpos: Vec::new(),
+            ctmp: Vec::new(),
+            cl: Vec::new(),
+            cstart: Vec::new(),
+            evs: Vec::new(),
+            pbuf: Vec::new(),
+        }
+    }
+}
+
+/// All of one person's events in one 30-minute bin of the window (`ts - base` divided by GAP), keyed by
+/// `(person id << 12 | bin) + 1` (0 = empty slot). Two events in a bin are never a session break; two bins apart
+/// always are; adjacent bins break exactly when `min` of the later minus `max` of the earlier exceeds GAP.
+/// Four slots per cache line, one array per field so one 16-byte compare tests all four keys. A key lives in the
+/// first line, from its home line on, that holds it or has a free slot. A free slot is (key 0, min MAX, max 0,
+/// cnt 0), so a new entry and an existing one take the same branch-free update.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct ELine {
+    key: [u32; 4],
+    min: [u32; 4], // ts - base, ms
+    max: [u32; 4],
+    cnt: [u32; 4],
+}
+
+const EMPTY_LINE: ELine = ELine { key: [0; 4], min: [u32::MAX; 4], max: [0; 4], cnt: [0; 4] };
+
+#[inline(always)]
+fn eline_of(key: u32, lbits: u32) -> usize {
+    ((key as u64).wrapping_mul(FIB) >> (64 - lbits)) as usize
+}
+
+/// Bit i set when slot i of `l` holds `key`.
+#[inline(always)]
+fn eline_match(l: &ELine, key: u32) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let v = _mm_load_si128(l.key.as_ptr() as *const __m128i);
+        _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(v, _mm_set1_epi32(key as i32)))) as u32
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        (l.key[0] == key) as u32 | ((l.key[1] == key) as u32) << 1 | ((l.key[2] == key) as u32) << 2 | ((l.key[3] == key) as u32) << 3
+    }
+}
+
+/// Slot (line * 4 + i) of `key`: where it is, else the first free one.
+#[inline(always)]
+fn eslot_of(lines: &[ELine], key: u32, lbits: u32) -> usize {
+    let mask = lines.len() - 1;
+    let mut l = eline_of(key, lbits);
+    loop {
+        let line = &lines[l];
+        let hit = eline_match(line, key);
+        let m = if hit != 0 { hit } else { eline_match(line, 0) };
+        if m != 0 {
+            return l * 4 + m.trailing_zeros() as usize;
+        }
+        l = (l + 1) & mask;
+    }
+}
+
+/// An entry once grouped by person; `head` is its first purchase in `Agg::purs`, NIL if none.
+#[derive(Clone, Copy)]
+struct Grp {
+    min: u32,
     max: u32,
     cnt: u32,
-    head: u32, // first of this entry's purchases in `Agg::purs`, NIL if none
+    head: u32,
+}
+
+/// A purchase waiting for its (person, bin) entry.
+struct PBuf {
+    key: u32,
+    price: u32,
+    cat: u16,
 }
 
 struct Pur {
@@ -1692,8 +1772,23 @@ struct Pur {
     cat: u16,
 }
 
-const NIL: u32 = u32::MAX;
+/// A click of a known person of this bucket, before grouping by person.
+struct CTmp {
+    pc: u64, // person id << 16 | campaign
+    cid: Packed,
+    ts: u32,
+}
 
+/// A click in its person's run, sorted by ts.
+#[derive(Clone, Copy)]
+struct Click {
+    cid: Packed,
+    ts: u32, // ts - base, ms
+    camp: u16,
+}
+
+const NIL: u32 = 0; // end of a purchase chain; chain links and heads are purchase index + 1
+const FIB: u64 = 0x9E37_79B9_7F4A_7C15;
 
 struct Sess {
     start: i64,
@@ -1702,124 +1797,276 @@ struct Sess {
     revenue: i64,
 }
 
+#[inline(always)]
+fn same_name(a: &SStr, b: &SStr) -> bool {
+    if b.0[15] != SStr::LONG {
+        u128::from_ne_bytes(a.0) == u128::from_ne_bytes(b.0)
+    } else {
+        a == b
+    }
+}
+
+/// The person table: open addressing on the hash the router computed, slot = tag << 32 | (person id + 1).
+fn person_find(pslots: &[u64], pnames: &[SStr], nh: u64, name: &SStr) -> Option<u32> {
+    let mask = pslots.len() - 1;
+    let tag = nh as u32;
+    let mut s = (nh >> (64 - pslots.len().trailing_zeros())) as usize;
+    loop {
+        let v = pslots[s];
+        if v == 0 {
+            return None;
+        }
+        if (v >> 32) as u32 == tag {
+            let id = v as u32 - 1;
+            if same_name(&pnames[id as usize], name) {
+                return Some(id);
+            }
+        }
+        s = (s + 1) & mask;
+    }
+}
+
+fn person_work_check(ctx: &Ctx) {
+    // ts - base must fit u32 (about 49 days); the generator's windows are 14 days
+    if ctx.we - (ctx.ws - WEEK) >= 1 << 32 {
+        die("window longer than 42 days");
+    }
+}
+
 fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<PClick>>], p: usize, agg: &mut Agg) {
-    let base = ctx.ws - WEEK; // every kept ts is in [base, base + 2^31)
+    person_work_check(ctx);
+    let base = ctx.ws - WEEK;
     let width = ctx.ndays;
     let organic = ctx.ncamp;
-
-    // 1. events -> one Entry per (person, bin) in an open-addressing table. Slot = tag << 32 | (entry index + 1).
     let n_ev: usize = routed.iter().map(|t| t[p].len()).sum();
-    let mut cap = (n_ev / 2).next_power_of_two().max(1024);
-    loop {
-        let shift = 64 - cap.trailing_zeros();
-        let mask = cap - 1;
-        agg.slots.clear();
-        agg.slots.resize(cap, 0);
-        agg.entries.clear();
-        agg.enh.clear();
-        agg.purs.clear();
-        let (slots, entries, enh, purs) = (&mut agg.slots, &mut agg.entries, &mut agg.enh, &mut agg.purs);
-        let limit = cap / 8 * 5;
-        let mut ok = true;
-        'scan: for t in routed {
-            for e in &t[p] {
-                let tsr = (e.ts - base) as u32;
-                let bin = tsr / GAP as u32;
-                let h = e.nh ^ (bin as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                let tag = h as u32;
-                let mut s = (h >> shift) as usize;
-                let idx = loop {
-                    let v = slots[s];
-                    if v == 0 {
-                        if entries.len() >= limit {
-                            ok = false;
-                            break 'scan;
-                        }
-                        entries.push(Entry { name: e.name, min: tsr, max: tsr, cnt: 0, head: NIL });
-                        enh.push(e.nh);
-                        slots[s] = (tag as u64) << 32 | entries.len() as u64;
-                        break entries.len() - 1;
+
+    // 1a. events -> person ids (person table); one (key, ts) per event, purchases on the side
+    let mut pcap = (n_ev / 10).next_power_of_two().max(256);
+    let mut pslots = std::mem::take(&mut agg.pslots);
+    pslots.clear();
+    pslots.resize(pcap, 0);
+    let mut pnames = std::mem::take(&mut agg.pnames);
+    pnames.clear();
+    let mut pnh = std::mem::take(&mut agg.pnh);
+    pnh.clear();
+    let mut evs = std::mem::take(&mut agg.evs);
+    evs.clear();
+    let mut pbuf = std::mem::take(&mut agg.pbuf);
+    pbuf.clear();
+    for t in routed {
+        for e in &t[p] {
+            let tsr = (e.ts - base) as u32;
+            let bin = tsr / GAP as u32;
+            let pmask = pcap - 1;
+            let tag = e.nh as u32;
+            let mut s = (e.nh >> (64 - pcap.trailing_zeros())) as usize;
+            let pid = loop {
+                let v = pslots[s];
+                if v == 0 {
+                    let id = pnames.len() as u32;
+                    if id >= (1 << 20) - 1 {
+                        die("person bucket holds over a million people");
                     }
-                    if (v >> 32) as u32 == tag {
-                        let i = (v as u32 - 1) as usize;
-                        let en = &entries[i];
-                        if en.name == e.name && en.min / GAP as u32 == bin {
-                            break i;
+                    pnames.push(e.name);
+                    pnh.push(e.nh);
+                    pslots[s] = (tag as u64) << 32 | (id as u64 + 1);
+                    if pnames.len() * 8 > pcap * 5 {
+                        // grow: re-place every person
+                        pcap *= 2;
+                        pslots.clear();
+                        pslots.resize(pcap, 0);
+                        let pmask = pcap - 1;
+                        let sh = 64 - pcap.trailing_zeros();
+                        for (i, &h) in pnh.iter().enumerate() {
+                            let mut s = (h >> sh) as usize;
+                            while pslots[s] != 0 {
+                                s = (s + 1) & pmask;
+                            }
+                            pslots[s] = ((h as u32) as u64) << 32 | (i as u64 + 1);
                         }
                     }
-                    s = (s + 1) & mask;
-                };
-                let en = &mut entries[idx];
-                en.cnt += 1;
-                en.min = en.min.min(tsr);
-                en.max = en.max.max(tsr);
-                if e.kind == PURCHASE {
-                    purs.push(Pur { next: en.head, price: e.price, cat: e.cat });
-                    en.head = purs.len() as u32 - 1;
+                    break id;
+                }
+                if (v >> 32) as u32 == tag {
+                    let id = v as u32 - 1;
+                    if same_name(&pnames[id as usize], &e.name) {
+                        break id;
+                    }
+                }
+                s = (s + 1) & pmask;
+            };
+            let key = (pid << 12 | bin) + 1;
+            evs.push((key, tsr));
+            if e.kind == PURCHASE {
+                pbuf.push(PBuf { key, price: e.price, cat: e.cat });
+            }
+        }
+    }
+    let np = pnames.len();
+    agg.pslots = pslots;
+    agg.pnames = pnames;
+    agg.pnh = pnh;
+
+    // 1b. (person, bin) entry table. A slot starts as (key 0, min MAX, max 0, cnt 0), so a new entry and an existing
+    //     one take the same branch-free update.
+    agg.pcnt.clear();
+    agg.pcnt.resize(np, 0);
+    let mut ecap = (n_ev * 2 / 5).next_power_of_two().max(256); // slots
+    let mut elines = std::mem::take(&mut agg.eslots);
+    elines.clear();
+    elines.resize(ecap / 4, EMPTY_LINE);
+    let mut eheads = std::mem::take(&mut agg.eheads);
+    eheads.clear();
+    eheads.resize(ecap, NIL);
+    let mut ne = 0usize;
+    for i in 0..evs.len() {
+        let lbits = ecap.trailing_zeros() - 2;
+        #[cfg(target_arch = "x86_64")]
+        if let Some(&(k2, _)) = evs.get(i + 12) {
+            unsafe { std::arch::x86_64::_mm_prefetch(elines.as_ptr().add(eline_of(k2, lbits)) as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+        }
+        let (key, tsr) = evs[i];
+        let at = eslot_of(&elines, key, lbits);
+        let (l, i) = (&mut elines[at >> 2], at & 3);
+        let new = (l.cnt[i] == 0) as u32;
+        l.key[i] = key;
+        l.cnt[i] += 1;
+        l.min[i] = l.min[i].min(tsr);
+        l.max[i] = l.max[i].max(tsr);
+        agg.pcnt[((key - 1) >> 12) as usize] += new;
+        ne += new as usize;
+        if ne * 8 > ecap * 5 {
+            // grow: re-place every entry
+            let old = std::mem::take(&mut elines);
+            let old_heads = std::mem::take(&mut eheads);
+            ecap *= 2;
+            elines.resize(ecap / 4, EMPTY_LINE);
+            eheads.resize(ecap, NIL);
+            let lbits = ecap.trailing_zeros() - 2;
+            for (li, o) in old.iter().enumerate() {
+                for i in 0..4 {
+                    if o.key[i] != 0 {
+                        let at = eslot_of(&elines, o.key[i], lbits);
+                        let l = &mut elines[at >> 2];
+                        l.key[at & 3] = o.key[i];
+                        l.min[at & 3] = o.min[i];
+                        l.max[at & 3] = o.max[i];
+                        l.cnt[at & 3] = o.cnt[i];
+                        eheads[at] = old_heads[li * 4 + i];
+                    }
                 }
             }
         }
-        if ok {
-            break;
-        }
-        cap = (n_ev * 2).next_power_of_two(); // every event its own entry still fits
     }
+    agg.purs.clear();
+    let lbits = ecap.trailing_zeros() - 2;
+    for pb in &pbuf {
+        let at = eslot_of(&elines, pb.key, lbits);
+        agg.purs.push(Pur { next: eheads[at], price: pb.price, cat: pb.cat });
+        eheads[at] = agg.purs.len() as u32;
+    }
+    agg.eslots = elines;
+    agg.eheads = eheads;
+    agg.evs = evs;
+    agg.pbuf = pbuf;
 
-    // 2. person ids (exact on the name bytes), then entries sorted by (person, bin)
-    agg.pid.clear();
-    agg.names.clear();
-    agg.keys.clear();
-    for (i, en) in agg.entries.iter().enumerate() {
-        let next = agg.names.len() as u32;
-        let names = &mut agg.names;
-        let id = *agg.pid.entry(PreHashed { h: agg.enh[i], s: en.name }).or_insert_with(|| {
-            names.push(en.name);
-            next
-        });
-        if id >= 1 << 20 {
-            die("person bucket holds over a million people");
-        }
-        agg.keys.push((id as u64) << 44 | ((en.min / GAP as u32) as u64) << 32 | i as u64);
+    // 2. group entries by person (counting sort on the per-person entry counts), each run sorted by bin
+    agg.gstart.clear();
+    agg.gpos.clear();
+    let mut acc = 0u32;
+    for &c in &agg.pcnt {
+        agg.gstart.push(acc);
+        agg.gpos.push(acc);
+        acc += c;
     }
-    agg.keys.sort_unstable();
-    let (pid, names, keys, entries, purs) = (&agg.pid, &agg.names, &agg.keys, &agg.entries, &agg.purs);
-
-    struct C {
-        key: u64,
-        cid: Bytes,
-        camp: u16,
-    }
-    let mut ck: Vec<C> = Vec::new();
-    for t in clicks {
-        for c in &t[p] {
-            if let Some(&id) = pid.get(&PreHashed { h: c.nh, s: c.name }) {
-                ck.push(C { key: ((id as u64) << 32) | (c.ts - base) as u64, cid: c.cid, camp: c.camp });
+    agg.gstart.push(acc);
+    agg.grp.clear();
+    agg.grp.resize(ne, Grp { min: 0, max: 0, cnt: 0, head: NIL });
+    for (li, l) in agg.eslots.iter().enumerate() {
+        for i in 0..4 {
+            if l.key[i] != 0 {
+                let pid = ((l.key[i] - 1) >> 12) as usize;
+                let at = agg.gpos[pid] as usize;
+                agg.gpos[pid] += 1;
+                agg.grp[at] = Grp { min: l.min[i], max: l.max[i], cnt: l.cnt[i], head: agg.eheads[li * 4 + i] };
             }
         }
     }
-    ck.sort_unstable_by_key(|c| c.key);
+    for pid in 0..np {
+        let g = &mut agg.grp[agg.gstart[pid] as usize..agg.gstart[pid + 1] as usize];
+        if g.len() <= 24 {
+            for i in 1..g.len() {
+                let x = g[i];
+                let mut j = i;
+                while j > 0 && g[j - 1].min > x.min {
+                    g[j] = g[j - 1];
+                    j -= 1;
+                }
+                g[j] = x;
+            }
+        } else {
+            g.sort_unstable_by_key(|x| x.min);
+        }
+    }
 
+    // 3. clicks of known people, grouped by person (counting sort) and sorted by ts within a person
+    agg.ctmp.clear();
+    agg.cstart.clear();
+    agg.cstart.resize(np + 2, 0);
+    for t in clicks {
+        for c in &t[p] {
+            if let Some(id) = person_find(&agg.pslots, &agg.pnames, c.nh, &c.name) {
+                agg.ctmp.push(CTmp { pc: (id as u64) << 16 | c.camp as u64, cid: Packed::new(c.cid), ts: (c.ts - base) as u32 });
+                agg.cstart[id as usize + 2] += 1;
+            }
+        }
+    }
+    for i in 2..np + 2 {
+        agg.cstart[i] += agg.cstart[i - 1];
+    }
+    // cstart[id + 1] is now the start of person id's run; scattering advances it to the run's end
+    agg.cl.clear();
+    agg.cl.resize(agg.ctmp.len(), Click { cid: Packed(0), ts: 0, camp: 0 });
+    for c in &agg.ctmp {
+        let id = (c.pc >> 16) as usize;
+        let at = agg.cstart[id + 1] as usize;
+        agg.cstart[id + 1] += 1;
+        agg.cl[at] = Click { cid: c.cid, ts: c.ts, camp: c.pc as u16 };
+    }
+    for pid in 0..np {
+        let g = &mut agg.cl[agg.cstart[pid] as usize..agg.cstart[pid + 1] as usize];
+        if g.len() <= 24 {
+            for i in 1..g.len() {
+                let x = g[i];
+                let mut j = i;
+                while j > 0 && g[j - 1].ts > x.ts {
+                    g[j] = g[j - 1];
+                    j -= 1;
+                }
+                g[j] = x;
+            }
+        } else {
+            g.sort_unstable_by_key(|x| x.ts);
+        }
+    }
+
+    // 4. per person: sessions + user_daily rows, credit, assists
     let mut sessions: Vec<Sess> = Vec::new();
     let mut day_groups: Vec<(usize, usize)> = Vec::new(); // (d, first session index)
     let mut cats: Vec<(u16, i64)> = Vec::new();
     let mut touched: Vec<usize> = Vec::new();
-    let mut ci = 0;
-    let mut i = 0;
-    while i < keys.len() {
-        let person = (keys[i] >> 44) as u32;
-        let mut j = i;
-        while j < keys.len() && (keys[j] >> 44) as u32 == person {
-            j += 1;
-        }
-        let name = names[person as usize];
+    for pid in 0..np {
+        let person = pid as u32;
+        let name = agg.pnames[pid];
+        let gs = &agg.grp[agg.gstart[pid] as usize..agg.gstart[pid + 1] as usize];
+        let cs = &agg.cl[agg.cstart[pid] as usize..agg.cstart[pid + 1] as usize];
 
         // sessions + user_daily rows
         sessions.clear();
         day_groups.clear();
         let mut row: Option<UserRow> = None;
         let mut prev_max = i64::MIN / 2;
-        for &k in &keys[i..j] {
-            let en = &entries[(k & 0xffff_ffff) as usize];
+        for en in gs {
             let mn = en.min as i64 + base;
             if mn - prev_max > GAP {
                 let d = ((mn.div_euclid(DAY)) - ctx.day0) as usize;
@@ -1839,7 +2086,7 @@ fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<
             r.events += en.cnt as i64;
             let mut h = en.head;
             while h != NIL {
-                let pu = &purs[h as usize];
+                let pu = &agg.purs[h as usize - 1];
                 let s = sessions.last_mut().unwrap();
                 s.purchased = true;
                 s.revenue += pu.price as i64;
@@ -1855,17 +2102,7 @@ fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<
             agg.rows.push(finish_row(r, &mut cats, &ctx.cat_rank));
         }
 
-        // this person's clicks
-        while ci < ck.len() && ((ck[ci].key >> 32) as u32) < person {
-            ci += 1;
-        }
-        let mut cj = ci;
-        while cj < ck.len() && (ck[cj].key >> 32) as u32 == person {
-            cj += 1;
-        }
-        let cs = &ck[ci..cj];
-        let cts = |c: &C| (c.key & 0xffff_ffff) as i64 + base;
-
+        let cts = |c: &Click| c.ts as i64 + base;
         let (nc, ns) = (cs.len(), sessions.len());
         if nc == 0 {
             for s in &sessions {
@@ -1874,7 +2111,7 @@ fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<
                 a[1] += s.purchased as i64;
                 a[2] += s.revenue;
             }
-        } else if nc * ns <= 16384 {
+        } else if nc * ns <= 2048 {
             // few clicks or few sessions: per session, look at the clicks of its 7-day window [start - 7d, start]
             // (a contiguous run of cs) for the credit and for the distinct assisting campaigns
             let (mut lo, mut hi) = (0, 0);
@@ -1893,7 +2130,7 @@ fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<
                     let mut k = hi - 1;
                     while k > lo && cts(&cs[k - 1]) == t {
                         k -= 1;
-                        if cs[k].cid < best.cid {
+                        if cs[k].cid.get() < best.cid.get() {
                             best = &cs[k];
                         }
                     }
@@ -1918,73 +2155,70 @@ fn person_bucket_work(ctx: &Ctx, routed: &[Vec<Vec<PEvent>>], clicks: &[Vec<Vec<
                 a[2] += s.revenue;
             }
         } else {
-        // credit: latest click with start - 7d <= ts <= start; tie -> smallest click_id
-        let mut q = 0;
-        for s in &sessions {
-            while q < cs.len() && cts(&cs[q]) <= s.start {
-                q += 1;
-            }
-            let mut camp = organic;
-            if q > 0 {
-                let t = cts(&cs[q - 1]);
-                if s.start - t <= WEEK {
-                    let mut best = &cs[q - 1];
-                    let mut k = q - 1;
-                    while k > 0 && cts(&cs[k - 1]) == t {
-                        k -= 1;
-                        if cs[k].cid < best.cid {
-                            best = &cs[k];
+            // credit: latest click with start - 7d <= ts <= start; tie -> smallest click_id
+            let mut q = 0;
+            for s in &sessions {
+                while q < cs.len() && cts(&cs[q]) <= s.start {
+                    q += 1;
+                }
+                let mut camp = organic;
+                if q > 0 {
+                    let t = cts(&cs[q - 1]);
+                    if s.start - t <= WEEK {
+                        let mut best = &cs[q - 1];
+                        let mut k = q - 1;
+                        while k > 0 && cts(&cs[k - 1]) == t {
+                            k -= 1;
+                            if cs[k].cid.get() < best.cid.get() {
+                                best = &cs[k];
+                            }
                         }
+                        camp = best.camp as usize;
                     }
-                    camp = best.camp as usize;
                 }
+                let a = &mut agg.cred[camp * width + s.d];
+                a[0] += 1;
+                a[1] += s.purchased as i64;
+                a[2] += s.revenue;
             }
-            let a = &mut agg.cred[camp * width + s.d];
-            a[0] += 1;
-            a[1] += s.purchased as i64;
-            a[2] += s.revenue;
-        }
 
-        
-        // assists: a click at t assists sessions starting in [t, t + 7d]; merge per campaign
-        let flush = |assist: &mut [i64], k: usize, lo: i64, hi: i64, sessions: &[Sess], day_groups: &[(usize, usize)]| {
-            let a = sessions.partition_point(|s| s.start < lo);
-            let b = sessions.partition_point(|s| s.start <= hi);
-            if a >= b {
-                return;
-            }
-            for (g, &(d, first)) in day_groups.iter().enumerate() {
-                let end = day_groups.get(g + 1).map(|x| x.1).unwrap_or(sessions.len());
-                let n = end.min(b) as i64 - first.max(a) as i64;
-                if n > 0 {
-                    assist[k * width + d] += n;
+            // assists: a click at t assists sessions starting in [t, t + 7d]; merge per campaign
+            let flush = |assist: &mut [i64], k: usize, lo: i64, hi: i64, sessions: &[Sess], day_groups: &[(usize, usize)]| {
+                let a = sessions.partition_point(|s| s.start < lo);
+                let b = sessions.partition_point(|s| s.start <= hi);
+                if a >= b {
+                    return;
+                }
+                for (g, &(d, first)) in day_groups.iter().enumerate() {
+                    let end = day_groups.get(g + 1).map(|x| x.1).unwrap_or(sessions.len());
+                    let n = end.min(b) as i64 - first.max(a) as i64;
+                    if n > 0 {
+                        assist[k * width + d] += n;
+                    }
+                }
+            };
+            touched.clear();
+            for c in cs {
+                let k = c.camp as usize;
+                let t = cts(c);
+                if agg.stamp[k] != person {
+                    agg.stamp[k] = person;
+                    agg.iv[k] = (t, t + WEEK);
+                    touched.push(k);
+                } else if t <= agg.iv[k].1 {
+                    agg.iv[k].1 = t + WEEK;
+                } else {
+                    let (lo, hi) = agg.iv[k];
+                    flush(&mut agg.assist, k, lo, hi, &sessions, &day_groups);
+                    agg.iv[k] = (t, t + WEEK);
                 }
             }
-        };
-        touched.clear();
-        for c in cs {
-            let k = c.camp as usize;
-            let t = cts(c);
-            if agg.stamp[k] != person {
-                agg.stamp[k] = person;
-                agg.iv[k] = (t, t + WEEK);
-                touched.push(k);
-            } else if t <= agg.iv[k].1 {
-                agg.iv[k].1 = t + WEEK;
-            } else {
+            for &k in &touched {
                 let (lo, hi) = agg.iv[k];
                 flush(&mut agg.assist, k, lo, hi, &sessions, &day_groups);
-                agg.iv[k] = (t, t + WEEK);
+                agg.stamp[k] = u32::MAX;
             }
         }
-        for &k in &touched {
-            let (lo, hi) = agg.iv[k];
-            flush(&mut agg.assist, k, lo, hi, &sessions, &day_groups);
-            agg.stamp[k] = u32::MAX;
-        }
-        }
-        ci = cj;
-        i = j;
     }
 }
 

@@ -920,17 +920,21 @@ fn parse_ts_near(b: &[u8], dt: &Dates) -> Option<i64> {
 /// Digits only, 1..=10,000,000.
 #[inline]
 fn parse_price(b: &[u8]) -> Option<u32> {
-    if b.is_empty() || b.len() > 12 {
+    if b.is_empty() {
         return None;
     }
+    // any number of leading zeros is allowed ("0250" is 250)
     let mut v = 0u64;
     for &c in b {
         if !c.is_ascii_digit() {
             return None;
         }
         v = v * 10 + (c - b'0') as u64;
+        if v > 10_000_000 {
+            return None;
+        }
     }
-    if v == 0 || v > 10_000_000 {
+    if v == 0 {
         None
     } else {
         Some(v as u32)
@@ -1057,9 +1061,17 @@ struct PRec {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct ERec {
-    eid: SStr,
+    ea: u64, // event_id as a Key (a, b)
+    eb: u32,
+    tag: u32, // low 32 bits of hash(event_id)
     ingest: u32,
     loc: u32, // thread << 28 | person bucket << 20 | index
+}
+impl ERec {
+    #[inline(always)]
+    fn eid(&self) -> Key {
+        Key { a: self.ea, b: self.eb }
+    }
 }
 
 /// A valid click in its person bucket.
@@ -1375,7 +1387,7 @@ fn link_chunk(tab: &Table, s: &mut TS, (f, a, b): (Bytes, usize, usize)) {
 
 #[derive(Clone, Copy)]
 struct PendEv {
-    eid: SStr,
+    eid: Key,
     uid: Key,
     uh: u64,
     eh: u64,
@@ -1398,8 +1410,7 @@ fn ingest_secs(ctx: &Ctx, b: &[u8]) -> Option<i64> {
 
 fn event_chunk(ctx: &Ctx, tab: &Table, s: &mut TS, f: Bytes, a: usize, b: usize) {
     let t = s.t as u32;
-    let z = SStr(0, 0);
-    let mut batch = [PendEv { eid: z, uid: Key { a: 0, b: 0 }, uh: 0, eh: 0, ingest: 0, ts: 0, pay: 0, cathi: 0 }; BATCH];
+    let mut batch = [PendEv { eid: Key { a: 0, b: 0 }, uid: Key { a: 0, b: 0 }, uh: 0, eh: 0, ingest: 0, ts: 0, pay: 0, cathi: 0 }; BATCH];
     let mut n = 0;
     let mut lines = Lines::<7>::new(f, a, b);
     loop {
@@ -1414,7 +1425,7 @@ fn event_chunk(ctx: &Ctx, tab: &Table, s: &mut TS, f: Bytes, a: usize, b: usize)
                 // ingest_ts is always valid F1; a line where it is not is treated as malformed
                 let Some(ingest_s) = ingest_secs(ctx, ing) else { break 'line };
                 let ingest = (ingest_s - ctx.ing_base).clamp(0, u32::MAX as i64) as u32;
-                let es = sstr(eid, fast);
+                let es = key(eid, fast);
                 let eh = es.hash();
                 // Events 3 + 4: the kept copy must be valid and not late
                 'drop: {
@@ -1441,7 +1452,7 @@ fn event_chunk(ctx: &Ctx, tab: &Table, s: &mut TS, f: Bytes, a: usize, b: usize)
                     n += 1;
                     break 'line;
                 }
-                s.eb[(eh >> 56) as usize].push(&mut s.arena, ERec { eid: es, ingest, loc: NONE });
+                s.eb[(eh >> 56) as usize].push(&mut s.arena, ERec { ea: es.a, eb: es.b, tag: eh as u32, ingest, loc: NONE });
             }
         }
         if n == BATCH || done {
@@ -1453,7 +1464,7 @@ fn event_chunk(ctx: &Ctx, tab: &Table, s: &mut TS, f: Bytes, a: usize, b: usize)
                     die("person bucket overflow");
                 }
                 let loc = t << 28 | (bk as u32) << 20 | idx as u32;
-                s.eb[(p.eh >> 56) as usize].push(&mut s.arena, ERec { eid: p.eid, ingest: p.ingest, loc });
+                s.eb[(p.eh >> 56) as usize].push(&mut s.arena, ERec { ea: p.eid.a, eb: p.eid.b, tag: p.eh as u32, ingest: p.ingest, loc });
             }
             n = 0;
         }
@@ -1530,16 +1541,15 @@ fn dedup_bucket(st: &[TS], e: usize, tbl: &mut Vec<u64>, dups: &mut Vec<(u32, u3
             for r in sl {
                 let rf = (s.t as u32) << 24 | i;
                 i += 1;
-                let h = r.eid.hash();
-                let tag = (h as u32 | 1) as u64;
-                let mut k = (h >> 32) as usize & mask;
+                let tag = (r.tag | 1) as u64;
+                let mut k = (r.tag >> 1) as usize & mask;
                 loop {
-                    let v = tbl[k];
+                    let v = unsafe { *tbl.get_unchecked(k) };
                     if v == 0 {
-                        tbl[k] = tag << 32 | rf as u64;
+                        unsafe { *tbl.get_unchecked_mut(k) = tag << 32 | rf as u64 };
                         break;
                     }
-                    if v >> 32 == tag && rec(v as u32).eid == r.eid {
+                    if v >> 32 == tag && rec(v as u32).eid().same(r.eid()) {
                         dups.push((v as u32, rf));
                         break;
                     }
@@ -1642,13 +1652,15 @@ struct Sess {
 fn sort_small(v: &mut [u64]) {
     if v.len() <= 24 {
         for i in 1..v.len() {
-            let x = v[i];
-            let mut j = i;
-            while j > 0 && v[j - 1] > x {
-                v[j] = v[j - 1];
-                j -= 1;
+            unsafe {
+                let x = *v.get_unchecked(i);
+                let mut j = i;
+                while j > 0 && *v.get_unchecked(j - 1) > x {
+                    *v.get_unchecked_mut(j) = *v.get_unchecked(j - 1);
+                    j -= 1;
+                }
+                *v.get_unchecked_mut(j) = x;
             }
-            v[j] = x;
         }
     } else {
         v.sort_unstable();

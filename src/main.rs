@@ -12,7 +12,7 @@ use memmap2::Mmap;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -573,6 +573,36 @@ impl Packed {
     }
 }
 
+/// A valid, non-late event in its user_id bucket, until dedup and person resolution.
+struct UEvent {
+    uh: u64,
+    uid: Packed,
+    eid: Packed,
+    ingest: i64,
+    ts: i64,
+    price: u32,
+    cat: u16,
+    kind: u8,
+    dropped: AtomicBool, // a copy of an event_id whose kept copy is another one
+}
+
+/// hash(event_id) and where its line went: `LOC_BAD` set = the thread's invalid list, else a user_id bucket.
+struct ERec {
+    h: u64,
+    loc: u64,
+}
+const LOC_BAD: u64 = 1 << 63;
+const LOC_T: u32 = 56; // thread, 7 bits
+const LOC_B: u32 = 40; // user_id bucket, 16 bits; the index is the low 40 bits
+
+/// One parse thread's output.
+struct EvParse {
+    t: usize,
+    ub: Vec<Vec<UEvent>>,
+    bad: Vec<(Packed, i64)>, // (event_id, ingest_ts) of invalid or late lines: they still win dedup
+    eb: Vec<Vec<ERec>>,
+}
+
 /// A surviving event, routed to its person's bucket.
 #[derive(Clone, Copy)]
 struct PEvent {
@@ -686,67 +716,132 @@ fn main() {
 
     let ctx = Ctx { ws, we, day0, ndays, ncamp, products, campaigns, unknown_cat, cat_rank };
 
-    // 2. events: parse into event_id buckets
+    // 2. events: parse. A valid, non-late event goes to its user_id bucket; an invalid one to a side list.
+    //    Every event also leaves a (hash(event_id), location) record in its event_id bucket.
     let ev_files = csv_files(&data.join("events"));
     let ev_chunks = chunks(&ev_files);
     let ev_est = ev_files.iter().map(|f| f.len()).sum::<usize>() / 60; // lines are ~75 bytes
-    let parsed = par(
+    let tid = AtomicUsize::new(0);
+    let mut parsed = par(
         threads,
         ev_chunks.len(),
-        || sized::<RawEvent>(EB, ev_est, threads),
-        |buckets, i| {
+        || EvParse {
+            t: tid.fetch_add(1, Relaxed),
+            ub: sized::<UEvent>(UB, ev_est, threads),
+            bad: Vec::new(),
+            eb: sized::<ERec>(EB, ev_est, threads),
+        },
+        |st, i| {
             let (f, s, e) = ev_chunks[i];
             for_records::<7>(f, s, e, |fields| {
                 if let Some(r) = parse_event(&ctx, fields) {
-                    buckets[(r.h >> 56) as usize % EB].push(r);
+                    let loc = if r.keep {
+                        let uh = hash_bytes(r.uid.get());
+                        let u = uid_bucket(uh);
+                        let v = &mut st.ub[u];
+                        let loc = ((st.t as u64) << LOC_T) | ((u as u64) << LOC_B) | v.len() as u64;
+                        v.push(UEvent {
+                            uh,
+                            uid: r.uid,
+                            eid: r.eid,
+                            ingest: r.ingest,
+                            ts: r.ts,
+                            price: r.price,
+                            cat: r.cat,
+                            kind: r.kind,
+                            dropped: AtomicBool::new(false),
+                        });
+                        loc
+                    } else {
+                        let loc = LOC_BAD | ((st.t as u64) << LOC_T) | st.bad.len() as u64;
+                        st.bad.push((r.eid, r.ingest));
+                        loc
+                    };
+                    st.eb[(r.h >> 56) as usize % EB].push(ERec { h: r.h, loc });
                 }
             });
         },
     );
+    parsed.sort_by_key(|p| p.t); // locations name threads by t
+    if parsed.len() > 127 {
+        die("too many threads");
+    }
     lap("events parsed");
 
-    // 3. dedup per event bucket, route survivors to person buckets
-    let n_parsed: usize = parsed.iter().flatten().map(|v| v.len()).sum();
-    let routed = par(
+    // 3. duplicates: per event_id bucket, find hashes seen more than once (2-4% of events). Among the copies of
+    //    one event_id the smallest ingest_ts is kept, so every other valid copy is marked dropped.
+    let rec = |loc: u64| -> (i64, Bytes, Option<&UEvent>) {
+        let t = &parsed[((loc >> LOC_T) & 0x7f) as usize];
+        let i = (loc & ((1 << LOC_B) - 1)) as usize;
+        if loc & LOC_BAD != 0 {
+            let (eid, ingest) = t.bad[i];
+            (ingest, eid.get(), None)
+        } else {
+            let e = &t.ub[((loc >> LOC_B) & 0xffff) as usize][i];
+            (e.ingest, e.eid.get(), Some(e))
+        }
+    };
+    let n_dups: usize = par(
         threads,
         EB,
-        || sized::<PEvent>(UB, n_parsed, threads),
-        |out, b| {
-            let mut v: Vec<RawEvent> = Vec::with_capacity(parsed.iter().map(|t| t[b].len()).sum());
+        || (Vec::<(u64, u64)>::new(), Vec::<(u64, u64)>::new(), Vec::<(i64, Bytes, Option<&UEvent>)>::new(), 0usize),
+        |(table, dups, grp, nd), b| {
+            // key = hash | 1 so 0 marks an empty slot; hashes that differ only in bit 0 just meet in a group below
+            let n: usize = parsed.iter().map(|t| t.eb[b].len()).sum();
+            let cap = (n * 2).next_power_of_two().max(16);
+            let mask = cap - 1;
+            table.clear();
+            table.resize(cap, (0, 0));
+            dups.clear();
             for t in &parsed {
-                v.extend_from_slice(&t[b]);
+                for r in &t.eb[b] {
+                    let k = r.h | 1;
+                    let mut s = (k as usize >> 1) & mask;
+                    loop {
+                        let (x, first) = table[s];
+                        if x == 0 {
+                            table[s] = (k, r.loc);
+                            break;
+                        }
+                        if x == k {
+                            if first != u64::MAX {
+                                dups.push((k, first));
+                                table[s].1 = u64::MAX;
+                            }
+                            dups.push((k, r.loc));
+                            break;
+                        }
+                        s = (s + 1) & mask;
+                    }
+                }
             }
-            v.sort_unstable_by_key(|r| r.h);
-            let mut seen: Vec<Bytes> = Vec::new(); // distinct event_ids among equal hashes
+            *nd += dups.len();
+            dups.sort_unstable();
             let mut i = 0;
-            while i < v.len() {
+            while i < dups.len() {
                 let mut j = i + 1;
-                while j < v.len() && v[j].h == v[i].h {
+                while j < dups.len() && dups[j].0 == dups[i].0 {
                     j += 1;
                 }
-                // copies share a hash; ordered by ingest, the first copy of each distinct event_id is the kept copy
-                if j - i > 1 {
-                    v[i..j].sort_unstable_by_key(|r| r.ingest);
-                }
-                seen.clear();
-                for r in &v[i..j] {
-                    if seen.contains(&r.eid.get()) {
-                        continue;
-                    }
-                    seen.push(r.eid.get());
-                    if r.keep {
-                        // routed by user_id for now; phase 4b swaps in the person
-                        let uid = r.uid.get();
-                        let uh = hash_bytes(uid);
-                        out[uid_bucket(uh)].push(PEvent { nh: uh, name: uid, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind });
+                grp.clear();
+                grp.extend(dups[i..j].iter().map(|&(_, loc)| rec(loc)));
+                grp.sort_unstable_by_key(|g| g.0);
+                // ordered by ingest: the first copy of each distinct event_id is its kept copy
+                for k in 0..grp.len() {
+                    if grp[..k].iter().any(|g| g.1 == grp[k].1) {
+                        if let Some(e) = grp[k].2 {
+                            e.dropped.store(true, Relaxed);
+                        }
                     }
                 }
                 i = j;
             }
         },
-    );
-    drop(parsed);
-    lap("events deduped");
+    )
+    .iter()
+    .map(|x| x.3)
+    .sum();
+    lap(&format!("duplicates marked: {n_dups} copies share a hash"));
 
     // 4. clicks
     let ck_files = csv_files(&data.join("clicks"));
@@ -771,7 +866,7 @@ fn main() {
     lap(&format!("links joined: {} linked ids", links.iter().map(|m| m.len()).sum::<usize>()));
 
     // 4b. per user_id bucket: user_id -> person through that bucket's slice of the link table
-    let n_ev: usize = routed.iter().flatten().map(|v| v.len()).sum();
+    let n_ev: usize = parsed.iter().flat_map(|t| t.ub.iter()).map(|v| v.len()).sum();
     let n_ck: usize = clicks.iter().flatten().map(|v| v.len()).sum();
     let resolved = par(
         threads,
@@ -780,10 +875,13 @@ fn main() {
         |(oe, oc), u| {
             let map = &links[u];
             let person = |h: u64, s: Bytes| map.get(&PreHashed { h, s }).copied().unwrap_or((s, h));
-            for t in &routed {
-                for e in &t[u] {
-                    let (name, nh) = person(e.nh, e.name);
-                    oe[person_bucket(nh)].push(PEvent { nh, name, ..*e });
+            for t in &parsed {
+                for e in &t.ub[u] {
+                    if e.dropped.load(Relaxed) {
+                        continue;
+                    }
+                    let (name, nh) = person(e.uh, e.uid.get());
+                    oe[person_bucket(nh)].push(PEvent { nh, name, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
                 }
             }
             for t in &clicks {
@@ -794,7 +892,7 @@ fn main() {
             }
         },
     );
-    drop(routed);
+    drop(parsed);
     drop(clicks);
     let (routed, clicks): (Vec<_>, Vec<_>) = resolved.into_iter().unzip();
     lap("user ids resolved");

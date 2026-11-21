@@ -1989,6 +1989,16 @@ fn die(msg: &str) -> ! {
     std::process::exit(1)
 }
 
+/// When the run started (set first thing in `main`).
+static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// With SESS_DEBUG set: prints how long after the start a step inside a phase ended.
+fn mark(what: &str) {
+    if std::env::var_os("SESS_DEBUG").is_some() {
+        eprintln!("[{:7.3}s] {what}", START.get().map_or(0.0, |t| t.elapsed().as_secs_f64()));
+    }
+}
+
 /// Runs `work(state, i)` for i in 0..n across `threads` threads; returns each thread's state.
 fn par<S: Send>(threads: usize, n: usize, init: impl Fn() -> S + Sync, work: impl Fn(&mut S, usize) + Sync) -> Vec<S> {
     let next = AtomicUsize::new(0);
@@ -2342,7 +2352,7 @@ fn log2_near(n: usize) -> u32 {
 }
 
 fn main() {
-    let t0 = Instant::now();
+    let t0 = *START.get_or_init(Instant::now);
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let threads: usize = env_num("NCPU")
@@ -2415,12 +2425,15 @@ fn main() {
     // 1. links, on every thread; this one reads the small tables meanwhile
     let ids = IdTable::new(id_bits);
     let names = Interner::new();
+    mark("files listed, ID table mapped");
     let (n_links, small) = std::thread::scope(|sc| {
         let links = sc.spawn(|| {
             ids.populate(threads);
+            mark("ID table populated");
             build_links(&ids, &names, link_files, threads)
         });
         let small = small_tables(&data);
+        mark("small tables read");
         (links.join().unwrap_or_else(|_| die("link builder panicked")), small)
     });
     let Small { products, campaigns, cat_names, cat_rank, unknown_cat, camp_ids, camp_channel } = small;
@@ -2907,6 +2920,7 @@ fn build_links(ids: &IdTable, names: &Interner, files: &[InFile], threads: usize
             bt.join(ids, names);
         },
     );
+    mark("link lines joined");
     // B. flatten, one pass over the table: every linked ID points straight at its root. The linked slots of a
     //    stretch are found a cache line at a time and wait, what they hang under asked for, until WAIT of them do
     const SPAN: usize = 1 << 15;
@@ -3556,7 +3570,11 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
         die("too many events for the duplicate finder");
     }
     let qb = buckets.trailing_zeros();
-    par(threads, buckets, || Dedup { tags: Vec::new(), pos: Vec::new(), groups: Vec::new(), total: 0 }, |d, b| dedup_bucket(cx, far, shards, qb, b, d))
+    // a thread's table starts with room for 1 MiB of tags and 1 MiB of positions (327,000 records a bucket), however
+    // small the buckets: blocks of that size are in huge pages (`huge_alloc`), smaller ones in 4 KiB pages, where
+    // every probe of a group and every position written is a miss of the first-level TLB
+    let new = || Dedup { tags: huge_vec((1 << 20) / 32), pos: huge_vec((1 << 20) / 64), groups: Vec::new(), total: 0 };
+    par(threads, buckets, new, |d, b| dedup_bucket(cx, far, shards, qb, b, d))
         .iter()
         .map(|d| d.total)
         .sum()

@@ -2982,7 +2982,8 @@ fn fast_exit(threads: usize) -> ! {
     let pieces: [[AtomicUsize; 2]; MAXP] = std::array::from_fn(|_| [AtomicUsize::new(0), AtomicUsize::new(0)]);
     std::thread::scope(|sc| {
         let mut n = 0;
-        while n < threads.clamp(1, 32) {
+        // this thread is the last of the `threads` workers: no more runnable threads than the CPU quota allows
+        while n + 1 < threads.clamp(1, 32) {
             let (reg, go, next, done, np, keep, pieces) = (&reg, &go, &next, &done, &np, &keep, &pieces);
             let k = n;
             let spawned = std::thread::Builder::new().spawn_scoped(sc, move || {
@@ -3013,18 +3014,15 @@ fn fast_exit(threads: usize) -> ! {
                     unsafe { libc::madvise(pieces[i][0].load(Relaxed) as *mut libc::c_void, pieces[i][1].load(Relaxed), libc::MADV_DONTNEED) };
                     done.fetch_add(1, Release);
                 }
-                // never return: thread exit would free into the zeroed heap
+                // never return: thread exit would free into the zeroed heap; sleep until the process ends
                 loop {
-                    unsafe { libc::sched_yield() };
+                    unsafe { libc::pause() };
                 }
             });
             if spawned.is_err() {
                 break;
             }
             n += 1;
-        }
-        if n == 0 {
-            std::process::exit(0);
         }
         while reg.load(Acquire) < n {
             std::thread::yield_now();
@@ -3080,8 +3078,16 @@ fn fast_exit(threads: usize) -> ! {
         }
         np.store(cnt, Relaxed);
         go.store(true, Release);
+        loop {
+            let i = next.fetch_add(1, Relaxed);
+            if i >= cnt {
+                break;
+            }
+            unsafe { libc::madvise(pieces[i][0].load(Relaxed) as *mut libc::c_void, pieces[i][1].load(Relaxed), libc::MADV_DONTNEED) };
+            done.fetch_add(1, Release);
+        }
         while done.load(Acquire) < cnt {
-            std::thread::yield_now();
+            std::hint::spin_loop();
         }
         unsafe { libc::_exit(0) }
     });

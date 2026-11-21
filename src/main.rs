@@ -976,6 +976,28 @@ fn csv_files(dir: &Path) -> Vec<Bytes> {
     paths.iter().map(|p| map_file(p)).collect()
 }
 
+/// Asks the kernel to read the mapped ranges in from disk, in order, without waiting for them (MADV_WILLNEED queues
+/// large reads; the parse threads then find the pages cached or in flight). Ranges already in the page cache, judged
+/// by their first 64 KB, are skipped, so a warm run costs a few mincore calls.
+fn read_ahead(ranges: &[(usize, usize)]) {
+    #[cfg(target_os = "linux")]
+    {
+        let mut vec = [0u8; 16];
+        for &(a, n) in ranges {
+            let start = a & !4095;
+            let len = n + (a - start);
+            let probe = len.min(16 * 4096);
+            let cached = unsafe { libc::mincore(start as *mut libc::c_void, probe, vec.as_mut_ptr()) } == 0
+                && vec[..probe.div_ceil(4096)].iter().all(|&v| v & 1 != 0);
+            if !cached {
+                unsafe { libc::madvise(start as *mut libc::c_void, len, libc::MADV_WILLNEED) };
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = ranges;
+}
+
 /// (file, start, end) pieces of at most `size` bytes.
 fn chunks(files: &[Bytes], size: usize) -> Vec<(Bytes, usize, usize)> {
     let mut out = Vec::new();
@@ -1141,6 +1163,20 @@ fn main() {
         .min(MAXT);
     let lap = |what: &str| eprintln!("[{:7.3}s] {what}", t0.elapsed().as_secs_f64());
 
+    // inputs: mapped first, and read ahead from disk in the order the phases consume them (a no-op when cached)
+    let link_files = csv_files(&data.join("links"));
+    let ev_files = csv_files(&data.join("events"));
+    let ck_files = csv_files(&data.join("clicks"));
+    let lk = chunks(&link_files, LINK_CHUNK);
+    let mut work: Vec<(Bytes, usize, usize, bool)> = chunks(&ev_files, CHUNK).into_iter().map(|(f, s, e)| (f, s, e, true)).collect();
+    work.extend(chunks(&ck_files, CHUNK).into_iter().map(|(f, s, e)| (f, s, e, false)));
+    work.sort_by_key(|w| std::cmp::Reverse(w.2 - w.1));
+    {
+        let order: Vec<(usize, usize)> =
+            lk.iter().map(|&(f, a, b)| (f.as_ptr() as usize + a, b - a)).chain(work.iter().map(|&(f, a, b, _)| (f.as_ptr() as usize + a, b - a))).collect();
+        std::thread::spawn(move || read_ahead(&order));
+    }
+
     // manifest
     let manifest = std::fs::read_to_string(data.join("manifest.json")).unwrap_or_else(|e| die(&format!("manifest.json: {e}")));
     let ws = manifest_ts(&manifest, "window_start");
@@ -1164,9 +1200,6 @@ fn main() {
     // dates any in-window ts (F2 local dates: +-1 day) or a typical ingest_ts can fall on
     let dates = Dates::new(base.div_euclid(DAY) - 2, (we - 1).div_euclid(DAY) + 7);
 
-    let link_files = csv_files(&data.join("links"));
-    let ev_files = csv_files(&data.join("events"));
-    let ck_files = csv_files(&data.join("clicks"));
     let link_bytes: usize = link_files.iter().map(|f| f.len()).sum();
     let ev_bytes: usize = ev_files.iter().map(|f| f.len()).sum();
     let ck_bytes: usize = ck_files.iter().map(|f| f.len()).sum();
@@ -1201,7 +1234,6 @@ fn main() {
     lap(&format!("setup: id table {cap} slots"));
 
     // 1. links
-    let lk = chunks(&link_files, LINK_CHUNK);
     par_mut(&mut st, lk.len(), |s, i| link_chunk(&tab, s, lk[i]));
     {
         let edges: Vec<&[(u32, u32)]> = st.iter().flat_map(|s| s.edges.chunks(16 << 10)).collect();
@@ -1226,9 +1258,6 @@ fn main() {
     let ctx = Ctx { ws, we, base, ing_base: ws.div_euclid(1000) - (1 << 31), day0, ndays, ncamp, products, camps, unknown_cat, cat_rank, dates };
 
     // 2. events + clicks
-    let mut work: Vec<(Bytes, usize, usize, bool)> = chunks(&ev_files, CHUNK).into_iter().map(|(f, s, e)| (f, s, e, true)).collect();
-    work.extend(chunks(&ck_files, CHUNK).into_iter().map(|(f, s, e)| (f, s, e, false)));
-    work.sort_by_key(|w| std::cmp::Reverse(w.2 - w.1));
     par_mut(&mut st, work.len(), |s, i| {
         let (f, a, b, ev) = work[i];
         if ev {

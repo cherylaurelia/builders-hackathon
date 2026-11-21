@@ -3075,6 +3075,90 @@ mod tests {
         (ev, lg)
     }
 
+    /// `fast_split` (with the masks `scan_lines` computes) agrees with `split` on random lines made of the bytes
+    /// that matter (from arena/c2's tests).
+    fn fast_split_vs_split<const N: usize>(seed: u64) {
+        let mut r = Rng(seed);
+        let atoms = ["a", ",", "\"", "\"\"", "xy", "\r", " ", "\"ab\"", "1234567"];
+        for _ in 0..200_000 {
+            let mut line = String::new();
+            for _ in 0..r.below(40) {
+                line += r.pick(&atoms);
+            }
+            line.truncate(126);
+            let mut buf = line.clone().into_bytes();
+            buf.push(b'\n');
+            buf.resize(buf.len() + 200, b'z');
+            let want = split::<N>(Box::leak(line.clone().into_bytes().into_boxed_slice())).map(|f| f.map(|x| x.to_vec()));
+            let got = unsafe {
+                let p = buf.as_ptr();
+                let [c0, q0, n0] = masks64(p);
+                let [c1, q1, n1] = masks64(p.add(64));
+                let e = (n0 as u128 | (n1 as u128) << 64).trailing_zeros() as usize;
+                assert_eq!(e, line.len());
+                let lm = (1u128 << e) - 1;
+                fast_split::<N>(p, e, (c0 as u128 | (c1 as u128) << 64) & lm, (q0 as u128 | (q1 as u128) << 64) & lm)
+            }
+            .map(|f| f.map(|(s, l)| buf[s..s + l].to_vec()));
+            assert_eq!(got, want, "line {line:?}");
+        }
+    }
+
+    #[test]
+    fn fast_split_matches_split() {
+        fast_split_vs_split::<2>(1);
+        fast_split_vs_split::<4>(2);
+        fast_split_vs_split::<7>(3);
+    }
+
+    #[test]
+    fn prices() {
+        assert_eq!(parse_price(b"0250"), Some(250));
+        assert_eq!(parse_price(b"000000000000000000000250"), Some(250));
+        assert_eq!(parse_price(b"10000000"), Some(10_000_000));
+        assert_eq!(parse_price(b"10000001"), None);
+        assert_eq!(parse_price(b"0"), None);
+        assert_eq!(parse_price(b"12.5"), None);
+        assert_eq!(parse_price(b""), None);
+        assert_eq!(parse_price(b"99999999999999999999999"), None);
+    }
+
+    /// `ts_at` and `ts_memo` agree with `parse_ts` on arena/c2's timestamp mix: F1/F2 with random fields near a
+    /// window holding February 29, 13-digit F3, digit strings of any length, and a stray byte now and then.
+    #[test]
+    fn timestamps_match_general_parser() {
+        let mut r = Rng(7);
+        let mut days = [NO_DAY; 32];
+        for _ in 0..300_000 {
+            let mut s: Vec<u8> = match r.below(4) {
+                0 => format!("2028-0{}-{:02}T{:02}:{:02}:{:02}Z", 2 + r.below(2), r.below(32), r.below(25), r.below(61), r.below(61)).into_bytes(),
+                1 => format!(
+                    "2028-0{}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
+                    2 + r.below(2),
+                    r.below(32),
+                    r.below(25),
+                    r.below(61),
+                    r.below(61),
+                    if r.below(2) == 0 { '+' } else { '-' },
+                    r.below(25),
+                    r.below(61)
+                )
+                .into_bytes(),
+                2 => format!("18{:011}", r.next() % 100_000_000_000).into_bytes(),
+                _ => (0..r.below(22)).map(|_| b'0' + r.below(10) as u8).collect(),
+            };
+            if r.below(8) == 0 && !s.is_empty() {
+                let i = r.below(s.len());
+                s[i] = b"xZT:-+ 0"[r.below(8)];
+            }
+            let mut buf = s.clone();
+            buf.extend_from_slice(&[b'7'; 32]);
+            let want = parse_ts(&s);
+            assert_eq!(unsafe { ts_at(buf.as_ptr(), s.len()) }, want, "{:?}", String::from_utf8_lossy(&s));
+            assert_eq!(unsafe { ts_memo(buf.as_ptr(), s.len(), &mut days) }, want, "memo {:?}", String::from_utf8_lossy(&s));
+        }
+    }
+
     #[test]
     fn streams_keep_every_record_where_push_said() {
         let mut r = Rng(17);

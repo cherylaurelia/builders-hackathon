@@ -3259,7 +3259,10 @@ fn main() {
     // against 2^9 + 2^9, while 2^8 + 2^8 is even with it (164K events a partition); box, 75M events, 8 threads
     // on 4 CPUs: 2^10 3.03 s, 2^9 2.76 s. Only inputs over ~69M events change. The partitions' floor (a click
     // keeps its person's number in the partition in 16 bits) stays above the cap.
-    let pbits = (env_num("SESS_PBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000).min(9))).clamp(4, 12.min(id_bits - 4)).max((id_bits + 1).saturating_sub(16));
+    // Person partitions alone: about 75,000 events each and up to 2^10. Intel VM, v5 60M (ev_est 72M), 10
+    // interleaved runs: 2^10 1315 ms against 2^9 1329 (sessions -20 ms, parse +8), 2^11 1327; v5 20M (ev_est 25M,
+    // 2^8) is even with 2^9 and 2^10. 2^10 from ev_est 58M (~4.1 GB of events) on, 2^9 from 29M.
+    let pbits = (env_num("SESS_PBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 75_000).min(10))).clamp(4, 12.min(id_bits - 4)).max((id_bits + 1).saturating_sub(16));
     let qbits = (env_num("SESS_QBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000).min(9))).clamp(4, 12);
     // 128 KiB a read: the copy from the page cache passes the piece through the core's cache twice (as source and
     // as copy), and a larger piece pushes the thread's open stream groups out of it (L2 is 1 MiB, and on the scorer

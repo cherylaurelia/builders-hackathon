@@ -1051,12 +1051,12 @@ impl<T> Stream<T> {
     }
 }
 
-/// Records in a block of a `Log`: 4 KiB of keys, then 4 KiB of payloads.
-const LG_BLOCK: usize = 512;
+/// Records in a block of a `Log`: 8 KiB of keys, then 8 KiB of payloads (see CK_BLOCK for the measurements).
+const LG_BLOCK: usize = 1024;
 
 /// The dedup records of each event-key bucket from one thread: per record a key and a payload of 8 bytes each,
-/// append-only, in blocks of LG_BLOCK records whose keys fill one page and whose payloads fill the next. The
-/// passes that only look at keys (`mark_duplicates`) then read half the bytes, a page at a time (a hardware
+/// append-only, in blocks of LG_BLOCK records whose keys fill two pages and whose payloads fill the next two. The
+/// passes that only look at keys (`mark_duplicates`) then read half the bytes, pages at a time (a hardware
 /// prefetcher stops at the end of a page, so it does not fetch the payloads behind the keys).
 ///
 /// Like a `Stream`, eight records at a time reach memory: their keys as one cache line and their payloads as
@@ -2974,7 +2974,9 @@ impl CRec {
 const EV_BLOCK: usize = 1536;
 /// Cache lines a stream of each kind writes at a time (`Stream`); a block is a whole number of them. One line:
 /// the stages are what a parse thread keeps in its half of the L2 (Intel VM, 60M: 1, 2 and 4 lines parse alike).
-const CK_BLOCK: usize = 192; // records: 3072 bytes
+// records: 12 KiB (with LG_BLOCK 1024, Intel v5 against 192 and 512: 60M wall min -0.9% and -0.9%, 20M -1.3%;
+// fewer block ends for the parse's pushes and for the passes that walk the blocks)
+const CK_BLOCK: usize = 768;
 
 /// Events or clicks whose user IDs are on their way from memory at a time (`Batch`). 128: at 60M (an ID table
 /// of 2^23 lines, twice the 20M one) the lookups of a batch of 64 still waited on some of their lines. Intel, v5,

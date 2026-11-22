@@ -421,48 +421,61 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
     sfence();
 }
 
-/// A for the lane `j` of `l`, whose line at `line` (192 bytes readable) has a field before its second comma longer than
-/// 9 bytes: when event_id or user_id is 33 bytes (quotes left out), the masks are those of the line with the
-/// bytes 9..33 of each such ID cut out, and `sh1`/`sh2` say how many bytes were cut before user_id and before ts;
-/// otherwise the masks of the line itself. The table slots of the long IDs are asked for (`batch` looks them up).
+/// A for the lane `j` of `l` (its masks taken), whose line at `line` (176 bytes readable) has a field before its
+/// second comma longer than 9 bytes: when event_id or user_id is 33 bytes (quotes left out), the masks become those
+/// of the line with the bytes 9..33 of each such ID cut out, and `sh1`/`sh2` say how many bytes were cut before
+/// user_id and before ts; otherwise the masks stay. The table slots of the long IDs are asked for (`batch` looks
+/// them up).
 ///
 /// The cut bytes are seen by no check here: the long-ID table takes only 32 lowercase hex digits after a 1-byte
 /// prefix (no comma, quote, newline or odd byte among them), and a lane whose ID it refuses goes to `event_line`.
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,avx2")]
 unsafe fn long_lane(cx: &Ctx, l: &mut Lanes, j: usize, line: *const u8) {
-    let (cm, qt, nv, lowest) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'"' as i8), _mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(0x20));
-    let v = [_mm512_loadu_si512(line as *const _), _mm512_loadu_si512(line.add(64) as *const _), _mm512_loadu_si512(line.add(128) as *const _)];
-    let m3 = |k: __m512i| [_mm512_cmpeq_epi8_mask(v[0], k), _mm512_cmpeq_epi8_mask(v[1], k), _mm512_cmpeq_epi8_mask(v[2], k)];
-    let (c, q, n) = (m3(cm), m3(qt), m3(nv));
-    let odd = [_mm512_cmplt_epi8_mask(v[0], lowest), _mm512_cmplt_epi8_mask(v[1], lowest), 0];
-    let lo = |m: [u64; 3]| m[0] as u128 | (m[1] as u128) << 64;
-    let cl = lo(c);
-    let ql = lo(q);
+    let c = *l.c0.get_unchecked(j) as u128 | (*l.c1.get_unchecked(j) as u128) << 64;
+    let q = *l.q0.get_unchecked(j) as u128 | (*l.q1.get_unchecked(j) as u128) << 64;
     // event_id: from byte qe; user_id: from s1 + qu
-    let qe = (q[0] & 1) as u32;
-    let p1 = cl.trailing_zeros();
+    let qe = (q & 1) as u32;
+    let p1 = c.trailing_zeros();
     let s1 = p1 + 1;
-    let qu = if s1 < 128 { ((ql >> s1) & 1) as u32 } else { 0 };
-    let p2 = (cl & cl.wrapping_sub(1)).trailing_zeros();
+    let qu = if s1 < 128 { ((q >> s1) & 1) as u32 } else { 0 };
+    let p2 = (c & c.wrapping_sub(1)).trailing_zeros();
     let l0 = p1 < 128 && p1 == 33 + 2 * qe;
     let l1 = p2 < 128 && p2 == s1 + 33 + 2 * qu;
+    if !(l0 | l1) {
+        *l.sh1.get_unchecked_mut(j) = 0;
+        *l.sh2.get_unchecked_mut(j) = 0;
+        return;
+    }
     // virtual byte k is real byte k below cut0, k + d1 below cut1, k + d2 from there
     let d1 = if l0 { 24 } else { 0 };
     let d2 = d1 + if l1 { 24 } else { 0 };
     let cut0 = if l0 { qe + 9 } else { 0 };
     let cut1 = if l1 { s1 + qu + 9 - d1 } else { 128 };
-    let low = |x: u32| if x >= 128 { !0u128 } else { (1u128 << x) - 1 };
-    let (m0, m1) = (low(cut0), low(cut1));
-    let shr = |m: [u64; 3], d: u32| if d == 0 { lo(m) } else { (lo(m) >> d) | ((m[2] as u128) << (128 - d)) };
-    let virt = |m: [u64; 3]| (lo(m) & m0) | (shr(m, d1) & !m0 & m1) | (shr(m, d2) & !m1);
-    let (vc, vq, vn, vo) = (virt(c), virt(q), virt(n), virt(odd));
-    *l.c0.get_unchecked_mut(j) = vc as u64;
-    *l.c1.get_unchecked_mut(j) = (vc >> 64) as u64;
-    *l.q0.get_unchecked_mut(j) = vq as u64;
-    *l.q1.get_unchecked_mut(j) = (vq >> 64) as u64;
-    *l.odd.get_unchecked_mut(j) = vo as u64;
-    *l.e2.get_unchecked_mut(j) = tz((vn >> 64) as u64) as u64;
+    let below = |x: u32, from: u32| -> u64 {
+        let x = x.saturating_sub(from);
+        if x >= 64 {
+            !0
+        } else {
+            (1u64 << x) - 1
+        }
+    };
+    // (a macro, not a closure: the 512-bit code stays in this function)
+    macro_rules! half {
+        ($o:expr) => {{
+            let x = _mm512_loadu_si512(line.add($o + d2 as usize) as *const _);
+            let x = _mm512_mask_blend_epi8(below(cut1, $o as u32), x, _mm512_loadu_si512(line.add($o + d1 as usize) as *const _));
+            _mm512_mask_blend_epi8(below(cut0, $o as u32), x, _mm512_loadu_si512(line.add($o) as *const _))
+        }};
+    }
+    let (v0, v1) = (half!(0usize), half!(64usize));
+    let (cm, qt, nv, lowest) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'"' as i8), _mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(0x20));
+    *l.c0.get_unchecked_mut(j) = _mm512_cmpeq_epi8_mask(v0, cm);
+    *l.q0.get_unchecked_mut(j) = _mm512_cmpeq_epi8_mask(v0, qt);
+    *l.c1.get_unchecked_mut(j) = _mm512_cmpeq_epi8_mask(v1, cm);
+    *l.q1.get_unchecked_mut(j) = _mm512_cmpeq_epi8_mask(v1, qt);
+    *l.odd.get_unchecked_mut(j) = _mm512_cmplt_epi8_mask(v0, lowest);
+    *l.e2.get_unchecked_mut(j) = tz(_mm512_cmpeq_epi8_mask(v1, nv)) as u64;
     *l.sh1.get_unchecked_mut(j) = d1 as u64;
     *l.sh2.get_unchecked_mut(j) = d2 as u64;
     // (an event ID is not looked up: `LONG_EV`)

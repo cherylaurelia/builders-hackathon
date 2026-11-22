@@ -1469,6 +1469,12 @@ impl IdTable {
         ((((x >> (k + 3)) << k) + y / 5) << 3) | (y % 5)
     }
 
+    /// Asks for the line of `name(person)`; a hint only.
+    #[inline(always)]
+    fn prefetch_name(&self, person: u32) {
+        prefetch(self.lines.as_ptr().wrapping_add((self.slot_of(person) >> 3) as usize));
+    }
+
     /// The name of `person`: the key of its root. For a number that is nobody's: 0 or some other key.
     #[inline(always)]
     fn name(&self, person: u32) -> u64 {
@@ -4893,6 +4899,9 @@ unsafe fn offsets(st: *mut u32, local: usize, act: *mut u32) -> (u32, usize) {
     (run, na)
 }
 
+/// How many people ahead `partition_work` asks for a name's line.
+const NAME_PF: usize = 8;
+
 /// rules.md "Events" 5-7 and "Clicks" 4-7 for person partition `p`: the people whose slot number starts with p.
 #[inline(never)]
 fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
@@ -5011,6 +5020,8 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
 
     let ev = std::mem::take(&mut w.ev);
     for i in 0..w.nact {
+        // the name's line is read once, a miss: asked for some people ahead
+        cx.ids.prefetch_name(((p << cx.pshift) | w.act[(i + NAME_PF).min(w.nact - 1)] as usize) as u32);
         let l = w.act[i] as usize;
         let (a, b) = (w.start[l] as usize, w.start[l + 1] as usize);
         let name = cx.ids.name(((p << cx.pshift) | l) as u32);
@@ -5233,6 +5244,22 @@ fn credit_clicks(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
             let at = if m != 0 { *cp.add(best) as usize } else { organic * width } + d;
             // assists: one click of each campaign in the window
             let day = assist.as_mut_ptr().add(d);
+            if nc <= 8 {
+                // every click, with no data-dependent branch: it adds 1 when it is in the window and no click
+                // before it in the window has its campaign
+                for j in 0..nc {
+                    let first = (m & *eq.get_unchecked(j) & ((1u64 << j) - 1) == 0) as u32;
+                    let cell = *cp.add(j) as usize;
+                    let a = day.add(cell);
+                    let v = *a as u32 + (((m >> j) as u32) & first & 1);
+                    *a = v as u16;
+                    if v >> 16 != 0 {
+                        around[cell + d] += 1;
+                    }
+                }
+                credit(cred, buy, at, s.rev);
+                continue;
+            }
             let mut c = m;
             while c != 0 {
                 let j = c.trailing_zeros() as usize;

@@ -6294,7 +6294,13 @@ fn user_group(f: &mut PqFile, rows: &[UserRow], people: &[(u64, u32)], cat_names
     // sessions and events stay far below 2^31: main() refuses inputs with that many events
     f.group(&USER_COLS, n, |c, lo, hi, b| {
         if c == 0 && lo == DICT_PAGE {
-            for &(name, _) in people {
+            for (i, &(name, _)) in people.iter().enumerate() {
+                // a long name's slot is a miss: asked for NAME_PF people ahead
+                if let Some(&(ahead, _)) = people.get(i + NAME_PF) {
+                    if ahead & (INTERNED | LONG) == INTERNED | LONG {
+                        prefetch(names.slot(ahead as usize));
+                    }
+                }
                 put_name(b, names, name, &mut tmp);
             }
             return entries;

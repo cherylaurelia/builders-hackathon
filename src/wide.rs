@@ -320,6 +320,40 @@ macro_rules! words2 {
     };
 }
 
+/// The 16 bytes at the starts `$a` (buffer offsets, a register just stored to `$a`) of four lines, from `$i` on,
+/// as one register: loaded straight into it (no copy through memory: a register read back from four stores
+/// waits for them to be written)
+macro_rules! lanes16 {
+    ($buf:expr, $a:expr, $i:expr) => {{
+        let p = |j: usize| $buf.add(std::ptr::read_volatile($a.as_ptr().add($i + j)) as usize) as *const __m128i;
+        let x = _mm512_inserti64x2::<1>(_mm512_castsi128_si512(_mm_loadu_si128(p(0))), _mm_loadu_si128(p(1)));
+        _mm512_inserti64x2::<3>(_mm512_inserti64x2::<2>(x, _mm_loadu_si128(p(2))), _mm_loadu_si128(p(3)))
+    }};
+}
+/// Words 0 and 1 of the 16 bytes at the eight starts `$a`, as `words2!` of their copies.
+macro_rules! words2at {
+    ($buf:expr, $a:expr) => {{
+        let (z0, z1) = (lanes16!($buf, $a, 0), lanes16!($buf, $a, 4));
+        (_mm512_permutex2var_epi64(z0, ix!(EVEN), z1), _mm512_permutex2var_epi64(z0, ix!(ODD), z1))
+    }};
+}
+/// Words 0..4 of the 32 bytes at the eight starts `$a`, as `words4!` of their copies.
+macro_rules! words4at {
+    ($buf:expr, $a:expr) => {{
+        let p = |j: usize| $buf.add(std::ptr::read_volatile($a.as_ptr().add(j)) as usize) as *const __m256i;
+        let z = |j: usize| _mm512_inserti64x4::<1>(_mm512_castsi256_si512(_mm256_loadu_si256(p(j))), _mm256_loadu_si256(p(j + 1)));
+        let (z0, z1, z2, z3) = (z(0), z(2), z(4), z(6));
+        let (a01, a23) = (_mm512_permutex2var_epi64(z0, ix!(IX_A), z1), _mm512_permutex2var_epi64(z2, ix!(IX_A), z3));
+        let (b01, b23) = (_mm512_permutex2var_epi64(z0, ix!(IX_B), z1), _mm512_permutex2var_epi64(z2, ix!(IX_B), z3));
+        (
+            _mm512_permutex2var_epi64(a01, ix!(IX_LO), a23),
+            _mm512_permutex2var_epi64(a01, ix!(IX_HI), a23),
+            _mm512_permutex2var_epi64(b01, ix!(IX_LO), b23),
+            _mm512_permutex2var_epi64(b01, ix!(IX_HI), b23),
+        )
+    }};
+}
+
 // ---------------------------------------------------------------- events
 
 /// Eight event lines on their way through `batch`: every field is 64 bytes, a register's worth.
@@ -845,14 +879,8 @@ struct ClickLanes {
     // B: the IDs' lengths
     cl: [u64; 8],
     ul: [u64; 8],
-    // C: the fields' bytes, line after line
-    sc: [u8; 128], // click_id: 16 bytes a line
-    su: [u8; 128], // user_id
-    sk: [u8; 128], // campaign_id (its first 8 bytes are used)
-    st: [u8; 256], // ts: 32 bytes a line
     // D
-    key: [u64; 8],  // the campaign as `short_key`
-    slot: [u64; 8], // where the search for it starts (`IdMap::get_short`)
+    key: [u64; 8],  // the campaign's length
     camp: [u64; 8], // its number, for the lanes whose campaign is in campaigns.csv
     home: [u64; 8],
     tx: [u64; 8],
@@ -1039,30 +1067,19 @@ unsafe fn click_batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &
     sv!(l.ak, _mm512_mask_add_epi64(pv, k_shape, pv, _mm512_add_epi64(s2, qk)));
     sv!(l.at, _mm512_mask_add_epi64(pv, k_shape, pv, _mm512_add_epi64(s3, qt)));
 
-    // ---- C: the fields' bytes to their fixed places
-    // SAFETY: a start is within the line's first 120 bytes and at most 32 bytes are read from there, and a ts
-    // starts 13 bytes before the newline at the latest: within the 144 readable ones
-    for i in 0..8 {
-        copy16!(l.sc, buf, l.ac, i);
-        copy16!(l.su, buf, l.au, i);
-        copy16!(l.sk, buf, l.ak, i);
-        copy32!(l.st, buf, l.at, i);
-    }
-
-    // ---- D
-    // the campaign first: its number comes from a table, one lane at a time, and is read again as a register
-    // at the end, when those stores are long done. `IdMap::get_short` on the key and the slot made here
-    let (kw, _) = words2!(l.sk);
-    let key = _mm512_or_si512(_mm512_and_si512(kw, _mm512_add_epi64(_mm512_sllv_epi64(one, _mm512_slli_epi64::<3>(kl)), m1)), _mm512_slli_epi64::<56>(_mm512_add_epi64(kl, one)));
-    sv!(l.key, key);
-    sv!(l.slot, _mm512_srl_epi64(_mm512_mullo_epi64(key, k!(0x9E37_79B9_7F4A_7C15u64)), _mm_cvtsi64_si128(cx.campaigns.rshift as i64)));
-    let (rkeys, rvals, rmask) = (cx.campaigns.rkeys.as_ptr(), cx.campaigns.rvals.as_ptr(), cx.campaigns.rkeys.len() - 1);
+    // ---- C, D
+    // the campaign: its number comes from a table, one lane at a time, its key (`short_key`) read from the line;
+    // the numbers are read again as a register at the end, when those stores are long done. `IdMap::get_short`
+    sv!(l.key, kl);
+    let (rkeys, rvals, rmask, rshift) = (cx.campaigns.rkeys.as_ptr(), cx.campaigns.rvals.as_ptr(), cx.campaigns.rkeys.len() - 1, cx.campaigns.rshift);
     let mut found = 0u8;
     let mut m = (k_shape & live) as u32;
     while m != 0 {
         let i = m.trailing_zeros() as usize;
         m &= m - 1;
-        let (want, mut at) = (l.key[i], l.slot[i] as usize);
+        // SAFETY: a campaign starts within its line's first 120 bytes: 8 bytes from there are readable
+        let want = short_key((buf.add(l.ak[i] as usize) as *const u64).read_unaligned(), l.key[i] as usize);
+        let mut at = (spread(want) >> rshift) as usize;
         // SAFETY: the slot is below the table's size (the shift leaves as many bits as the mask has)
         loop {
             let have = *rkeys.add(at);
@@ -1078,14 +1095,16 @@ unsafe fn click_batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &
         }
     }
 
-    // IDs of 8 or 9 bytes packed here (for any other lane the key is of no use)
+    // IDs of 8 or 9 bytes packed here (for any other lane the key is of no use). SAFETY: a start is within the
+    // line's first 120 bytes and at most 32 bytes are read from there, and a ts starts 13 bytes before the
+    // newline at the latest: within the 144 readable ones
     let (c9, u9) = (_mm512_cmpeq_epi64_mask(cl, k!(9)), _mm512_cmpeq_epi64_mask(ul, k!(9)));
     let short = _mm512_mask_cmple_epu64_mask(_mm512_cmple_epu64_mask(_mm512_sub_epi64(cl, k!(8)), one), _mm512_sub_epi64(ul, k!(8)), one);
-    let (clo, chi) = words2!(l.sc);
-    let (ulo, uhi) = words2!(l.su);
+    let (clo, chi) = words2at!(buf, l.ac);
+    let (ulo, uhi) = words2at!(buf, l.au);
     let ckey = pack8(clo, chi, c9);
     let ukey = pack8(ulo, uhi, u9);
-    let (w0, w1, w2, w3) = words4!(l.st);
+    let (w0, w1, w2, w3) = words4at!(buf, l.at);
     let (kts, trel, kdate) = stamp(&(*st).dv, cx.ws, w0, w1, w2, w3, kf1, kf2, kf3);
     // ms from the start of the clicks' window, seven days before window_start
     let tw = _mm512_add_epi64(trel, k!(cx.ws - cx.base));

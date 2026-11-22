@@ -4695,6 +4695,7 @@ struct Work {
     // the ts and the campaign of the clicks of the person at hand (up to 64), as arrays for the vector passes
     cts: A32,
     ccamp: A32,
+    ccid: A32, // and its campaign
     bins: Vec<Bin>, // the bins of the person at hand (all free between people)
     bits: Vec<u64>, // which bins are taken
     // the sessions of the person at hand
@@ -4742,6 +4743,7 @@ impl Work {
             sat: vec![0; nbins.next_multiple_of(8) + 3],
             cts: A32([0; 72]),
             ccamp: A32([0; 72]),
+            ccid: A32([0; 72]),
             bins: vec![FREE_BIN; nbins],
             bits: vec![0; nbins / 64 + 1],
             ses: vec![Ses { start: 0, d: 0, row: 0, rev: 0 }; nbins + 1],
@@ -5268,7 +5270,7 @@ fn credit(cells: &mut [[u16; 2]], round: &mut [[u32; 2]], buy: &mut [Buy], at: u
 #[inline(never)]
 fn credit_clicks(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
     let (width, organic) = (cx.ndays, cx.ncamp);
-    let Work { cells, round, buy, ses, ck, cts, ccamp, eq, .. } = w;
+    let Work { cells, round, buy, ses, ck, cts, ccamp, ccid, eq, seen, sctr, .. } = w;
     let cs = &ck[ca..ca + nc];
     assert!(nc <= 64 && cells.len() == (organic + 1) * width);
     for (j, c) in cs.iter().enumerate() {
@@ -5276,13 +5278,16 @@ fn credit_clicks(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
         unsafe {
             *cts.0.get_unchecked_mut(j) = c.ts();
             *ccamp.0.get_unchecked_mut(j) = c.camp() * width as u32; // the campaign's first cell
+            *ccid.0.get_unchecked_mut(j) = c.camp();
         }
         // its days are one or two lines, read by the sessions below
         prefetch(cells.as_ptr().wrapping_add(c.camp() as usize * width));
     }
     // the vector passes read up to 8 entries past the last click: the arrays hold 72
     let (tp, cp) = (cts.0.as_ptr(), ccamp.0.as_ptr());
-    unsafe { same_campaign(cp, nc, eq) };
+    if nc <= 8 {
+        unsafe { same_campaign(cp, nc, eq) };
+    }
     for s in &ses[..ns] {
         let d = s.d as usize;
         // SAFETY: a bit of m or e is below nc, the index of one of the person's clicks; a click's campaign is
@@ -5320,13 +5325,19 @@ fn credit_clicks(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
                 credit(cells, round, buy, at, s.rev);
                 continue;
             }
-            // each click of the window, adding 1 when no click before it in the window has its campaign: the
-            // next click does not wait for this one's campaign bits
+            // each click of the window, adding 1 when its campaign has no mark of this session yet
+            if *sctr == u32::MAX {
+                seen.fill(0);
+                *sctr = 0;
+            }
+            *sctr += 1;
             let mut c = m;
             while c != 0 {
                 let j = c.trailing_zeros() as usize;
                 c &= c - 1;
-                let first = (m & *eq.get_unchecked(j) & ((1u64 << j) - 1) == 0) as u32;
+                let k = *ccid.0.get_unchecked(j) as usize;
+                let first = (*seen.get_unchecked(k) != *sctr) as u32;
+                *seen.get_unchecked_mut(k) = *sctr;
                 let cell = *cp.add(j) as usize;
                 let a = day.add(cell);
                 let v = (*a)[1] as u32 + first;

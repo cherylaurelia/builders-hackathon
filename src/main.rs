@@ -300,6 +300,91 @@ fn restart_long_bigger(bits: u32) {
     die(&format!("restart: {err}"))
 }
 
+/// Bits 61..64 of an event key: an event_id of `e` and 32 lowercase hex digits (v5's long event_ids) keyed by its
+/// digits themselves, not by a slot of the long-ID table: nearly every event_id is new, and a new one cost the
+/// table a miss and a locked write. The key is the top 61 bits of the second half of the digits (they come out of
+/// a keyed bijection: as good as a hash); the 16 bytes of the digits go to `Shard::evh`, and `event_ids_distinct`
+/// proves that no two different such IDs got one key, or the run starts again with the table (SESS_NO_EVHASH).
+/// Event keys are only compared for equality and hashed. Any other event_id keeps its usual key, so an ID is
+/// keyed one way only.
+const EVHASH: u64 = 7 << 61;
+/// The groups `event_ids_distinct` checks one at a time: by the top bits of the key.
+const EVH_BUCKETS: usize = 64;
+/// Records in a block of a `Shard::evh` stream: 4 KiB.
+const EVH_BLOCK: usize = 256;
+
+/// For the 33 bytes at `p`: when they are `e` and 32 lowercase hex digits, the event key (EVHASH) and the digits'
+/// 16 bytes [second half, first half]; None for any other 33 bytes.
+#[inline(always)]
+unsafe fn ev_hash(p: *const u8) -> Option<(u64, [u64; 2])> {
+    if *p != b'e' {
+        return None;
+    }
+    let (lo, hi) = hex32(p.add(1))?;
+    Some((EVHASH | (hi >> 3), [hi, lo]))
+}
+
+/// True when no two different event_ids got one key from `ev_hash`: per bucket, the records of every thread in
+/// a table by key (a table per thread, used again for every bucket, that stays in the core's cache).
+fn event_ids_distinct(shards: &mut [Shard], threads: usize) -> bool {
+    for s in shards.iter_mut() {
+        s.evh.iter_mut().for_each(Stream::finish);
+    }
+    let shards = &*shards;
+    let clash = AtomicBool::new(false);
+    par(
+        threads,
+        EVH_BUCKETS,
+        Vec::<[u64; 2]>::new,
+        |t, b| {
+            let n: usize = shards.iter().map(|s| s.evh[b].len(EVH_BLOCK)).sum();
+            if n == 0 {
+                return;
+            }
+            let cap = (n + n / 2).next_power_of_two().max(2);
+            t.clear();
+            t.resize(cap, [0, 0]); // [0, 0] = free
+            let mut zero = 0u8; // the record of all zero digits, which the free mark would hide, is noted aside
+            for r in shards.iter().flat_map(|s| s.evh[b].slices(EVH_BLOCK)).flatten() {
+                if *r == [0, 0] {
+                    zero = 1;
+                    continue;
+                }
+                let mut i = (spread(r[0] >> 3) >> (64 - cap.trailing_zeros())) as usize;
+                loop {
+                    let e = &mut t[i];
+                    if *e == [0, 0] {
+                        *e = *r;
+                        break;
+                    }
+                    if e[0] >> 3 == r[0] >> 3 {
+                        if *e != *r {
+                            clash.store(true, Relaxed);
+                        }
+                        break;
+                    }
+                    i = (i + 1) & (cap - 1);
+                }
+            }
+            // the all-zero digits share their key (EVHASH) with any digits whose second half is below 8
+            if zero == 1 && t.iter().any(|e| *e != [0, 0] && e[0] >> 3 == 0) {
+                clash.store(true, Relaxed);
+            }
+        },
+    );
+    !clash.load(Relaxed)
+}
+
+/// Replaces the process with itself keying event_ids in the long-ID table (nothing has been written yet).
+#[cold]
+fn restart_without_evhash() -> ! {
+    use std::os::unix::process::CommandExt;
+    eprintln!("two event_ids share a key: restarting with SESS_NO_EVHASH=1");
+    let exe = std::env::current_exe().unwrap_or_else(|e| die(&format!("current_exe: {e}")));
+    let err = std::process::Command::new(exe).args(std::env::args_os().skip(1)).env("SESS_NO_EVHASH", "1").exec();
+    die(&format!("restart: {err}"))
+}
+
 /// The 32 lowercase hex digits at `p` as 16 bytes (the first two digits the first byte, the low one of `lo`);
 /// None when one is not a digit or `a`..=`f`.
 #[inline(always)]
@@ -2807,6 +2892,9 @@ struct Shard {
     ph: usize,
     // where the next kept click ID goes, and the end of its chunk (`Shard::keep_id`)
     kb: (usize, usize),
+    // the digits of the event_ids keyed by `ev_hash`, by bucket (`event_ids_distinct`), and their blocks
+    evh: Vec<Stream<[u64; 2], 1>>,
+    earena: Arena,
 }
 /// Lines `Shard::pend` holds.
 const PEND: usize = 8;
@@ -2842,6 +2930,7 @@ struct Ctx {
     abase: usize, // `arena_range().0`: where `LRec::loc` counts from
     ihi: i64,     // window end + 24 h: an event ingested later is late or invalid
     ilo: i64,     // ihi - (ING_SPAN - 1) ms: the earliest ingest_ts an `LRec` holds itself
+    evhash: bool, // `e` + 32 hex event_ids keyed by `ev_hash` (unless SESS_NO_EVHASH)
 }
 
 impl Ctx {
@@ -2909,6 +2998,8 @@ impl Shard {
             pn: 0,
             ph: 0,
             kb: (0, 0),
+            evh: (0..EVH_BUCKETS).map(|_| Stream::new()).collect(),
+            earena: Arena::new(),
         }
     }
 
@@ -2982,6 +3073,37 @@ impl Shard {
                 self.drain::<false>(cx);
             }
         }
+    }
+
+    /// The key of an event_id: by `ev_hash` where it takes the ID, its digits kept for `event_ids_distinct`.
+    #[inline(always)]
+    fn ekey(&mut self, cx: &Ctx, id: &[u8]) -> u64 {
+        if id.len() == 33 && cx.evhash {
+            // SAFETY: the 33 bytes of the slice
+            if let Some((k, r)) = unsafe { ev_hash(id.as_ptr()) } {
+                self.evh_push(k, r);
+                return k;
+            }
+        }
+        cx.names.key(id)
+    }
+
+    /// `ekey` of the `len` (> 0) bytes at `p` (9 bytes must be readable).
+    #[inline(always)]
+    unsafe fn ekey_at(&mut self, cx: &Ctx, p: *const u8, len: usize) -> u64 {
+        if len == 33 && cx.evhash {
+            if let Some((k, r)) = ev_hash(p) {
+                self.evh_push(k, r);
+                return k;
+            }
+        }
+        cx.names.key_at(p, len)
+    }
+
+    #[inline(always)]
+    fn evh_push(&mut self, k: u64, r: [u64; 2]) {
+        // SAFETY: six bits, below EVH_BUCKETS
+        unsafe { self.evh.get_unchecked_mut(((k >> 55) & 63) as usize) }.push(&mut self.earena, EVH_BLOCK, r);
     }
 
     /// Any parsed event: its dedup record. `loc` = 0 for an invalid or late one.
@@ -3140,7 +3262,11 @@ fn main() {
     let ids = IdTable::new(id_bits, pbits);
     // the long-ID table: one ID in eight is long in generated data, some 600 input bytes a distinct one; about
     // half full
-    let lbits = env_num("SESS_LONG_BITS").map(|v| v as u32).unwrap_or(usize::BITS - ((ev_bytes + bytes(&ck_files)) / 400).leading_zeros()).clamp(12, 28);
+    // (`ev_hash` keeps v5's event_ids out of it: then user IDs alone, some 8x fewer; SESS_NO_EVHASH puts them back)
+    let lbits = env_num("SESS_LONG_BITS")
+        .map(|v| v as u32)
+        .unwrap_or(usize::BITS - ((ev_bytes + bytes(&ck_files)) / if std::env::var_os("SESS_NO_EVHASH").is_some() { 400 } else { 3200 }).leading_zeros())
+        .clamp(12, 28);
     let names = Interner::sized(lbits, threads);
     mark("files listed, ID table mapped");
     let (n_links, small) = std::thread::scope(|sc| {
@@ -3174,6 +3300,7 @@ fn main() {
         abase,
         ihi,
         ilo,
+        evhash: std::env::var_os("SESS_NO_EVHASH").is_none(),
     };
     lap(&format!("small tables, links joined: {n_links} lines; 2^{id_bits} id slots, 2^{pbits} person partitions, 2^{qbits} event buckets"));
 
@@ -3210,6 +3337,15 @@ fn main() {
     lap(&format!("parsed: {n_ev} valid events, {n_ck} valid clicks"));
     if n_ev >= i32::MAX as usize {
         die("too many events for 32-bit session and event counts"); // user_daily writes them as INT32
+    }
+
+    if cx.evhash {
+        if !event_ids_distinct(&mut shards, threads) {
+            restart_without_evhash();
+        }
+        for s in &mut shards {
+            s.evh = Vec::new();
+        }
     }
 
     // 3. duplicates
@@ -3655,7 +3791,7 @@ fn event_fields(cx: &Ctx, [eid, uid, ts, ingest, etype, pid, price]: [Bytes; 7],
         return;
     }
     let Some(ingest) = parse_ts(ingest) else { return }; // always valid F1 per rules.md
-    let ekey = cx.names.key(eid);
+    let ekey = st.ekey(cx, eid);
     let valid = || -> Option<(i64, u32)> {
         if uid.is_empty() || pid.is_empty() {
             return None;
@@ -3687,7 +3823,7 @@ unsafe fn fast_event(cx: &Ctx, line: *const u8, mut a: Cut, rest: *const u8, mut
     }
     let (is, il) = b.next();
     let Some(ingest) = ts_memo(rest.add(is), il, &mut st.days) else { return };
-    let ekey = cx.names.key_at(line.add(es), el);
+    let ekey = st.ekey_at(cx, line.add(es), el);
     let (us, ul) = a.next();
     let (ts, tl) = a.next();
     let (ks, kl) = b.next();
@@ -3718,7 +3854,7 @@ unsafe fn fast_event_n(cx: &Ctx, line: *const u8, f: [(usize, usize); 7], st: &m
         return;
     }
     let Some(ingest) = ts_memo(line.add(is), il, &mut st.days) else { return };
-    let ekey = cx.names.key_at(line.add(es), el);
+    let ekey = st.ekey_at(cx, line.add(es), el);
     let ts = match ts_memo(line.add(ts), tl, &mut st.days) {
         Some(t) if ul != 0 && pl != 0 && t >= cx.ws && t < cx.we && ingest - t <= DAY => t,
         _ => return st.log(cx, ekey, ingest, 0),
@@ -5795,6 +5931,7 @@ mod tests {
             abase: Ctx::record_fields(0).0,
             ihi: Ctx::record_fields(ws + 14 * DAY).1,
             ilo: Ctx::record_fields(ws + 14 * DAY).2,
+            evhash: true,
         }
     }
 
@@ -6593,6 +6730,51 @@ mod tests {
             small.bytes(k, &mut back);
             assert_eq!(back, hex(i as u64).as_bytes());
         }
+    }
+
+    #[test]
+    fn long_event_ids_are_keyed_by_their_digits_and_checked() {
+        let c = ctx();
+        let mut st = Shard::new(16, 16);
+        let id = |i: u64| format!("e{:016x}{:016x}", mix(i), mix(i + 7));
+        let mut keys = std::collections::HashSet::new();
+        for i in 0..5000u64 {
+            let k = st.ekey(&c, id(i).as_bytes());
+            assert_eq!(k & EVHASH, EVHASH);
+            assert_eq!(st.ekey(&c, id(i).as_bytes()), k);
+            assert_eq!(unsafe { st.ekey_at(&c, id(i).as_ptr(), 33) }, k);
+            keys.insert(k);
+        }
+        assert_eq!(keys.len(), 5000);
+        // not `e` and 32 lowercase hex digits: the usual keys
+        for odd in [&b"E0123456789abcdef0123456789abcdef"[..], b"u0123456789abcdef0123456789abcdef", b"e0123456789ABCDEF0123456789abcdef", b"e0123456789abcdef0123456789abcdeg", b"e1", b"e0123456789abcdef0123456789abcdef0"] {
+            let k = st.ekey(&c, odd);
+            assert_ne!(k & EVHASH, EVHASH, "{odd:?}");
+            assert_eq!(k, c.names.key(odd));
+        }
+        // the same IDs from two threads are fine
+        let mut other = Shard::new(16, 16);
+        for i in 0..100u64 {
+            other.ekey(&c, id(i).as_bytes());
+        }
+        assert!(event_ids_distinct(&mut [st, other], 2));
+        // two IDs of one key are not: same top 61 bits of the second half, any other difference
+        let k = |s: &str| unsafe { ev_hash(s.as_ptr()) }.unwrap().0;
+        let (a, b) = ("e00000000000000001000000000000000", "e00000000000000011700000000000000");
+        assert_eq!(k(a), k(b));
+        let (mut x, mut y) = (Shard::new(16, 16), Shard::new(16, 16));
+        x.ekey(&c, a.as_bytes());
+        y.ekey(&c, b.as_bytes());
+        assert!(!event_ids_distinct(&mut [x, y], 2));
+        // the all-zero digits against a second half below 8
+        let (mut x, mut y) = (Shard::new(16, 16), Shard::new(16, 16));
+        x.ekey(&c, b"e00000000000000000000000000000000");
+        y.ekey(&c, b"e00000000000000000700000000000000");
+        assert!(!event_ids_distinct(&mut [x, y], 2));
+        let (mut x, mut y) = (Shard::new(16, 16), Shard::new(16, 16));
+        x.ekey(&c, b"e00000000000000000000000000000000");
+        y.ekey(&c, b"e00000000000000000000000000000000");
+        assert!(event_ids_distinct(&mut [x, y], 2));
     }
 
     #[test]

@@ -371,6 +371,7 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
         let mut l: Lanes = std::mem::zeroed();
         (l.cur, l.lim) = (cur, lim);
         let (cm, qt, nv, lowest) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'"' as i8), _mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(0x20));
+        let mut long: u32; // the lanes `long_lane` takes
         // SAFETY: a walk stands at a line start below `len`, or right after a line's newline, which is at `len`
         // at the latest: at most at len + 1, and 144 bytes are readable from there (PAD)
         macro_rules! lane {
@@ -385,18 +386,17 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
                 // as signed bytes, those above 0x7F are below 0x20 too
                 *l.odd.get_unchecked_mut($j) = _mm512_cmplt_epi8_mask(v0, lowest);
                 *l.e2.get_unchecked_mut($j) = tz(_mm512_cmpeq_epi8_mask(v1, nv)) as u64;
-                // an ID longer than 9 bytes (with its quotes 11): the line through `long_lane`
+                // an ID longer than 9 bytes (with its quotes 11): the line through `long_lane`, after the eight
+                // (one branch a batch, where one a lane missed one line in four)
                 let c0 = *l.c0.get_unchecked($j);
                 let (p1, p2) = (tz(c0), tz(c0 & c0.wrapping_sub(1)));
-                if (p1 > 11 || p2 - p1 > 12) && *l.cur.get_unchecked($j) < *l.lim.get_unchecked($j) {
-                    long_lane(cx, &mut l, $j, line);
-                } else {
-                    *l.sh1.get_unchecked_mut($j) = 0;
-                    *l.sh2.get_unchecked_mut($j) = 0;
-                }
+                long |= ((((p1 > 11) | (p2 - p1 > 12)) & (*l.cur.get_unchecked($j) < *l.lim.get_unchecked($j))) as u32) << $j;
+                *l.sh1.get_unchecked_mut($j) = 0;
+                *l.sh2.get_unchecked_mut($j) = 0;
             }};
         }
         loop {
+            long = 0;
             lane!(0);
             lane!(1);
             lane!(2);
@@ -405,6 +405,12 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
             lane!(5);
             lane!(6);
             lane!(7);
+            while long != 0 {
+                let j = long.trailing_zeros() as usize;
+                long &= long - 1;
+                let line = buf.add(*l.cur.get_unchecked(j) as usize);
+                long_lane(cx, &mut l, j, line);
+            }
             if !batch(cx, buf, len, st, &mut l) {
                 break;
             }

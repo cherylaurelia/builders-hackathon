@@ -44,9 +44,6 @@ pub fn available() -> bool {
     })
 }
 
-/// How far ahead of a walk its bytes are asked for (a mapped file comes from memory, a page at a time).
-pub static PF: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
 /// Lines the eight-line paths took themselves (the tests check that it is most of them).
 #[cfg(test)]
 pub static USUAL: AtomicUsize = AtomicUsize::new(0);
@@ -374,15 +371,12 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
         let mut l: Lanes = std::mem::zeroed();
         (l.cur, l.lim) = (cur, lim);
         let (cm, qt, nv, lowest) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'"' as i8), _mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(0x20));
-        let pf = *PF.get_or_init(|| env_num("SESS_PF").unwrap_or(192));
         let mut long: u32; // the lanes `long_lane` takes
         // SAFETY: a walk stands at a line start below `len`, or right after a line's newline, which is at `len`
         // at the latest: at most at len + 1, and 144 bytes are readable from there (PAD)
         macro_rules! lane {
             ($j:expr) => {{
                 let line = buf.add(*l.cur.get_unchecked($j) as usize);
-                prefetch(line.wrapping_add(pf));
-                prefetch(line.wrapping_add(pf + 64));
                 let v0 = _mm512_loadu_si512(line as *const _);
                 let v1 = _mm512_loadu_si512(line.add(64) as *const _);
                 *l.c0.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v0, cm);
@@ -870,12 +864,10 @@ pub unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
         let mut l: ClickLanes = std::mem::zeroed();
         (l.cur, l.lim) = (cur, lim);
         let (cm, qt, nv, lowest) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'"' as i8), _mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(0x20));
-        let pf = *PF.get_or_init(|| env_num("SESS_PF").unwrap_or(192));
         // SAFETY: as in `parse_events`: a walk stands at len + 1 at most, and 144 bytes are readable from there
         macro_rules! lane {
             ($j:expr) => {{
                 let line = buf.add(*l.cur.get_unchecked($j) as usize);
-                prefetch(line.wrapping_add(pf));
                 let v0 = _mm512_loadu_si512(line as *const _);
                 let v1 = _mm512_loadu_si512(line.add(64) as *const _);
                 // the first byte below 0x20 or above 0x7F (as signed bytes, those are below 0x20 too) must be the

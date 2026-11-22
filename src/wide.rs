@@ -45,6 +45,7 @@ pub fn available() -> bool {
 }
 
 /// How far ahead of a walk its bytes are asked for (a mapped file comes from memory, a page at a time).
+// (256: Intel VM v5 60M, 12 interleaved runs, 1273/1286 ms min/median against 1277/1292 at 192; 20M even)
 pub static PF: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// Lines the eight-line paths took themselves (the tests check that it is most of them).
@@ -374,7 +375,7 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
         let mut l: Lanes = std::mem::zeroed();
         (l.cur, l.lim) = (cur, lim);
         let (cm, qt, nv, lowest) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'"' as i8), _mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(0x20));
-        let pf = *PF.get_or_init(|| env_num("SESS_PF").unwrap_or(192));
+        let pf = *PF.get_or_init(|| env_num("SESS_PF").unwrap_or(256));
         let mut long: u32; // the lanes `long_lane` takes
         // SAFETY: a walk stands at a line start below `len`, or right after a line's newline, which is at `len`
         // at the latest: at most at len + 1, and 144 bytes are readable from there (PAD)
@@ -870,7 +871,7 @@ pub unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
         let mut l: ClickLanes = std::mem::zeroed();
         (l.cur, l.lim) = (cur, lim);
         let (cm, qt, nv, lowest) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'"' as i8), _mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(0x20));
-        let pf = *PF.get_or_init(|| env_num("SESS_PF").unwrap_or(192));
+        let pf = *PF.get_or_init(|| env_num("SESS_PF").unwrap_or(256));
         // SAFETY: as in `parse_events`: a walk stands at len + 1 at most, and 144 bytes are readable from there
         macro_rules! lane {
             ($j:expr) => {{

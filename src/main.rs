@@ -2363,7 +2363,7 @@ fn read_ahead(queue: Vec<(&'static InFile, usize, usize)>, _threads: usize) {
 fn read_ahead(_queue: Vec<(&'static InFile, usize, usize)>, _threads: usize) {}
 
 /// Bytes past the data that `read_span` keeps readable (and starts with a `\n`): the parsers load 144 past a line start.
-const PAD: usize = 224; // the 512-bit event loop reads 192 bytes from a line's start (`wide::long_lane`)
+const PAD: usize = 224; // the 512-bit event loop reads 176 bytes from a line's start (`wide::long_lane`)
 
 /// Reads into `buf` every line of `f` that starts in [s, e): from byte s - 1 (to see whether a line starts at s)
 /// through the `\n` of the last such line, or the end of the file. Returns (len, start, end) with the data in

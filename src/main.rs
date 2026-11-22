@@ -5124,6 +5124,8 @@ unsafe fn offsets(st: *mut u32, local: usize, act: *mut u32) -> (u32, usize) {
 
 /// How many records ahead the counting sorts of `partition_work` ask for the line a record goes to.
 const PLACE_PF: usize = 32;
+/// Cache lines ahead that the counting passes of `partition_work` ask for.
+const COUNT_PF: usize = 12;
 
 /// How many people ahead `partition_work` asks for a name's line.
 const NAME_PF: usize = 16;
@@ -5151,9 +5153,19 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
         std::ptr::write_bytes(st, 0, local + 3);
         for s in shards {
             for blk in s.ev[p].slices(EV_BLOCK) {
+                // the block was written past the caches: its lines are asked for COUNT_PF lines ahead
+                let (bp, n) = (blk.as_ptr(), blk.len());
+                for k in 0..COUNT_PF.min(n.div_ceil(8)) {
+                    prefetch(bp.add(k * 8));
+                }
                 // four records a step: the loop's own instructions are a third of one record's
                 let mut four = blk.chunks_exact(4);
+                let mut i = 0;
                 for r in &mut four {
+                    if i & 4 == 0 && i + COUNT_PF * 8 < n {
+                        prefetch(bp.add(i + COUNT_PF * 8));
+                    }
+                    i += 4;
                     *st.add(ev_bin(&r[0]) + 2) += 1;
                     *st.add(ev_bin(&r[1]) + 2) += 1;
                     *st.add(ev_bin(&r[2]) + 2) += 1;
@@ -5232,7 +5244,14 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
         std::ptr::write_bytes(ct, 0, local + 3);
         for s in shards {
             for blk in s.ck[p].slices(CK_BLOCK) {
-                for r in blk {
+                let (bp, n) = (blk.as_ptr(), blk.len());
+                for k in 0..COUNT_PF.min(n.div_ceil(4)) {
+                    prefetch(bp.add(k * 4));
+                }
+                for (i, r) in blk.iter().enumerate() {
+                    if i & 3 == 0 && i + COUNT_PF * 4 < n {
+                        prefetch(bp.add(i + COUNT_PF * 4));
+                    }
                     *ct.add(ck_bin(r) + 2) += 1;
                 }
             }

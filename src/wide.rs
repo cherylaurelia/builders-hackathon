@@ -940,8 +940,9 @@ unsafe fn click_late(cx: &Ctx, buf: *const u8, st: &mut Shard, l: &mut ClickLane
     while l.pn > keep {
         let j = l.ph % LATE;
         (l.ph, l.pn) = (j + 1, l.pn - 1);
-        // SAFETY: an ID of the line, which is in the buffer: 9 bytes readable from its start (PAD)
-        let ck = st.click_key(cx, buf.add(l.pc[j] as usize), l.pcl[j] as usize);
+        // SAFETY: an ID of the line, which is in the buffer: it starts within the line's first 120 bytes, so 48
+        // bytes from its start are readable (PAD)
+        let ck = st.click_key48(cx, buf.add(l.pc[j] as usize), l.pcl[j] as usize);
         let uk = cx.names.key_at(buf.add(l.pu[j] as usize), l.pul[j] as usize);
         let n = st.bt.n;
         // SAFETY: n < BATCH between calls: a full batch is drained at once

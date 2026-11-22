@@ -260,6 +260,9 @@ const HEX: u64 = 1 << 62;
 /// no `Interner` key looks like this).
 const LONG_EV: u64 = INTERNED | 1 << 61;
 const LONG_MASK: u64 = INTERNED | HEX | 1 << 61;
+/// A click ID of a byte and 32 hex digits: the low 40 bits are where its (lo, hi, first byte) record is, from
+/// `arena_range().0` (`Shard::click_key_at`).
+const LONG_CK: u64 = INTERNED | 1 << 61;
 
 /// A hex digit's value; 0xFF for any other byte.
 static HEXV: [u8; 256] = {
@@ -540,16 +543,27 @@ impl Interner {
             }
             return Some(9);
         }
-        if key & HEX == 0 {
-            return None;
-        }
-        let (c, hi, lo) = self.hex.get(key as u32 as usize);
+        let (c, hi, lo) = self.hexid(key)?;
         buf[0] = c;
         for i in 0..16 {
             buf[1 + i] = b"0123456789abcdef"[(hi >> (60 - 4 * i)) as usize & 15];
             buf[17 + i] = b"0123456789abcdef"[(lo >> (60 - 4 * i)) as usize & 15];
         }
         Some(33)
+    }
+
+    /// (first byte, hi, lo) of a key of a byte and 32 hex digits: in the hex table, or a click's (`LONG_CK`).
+    #[inline]
+    fn hexid(&self, key: u64) -> Option<(u8, u64, u64)> {
+        if key & (INTERNED | HEX) == INTERNED | HEX {
+            return Some(self.hex.get(key as u32 as usize));
+        }
+        if key & LONG_MASK == LONG_CK {
+            // SAFETY: a record `Shard::long_click` wrote, in the arena, which is not released before the last use
+            let r = unsafe { ((arena_range().0 + (key & ((1 << 40) - 1)) as usize) as *const [u64; 3]).read() };
+            return Some((r[2] as u8, r[1], r[0]));
+        }
+        None
     }
 
     /// Appends the ID of `key` to `out`.
@@ -570,9 +584,8 @@ impl Interner {
         if (a | b) & INTERNED == 0 {
             return a < b;
         }
-        if a & b & (INTERNED | HEX) == INTERNED | HEX {
+        if let (Some(x), Some(y)) = (self.hexid(a), self.hexid(b)) {
             // a first byte and 32 digits each: digits compare as their values do
-            let (x, y) = (self.hex.get(a as u32 as usize), self.hex.get(b as u32 as usize));
             return x < y;
         }
         let (mut p, mut q) = ([0u8; 40], [0u8; 40]);
@@ -2802,6 +2815,7 @@ struct Shard {
     lx: Vec<Log>,
     farx: Vec<((u8, u64, u64), u32, i64)>, // `far` of those
     longs: Vec<(u8, u64, u64)>,           // the IDs of the batch's events marked LONG_EV
+    ckid: (usize, usize),                 // where the next `long_click` record goes in `arena`, and its block's end
     buf: Vec<u8>,
     ins: usize,
     bt: Batch,
@@ -2906,6 +2920,7 @@ impl Shard {
             lx: (0..buckets).map(|_| Log::new()).collect(),
             farx: Vec::new(),
             longs: Vec::with_capacity(BATCH),
+            ckid: (0, 0),
             far: Vec::new(),
             buf: Vec::new(),
             ins: 0,
@@ -3129,6 +3144,44 @@ impl Shard {
     }
 
 
+    /// The key of the click ID of `len` bytes at `p` (9 bytes must be readable): a byte and 32 hex digits as a
+    /// `LONG_CK` record of this thread (not in the hex table: a click ID is only ever compared, `Interner::less`),
+    /// any other ID as `Interner::key_at`.
+    #[inline(always)]
+    unsafe fn click_key_at(&mut self, cx: &Ctx, p: *const u8, len: usize) -> u64 {
+        if len == 33 && (*p).wrapping_sub(1) < 127 {
+            if let Some((hi, lo)) = hex128(p.add(1)) {
+                return self.long_click(*p, hi, lo);
+            }
+        }
+        cx.names.key_at(p, len)
+    }
+
+    /// `click_key_at` of an ID given as a slice.
+    fn click_key(&mut self, cx: &Ctx, b: &[u8]) -> u64 {
+        if b.len() == 33 && b[0].wrapping_sub(1) < 127 {
+            // SAFETY: 33 bytes
+            if let Some((hi, lo)) = unsafe { hex128(b.as_ptr().add(1)) } {
+                return self.long_click(b[0], hi, lo);
+            }
+        }
+        cx.names.key(b)
+    }
+
+    #[inline(never)]
+    fn long_click(&mut self, c: u8, hi: u64, lo: u64) -> u64 {
+        const BLOCK: usize = 64 << 10;
+        if self.ckid.0 == self.ckid.1 {
+            let p = self.arena.alloc(BLOCK) as usize;
+            self.ckid = (p, p + BLOCK / 24 * 24);
+        }
+        let at = self.ckid.0;
+        self.ckid.0 = at + 24;
+        // SAFETY: 24 bytes of this thread's block; read by others only after the parse threads are joined
+        unsafe { (at as *mut [u64; 3]).write([lo, hi, c as u64]) };
+        LONG_CK | (at - arena_range().0) as u64
+    }
+
     /// A valid click, into its person's partition once its user ID is at hand.
     #[inline(always)]
     fn click(&mut self, cx: &Ctx, cid: u64, ukey: u64, ts: i64, camp: u16) {
@@ -3222,9 +3275,9 @@ fn main() {
 
     // 1. links, on every thread; this one reads the small tables meanwhile
     let ids = IdTable::new(id_bits, pbits);
-    // one in eight distinct IDs is a byte and 32 hex digits (rules.md, v5): of ~1 event ID a line, ~1 click ID a
-    // line and the users; the table at about half full. A wrong guess costs speed, never rows (it restarts).
-    let hex_est = (bytes(&ck_files) / 45 + id_est) / 8; // event IDs are not put there (`Shard::lx`)
+    // one in eight distinct IDs is a byte and 32 hex digits (rules.md, v5); only user IDs go to this table (event
+    // and click IDs: `Shard::lx`, `LONG_CK`). A wrong guess costs speed, never rows (it restarts).
+    let hex_est = id_est / 8;
     let hex_bits = env_num("SESS_HEX_BITS").map(|v| v as u32).unwrap_or(usize::BITS - (hex_est * 5 / 4).leading_zeros()).clamp(16, 31);
     let names = Interner::with_hex(hex_bits);
     mark("files listed, ID table mapped");
@@ -4020,7 +4073,8 @@ fn click_fields(cx: &Ctx, [cid, uid, camp, ts]: [Bytes; 4], st: &mut Shard) {
         return;
     }
     let Some(camp) = cx.campaigns.get(camp) else { return };
-    st.click(cx, cx.names.key(cid), cx.names.key(uid), t, camp);
+    let ck = st.click_key(cx, cid);
+    st.click(cx, ck, cx.names.key(uid), t, camp);
 }
 
 #[inline(always)]
@@ -4037,7 +4091,7 @@ unsafe fn fast_click(cx: &Ctx, line: *const u8, mut f: Cut, st: &mut Shard) {
         _ => return,
     };
     let Some(camp) = cx.campaigns.get_short(line.add(ks), kl) else { return };
-    let ck = st.idk(cx, line.add(cs), cl, 0);
+    let ck = st.click_key_at(cx, line.add(cs), cl);
     let uk = st.idk(cx, line.add(us), ul, 1);
     st.click(cx, ck, uk, t, camp);
 }
@@ -4057,7 +4111,7 @@ unsafe fn click_line(cx: &Ctx, buf: *const u8, p: usize, len: usize, st: &mut Sh
                 if let Some(t) = ts_memo(line.add(ts), tl, &mut st.days) {
                     if t >= cx.base && t < cx.we {
                         if let Some(camp) = cx.campaigns.get_short(line.add(ks), kl) {
-                            let ck = st.idk(cx, line.add(cs), cl, 0);
+                            let ck = st.click_key_at(cx, line.add(cs), cl);
                             let uk = st.idk(cx, line.add(us), ul, 1);
                             st.click(cx, ck, uk, t, camp);
                         }
@@ -6681,6 +6735,32 @@ mod tests {
         let (a, b, c) = (names.key(b"user-with-dash"), names.key(b"user-with-dash"), names.key(" \u{e9}1".as_bytes()));
         assert!(a == b && a != c && a & INTERNED != 0);
         assert!(names.less(c, pack(b"u1")) && names.less(pack(b"u1"), a) && !names.less(a, a));
+    }
+
+    #[test]
+    fn click_ids_of_every_kind_compare_byte_wise() {
+        let c = ctx();
+        let mut st = Shard::new(16, 16);
+        let ids: [&[u8]; 8] = [
+            b"k0123456789abcdef0123456789abcdef",
+            b"k0123456789abcdef0123456789abcdee",
+            b"j0123456789abcdef0123456789abcdef",
+            b"kffffffffffffffffffffffffffffffff",
+            b"k0123456789ABCDEF0123456789abcdef", // upper case: the locked shards
+            b"k01",
+            b"k1",
+            b"user-with-dash",
+        ];
+        let keys: Vec<u64> = ids.iter().map(|b| st.click_key(&c, b)).collect();
+        assert!(keys[..4].iter().all(|k| k & LONG_MASK == LONG_CK));
+        for (i, a) in ids.iter().enumerate() {
+            let mut back = Vec::new();
+            c.names.bytes(keys[i], &mut back);
+            assert_eq!(&back[..], *a);
+            for (j, b) in ids.iter().enumerate() {
+                assert_eq!(c.names.less(keys[i], keys[j]), a < b, "{i} {j}");
+            }
+        }
     }
 
     #[test]

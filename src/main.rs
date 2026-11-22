@@ -325,50 +325,49 @@ unsafe fn ev_hash(p: *const u8) -> Option<(u64, [u64; 2])> {
 }
 
 /// True when no two different event_ids got one key from `ev_hash`: per bucket, the records of every thread in
-/// a table by key (a table per thread, used again for every bucket, that stays in the core's cache).
+/// a table by key.
 fn event_ids_distinct(shards: &mut [Shard], threads: usize) -> bool {
     for s in shards.iter_mut() {
         s.evh.iter_mut().for_each(Stream::finish);
     }
     let shards = &*shards;
     let clash = AtomicBool::new(false);
+    // per thread, used again for every bucket: the bucket's records in one run, and a table of their places + 1
+    // (0 = free); some 40K records a bucket at 20M events, so both stay in the core's cache
     par(
         threads,
         EVH_BUCKETS,
-        Vec::<[u64; 2]>::new,
-        |t, b| {
-            let n: usize = shards.iter().map(|s| s.evh[b].len(EVH_BLOCK)).sum();
-            if n == 0 {
+        || (Vec::<[u64; 2]>::new(), Vec::<u32>::new()),
+        |(v, t), b| {
+            v.clear();
+            for s in shards {
+                for blk in s.evh[b].slices(EVH_BLOCK) {
+                    v.extend_from_slice(blk);
+                }
+            }
+            if v.is_empty() {
                 return;
             }
-            let cap = (n + n / 2).next_power_of_two().max(2);
+            let cap = (v.len() + v.len() / 2).next_power_of_two().max(2);
             t.clear();
-            t.resize(cap, [0, 0]); // [0, 0] = free
-            let mut zero = 0u8; // the record of all zero digits, which the free mark would hide, is noted aside
-            for r in shards.iter().flat_map(|s| s.evh[b].slices(EVH_BLOCK)).flatten() {
-                if *r == [0, 0] {
-                    zero = 1;
-                    continue;
-                }
+            t.resize(cap, 0);
+            for (n, r) in v.iter().enumerate() {
                 let mut i = (spread(r[0] >> 3) >> (64 - cap.trailing_zeros())) as usize;
                 loop {
-                    let e = &mut t[i];
-                    if *e == [0, 0] {
-                        *e = *r;
+                    let e = t[i];
+                    if e == 0 {
+                        t[i] = n as u32 + 1;
                         break;
                     }
-                    if e[0] >> 3 == r[0] >> 3 {
-                        if *e != *r {
+                    let o = &v[e as usize - 1];
+                    if o[0] >> 3 == r[0] >> 3 {
+                        if o != r {
                             clash.store(true, Relaxed);
                         }
                         break;
                     }
                     i = (i + 1) & (cap - 1);
                 }
-            }
-            // the all-zero digits share their key (EVHASH) with any digits whose second half is below 8
-            if zero == 1 && t.iter().any(|e| *e != [0, 0] && e[0] >> 3 == 0) {
-                clash.store(true, Relaxed);
             }
         },
     );

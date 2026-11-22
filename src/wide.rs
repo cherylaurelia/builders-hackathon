@@ -787,15 +787,21 @@ unsafe fn defer<const EVENTS: bool>(cx: &Ctx, buf: *const u8, p: usize, len: usi
 struct ClickLanes {
     cur: [u64; 8],
     lim: [u64; 8],
-    // A: per line
-    c: [u64; 8], // commas of its first 64 bytes
-    q: [u64; 8], // quotes
-    e: [u64; 8], // where its newline is, when that is among them and no byte before it is below 0x20 or above 0x7F; else 64
+    // A: per line, the masks cut at its newline
+    c0: [u64; 8], // commas of its bytes 0..64
+    q0: [u64; 8], // quotes
+    c1: [u64; 8], // commas of its bytes 64..128
+    q1: [u64; 8], // quotes
+    e: [u64; 8],  // where its newline is, when that is in its first 128 bytes and no byte before it is below 0x20 or above 0x7F; else 128
+    n: [u64; 8],  // its commas | its quotes << 8
     // B: where to copy from (buffer offsets)
     ac: [u64; 8],
     au: [u64; 8],
     ak: [u64; 8],
     at: [u64; 8],
+    // B: the IDs' lengths
+    cl: [u64; 8],
+    ul: [u64; 8],
     // C: the fields' bytes, line after line
     sc: [u8; 128], // click_id: 16 bytes a line
     su: [u8; 128], // user_id
@@ -806,11 +812,25 @@ struct ClickLanes {
     slot: [u64; 8], // where the search for it starts (`IdMap::get_short`)
     camp: [u64; 8], // its number, for the lanes whose campaign is in campaigns.csv
     home: [u64; 8],
+    tx: [u64; 8],
+    // kept clicks with an ID that is not 8 or 9 bytes (a long ID: its slot asked for): their IDs (buffer offset,
+    // length) and `Batch::tx`, into the batch at the next `click_batch` (`click_late`)
+    pc: [u64; LATE],
+    pcl: [u64; LATE],
+    pu: [u64; LATE],
+    pul: [u64; LATE],
+    ptx: [u64; LATE],
+    ph: usize, // the oldest
+    pn: usize,
 }
+
+/// Room for clicks waiting in `ClickLanes`; `click_batch` lets no more than LATE / 2 wait (some LATE / 4 batches
+/// of eight lines at one long ID in four lines), so a slot asked for has that long to arrive.
+const LATE: usize = 32;
 
 /// Parses the click lines that start in [start, end) of the `len` bytes at `buf` into `st`, as `parse_clicks_v3`
 /// does; `buf` must be readable for 144 bytes past `len`, and buf[len] must be `\n` (`read_span`).
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,avx2")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,avx2,bmi1,bmi2,popcnt")]
 pub unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: usize, st: &mut Shard) {
     if let Some((cur, lim)) = walks(buf, start, end, len) {
         let st: *mut Shard = st;
@@ -820,13 +840,26 @@ pub unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
         // SAFETY: as in `parse_events`: a walk stands at len + 1 at most, and 144 bytes are readable from there
         macro_rules! lane {
             ($j:expr) => {{
-                let v0 = _mm512_loadu_si512(buf.add(*l.cur.get_unchecked($j) as usize) as *const _);
-                *l.c.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v0, cm);
-                *l.q.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v0, qt);
-                // the first byte below 0x20 or above 0x7F must be the line's newline: both IDs are then bytes
-                // that pack. (No newline and no such byte in the 64: both counts are 64, and that is no place)
-                let (odd, nl) = (tz(_mm512_cmplt_epi8_mask(v0, lowest)), tz(_mm512_cmpeq_epi8_mask(v0, nv)));
-                *l.e.get_unchecked_mut($j) = (if odd == nl { nl } else { 64 }) as u64;
+                let line = buf.add(*l.cur.get_unchecked($j) as usize);
+                let v0 = _mm512_loadu_si512(line as *const _);
+                let v1 = _mm512_loadu_si512(line.add(64) as *const _);
+                // the first byte below 0x20 or above 0x7F (as signed bytes, those are below 0x20 too) must be the
+                // line's newline: both IDs are then bytes that pack. (No newline and no such byte in the 128: both
+                // places are 128, and that is no place)
+                let odd = _mm512_cmplt_epi8_mask(v0, lowest) as u128 | (_mm512_cmplt_epi8_mask(v1, lowest) as u128) << 64;
+                let nl = _mm512_cmpeq_epi8_mask(v0, nv) as u128 | (_mm512_cmpeq_epi8_mask(v1, nv) as u128) << 64;
+                let (o, w) = (odd.trailing_zeros(), nl.trailing_zeros());
+                let e = if o == w { w } else { 128 };
+                // the commas and quotes before the newline (bzhi keeps all of a word for a count of 64 and more)
+                let (n0, n1) = (e.min(64), e.saturating_sub(64));
+                let (c0, c1) = (_bzhi_u64(_mm512_cmpeq_epi8_mask(v0, cm), n0), _bzhi_u64(_mm512_cmpeq_epi8_mask(v1, cm), n1));
+                let (q0, q1) = (_bzhi_u64(_mm512_cmpeq_epi8_mask(v0, qt), n0), _bzhi_u64(_mm512_cmpeq_epi8_mask(v1, qt), n1));
+                *l.c0.get_unchecked_mut($j) = c0;
+                *l.c1.get_unchecked_mut($j) = c1;
+                *l.q0.get_unchecked_mut($j) = q0;
+                *l.q1.get_unchecked_mut($j) = q1;
+                *l.e.get_unchecked_mut($j) = e as u64;
+                *l.n.get_unchecked_mut($j) = (c0.count_ones() + c1.count_ones()) as u64 | ((q0.count_ones() + q1.count_ones()) as u64) << 8;
             }};
         }
         loop {
@@ -842,22 +875,51 @@ pub unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
                 break;
             }
         }
+        click_late(cx, buf, &mut *st, &mut l, 0);
         flush::<false>(cx, buf, len, &mut *st);
     }
     st.drain::<false>(cx);
     sfence();
 }
 
+/// The clicks `click_batch` left waiting in `l` into the batch, the oldest first, until `keep` wait.
+#[inline(never)]
+unsafe fn click_late(cx: &Ctx, buf: *const u8, st: &mut Shard, l: &mut ClickLanes, keep: usize) {
+    while l.pn > keep {
+        let j = l.ph % LATE;
+        (l.ph, l.pn) = (j + 1, l.pn - 1);
+        // SAFETY: an ID of the line, which is in the buffer: 9 bytes readable from its start (PAD)
+        let ck = cx.names.key_at(buf.add(l.pc[j] as usize), l.pcl[j] as usize);
+        let uk = cx.names.key_at(buf.add(l.pu[j] as usize), l.pul[j] as usize);
+        let n = st.bt.n;
+        // SAFETY: n < BATCH between calls: a full batch is drained at once
+        *st.bt.a.get_unchecked_mut(n) = ck;
+        *st.bt.ukey.get_unchecked_mut(n) = uk;
+        *st.bt.tx.get_unchecked_mut(n) = l.ptx[j];
+        *st.bt.home.get_unchecked_mut(n) = cx.ids.aim(uk);
+        st.bt.n = n + 1;
+        if n + 1 == BATCH {
+            st.drain::<false>(cx);
+        }
+    }
+}
+
 /// The lines the walks of `l` stand on (A filled in), each walk moved past its line: the usual ones into the
 /// batch when the click is kept; the others through `click_line`. False when the piece is done.
 ///
-/// The usual line: it ends in its first 64 bytes and every byte before that is 0x20..=0x7F; four fields, well
-/// quoted; both IDs 8 or 9 bytes; campaign_id at most 7 bytes; ts is F1 or F2 of a date seen before, or 13
-/// digits, and valid. For such a line this does what `click_fields` does.
+/// The usual line: it ends in its first 120 bytes and every byte before that is 0x20..=0x7F; four fields, each
+/// quoted whole or not at all, and no other quote; IDs of 1 to 48 bytes; campaign_id at most 7 bytes; ts is F1 or
+/// F2 of a date seen before, or 13 digits, and valid. For such a line this does what `click_fields` does. IDs of 8
+/// or 9 bytes are packed here; a kept click with any other ID (a long one) waits in `l` for the next batch, its
+/// slot of the long-ID table asked for, and gets its keys from `Interner::key_at`.
 #[inline]
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,avx2")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,avx2,bmi1,bmi2,popcnt")]
+#[allow(unused_assignments)] // the third `comma!` clears a bit no one reads
 unsafe fn click_batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut ClickLanes) -> bool {
-    let (m1, one) = (k!(-1), k!(1));
+    let (m1, one, c64) = (k!(-1), k!(1), k!(64));
+    if l.pn > LATE - 16 {
+        click_late(cx, buf, &mut *st, l, LATE - 16);
+    }
     let bt: *mut Batch = &mut (*st).bt;
     if (*bt).n > BATCH - 8 {
         (*st).drain::<false>(cx);
@@ -870,52 +932,66 @@ unsafe fn click_batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &
         return false;
     }
     sv!(l.cur, _mm512_mask_add_epi64(pv, live, pv, _mm512_add_epi64(e, one)));
-    // the line's commas and quotes are those below its newline
-    let nlb = _mm512_sllv_epi64(one, e);
-    let below = _mm512_add_epi64(nlb, m1);
-    let (c, q) = (_mm512_and_si512(ld!(l.c), below), _mm512_and_si512(ld!(l.q), below));
-    let cm = _mm512_add_epi64(c, m1);
-    let t1 = _mm512_and_si512(c, cm);
-    let t1m = _mm512_add_epi64(t1, m1);
-    let t2 = _mm512_and_si512(t1, t1m);
-    let t2m = _mm512_add_epi64(t2, m1);
-    let t3 = _mm512_and_si512(t2, t2m);
-    let (p1, p2, p3) = (tzv!(c, cm), tzv!(t1, t1m), tzv!(t2, t2m));
-    let qc = _mm512_and_si512(q, one);
-    let s1 = _mm512_add_epi64(p1, one);
-    let qu = qbit!(q, s1);
-    let s2 = _mm512_add_epi64(p2, one);
-    let qk = qbit!(q, s2);
-    let s3 = _mm512_add_epi64(p3, one);
-    let qt = qbit!(q, s3);
+    // the first three commas of the 128-bit masks (lo, hi): from lo while it has one, then from hi
+    let (mut lo, mut hi) = (ld!(l.c0), ld!(l.c1));
+    macro_rules! comma {
+        () => {{
+            let klo = _mm512_test_epi64_mask(lo, lo);
+            let (lm, hm) = (_mm512_add_epi64(lo, m1), _mm512_add_epi64(hi, m1));
+            let p = _mm512_mask_blend_epi64(klo, _mm512_add_epi64(tzv!(hi, hm), c64), tzv!(lo, lm));
+            lo = _mm512_mask_and_epi64(lo, klo, lo, lm);
+            hi = _mm512_mask_and_epi64(hi, !klo, hi, hm);
+            p
+        }};
+    }
+    let p1 = comma!();
+    let p2 = comma!();
+    let p3 = comma!();
+    // the quote bit at a place 0..128 (0 for any other place: a shift by 64 or more gives 0)
+    let (q0, q1) = (ld!(l.q0), ld!(l.q1));
+    macro_rules! qb {
+        ($at:expr) => {{
+            let at = $at;
+            _mm512_and_si512(_mm512_or_si512(_mm512_srlv_epi64(q0, at), _mm512_srlv_epi64(q1, _mm512_sub_epi64(at, c64))), one)
+        }};
+    }
+    let (s1, s2, s3) = (_mm512_add_epi64(p1, one), _mm512_add_epi64(p2, one), _mm512_add_epi64(p3, one));
+    let (qc, qu, qk, qt) = (_mm512_and_si512(q0, one), qb!(s1), qb!(s2), qb!(s3));
+    // each field quoted at both ends or neither, and no quote but those: as many quotes as the quoted fields have
+    // ends. (A field that is one quote counts it twice: too many)
+    let ends = _mm512_or_si512(
+        _mm512_or_si512(_mm512_xor_si512(qc, qb!(_mm512_add_epi64(p1, m1))), _mm512_xor_si512(qu, qb!(_mm512_add_epi64(p2, m1)))),
+        _mm512_or_si512(_mm512_xor_si512(qk, qb!(_mm512_add_epi64(p3, m1))), _mm512_xor_si512(qt, qb!(_mm512_add_epi64(e, m1)))),
+    );
+    let quoted = _mm512_add_epi64(_mm512_add_epi64(qc, qu), _mm512_add_epi64(qk, qt));
+    let want = _mm512_or_si512(k!(3), _mm512_slli_epi64::<9>(quoted));
     let cl = _mm512_sub_epi64(p1, _mm512_add_epi64(qc, qc));
     let ul = _mm512_sub_epi64(_mm512_sub_epi64(p2, s1), _mm512_add_epi64(qu, qu));
     let kl = _mm512_sub_epi64(_mm512_sub_epi64(p3, s2), _mm512_add_epi64(qk, qk));
     let tl = _mm512_sub_epi64(_mm512_sub_epi64(e, s3), _mm512_add_epi64(qt, qt));
-    // a newline in the first 64 bytes after exactly three commas; both IDs 8 or 9 bytes, the campaign 0 to 7
-    // (an empty one is in no file, as `get_short` finds out), ts 13, 20 or 25
-    let k_w = _mm512_mask_cmplt_epu64_mask(_mm512_mask_testn_epi64_mask(_mm512_test_epi64_mask(t2, t2), t3, t3), e, k!(64));
-    let k_len = _mm512_mask_cmple_epu64_mask(_mm512_mask_cmple_epu64_mask(k_w, _mm512_or_si512(_mm512_sub_epi64(cl, k!(8)), _mm512_sub_epi64(ul, k!(8))), one), kl, k!(7));
+    // a newline in the first 120 bytes after exactly three commas, well quoted; both IDs 1 to 48 bytes, the
+    // campaign 0 to 7 (an empty one is in no file, as `get_short` finds out), ts 13, 20 or 25
+    let k_w = _mm512_mask_cmplt_epu64_mask(_mm512_mask_cmpeq_epi64_mask(_mm512_testn_epi64_mask(ends, ends) & live, ld!(l.n), want), e, k!(120));
+    let k_len = _mm512_mask_cmplt_epu64_mask(_mm512_mask_cmplt_epu64_mask(k_w, _mm512_add_epi64(cl, m1), k!(48)), _mm512_add_epi64(ul, m1), k!(48));
+    let k_len = _mm512_mask_cmple_epu64_mask(k_len, kl, k!(7));
     let (kf1, kf2, kf3) = (_mm512_mask_cmpeq_epi64_mask(k_len, tl, k!(20)), _mm512_mask_cmpeq_epi64_mask(k_len, tl, k!(25)), _mm512_mask_cmpeq_epi64_mask(k_len, tl, k!(13)));
-    let k_pos = kf1 | kf2 | kf3;
+    let k_shape = kf1 | kf2 | kf3;
     // any other lane copies from its line's start
-    sv!(l.ac, _mm512_mask_add_epi64(pv, k_pos, pv, qc));
-    sv!(l.au, _mm512_mask_add_epi64(pv, k_pos, pv, _mm512_add_epi64(s1, qu)));
-    sv!(l.ak, _mm512_mask_add_epi64(pv, k_pos, pv, _mm512_add_epi64(s2, qk)));
-    sv!(l.at, _mm512_mask_add_epi64(pv, k_pos, pv, _mm512_add_epi64(s3, qt)));
+    let (ac, au) = (_mm512_mask_add_epi64(pv, k_shape, pv, qc), _mm512_mask_add_epi64(pv, k_shape, pv, _mm512_add_epi64(s1, qu)));
+    sv!(l.ac, ac);
+    sv!(l.au, au);
+    sv!(l.ak, _mm512_mask_add_epi64(pv, k_shape, pv, _mm512_add_epi64(s2, qk)));
+    sv!(l.at, _mm512_mask_add_epi64(pv, k_shape, pv, _mm512_add_epi64(s3, qt)));
 
     // ---- C: the fields' bytes to their fixed places
-    // SAFETY: a start is within the line's first 64 bytes and 32 bytes are read: within the 144 readable ones
+    // SAFETY: a start is within the line's first 120 bytes and at most 32 bytes are read from there, and a ts
+    // starts 13 bytes before the newline at the latest: within the 144 readable ones
     for i in 0..8 {
         copy16!(l.sc, buf, l.ac, i);
         copy16!(l.su, buf, l.au, i);
         copy16!(l.sk, buf, l.ak, i);
         copy32!(l.st, buf, l.at, i);
     }
-
-    // the quotes (this does not wait for the copies)
-    let bad = misquoted!(_mm512_or_si512(c, nlb), q);
-    let k_shape = _mm512_mask_testn_epi64_mask(k_pos, bad, bad);
 
     // ---- D
     // the campaign first: its number comes from a table, one lane at a time, and is read again as a register
@@ -946,10 +1022,13 @@ unsafe fn click_batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &
         }
     }
 
+    // IDs of 8 or 9 bytes packed here (for any other lane the key is of no use)
+    let (c9, u9) = (_mm512_cmpeq_epi64_mask(cl, k!(9)), _mm512_cmpeq_epi64_mask(ul, k!(9)));
+    let short = _mm512_mask_cmple_epu64_mask(_mm512_cmple_epu64_mask(_mm512_sub_epi64(cl, k!(8)), one), _mm512_sub_epi64(ul, k!(8)), one);
     let (clo, chi) = words2!(l.sc);
     let (ulo, uhi) = words2!(l.su);
-    let ckey = pack8(clo, chi, _mm512_cmpeq_epi64_mask(cl, k!(9)));
-    let ukey = pack8(ulo, uhi, _mm512_cmpeq_epi64_mask(ul, k!(9)));
+    let ckey = pack8(clo, chi, c9);
+    let ukey = pack8(ulo, uhi, u9);
     let (w0, w1, w2, w3) = words4!(l.st);
     let (kts, trel, kdate) = stamp(&(*st).dv, cx.ws, w0, w1, w2, w3, kf1, kf2, kf3);
     // ms from the start of the clicks' window, seven days before window_start
@@ -960,21 +1039,46 @@ unsafe fn click_batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &
     #[cfg(test)]
     USUAL.fetch_add(usual.count_ones() as usize, Relaxed);
 
+    let now = keep & short;
     let home = homes(cx, ukey);
     sv!(l.home, home);
     let slots = cx.ids.slots.as_ptr() as *const u8;
-    for i in 0..8 {
+    let mut m = now as u32;
+    while m != 0 {
+        let i = m.trailing_zeros() as usize;
+        m &= m - 1;
         prefetch(slots.add(std::ptr::read_volatile(l.home.as_ptr().add(i)) as usize));
     }
     let tx = _mm512_or_si512(_mm512_slli_epi64::<32>(tw), ld!(l.camp));
     let at = (*bt).n;
-    _mm512_storeu_si512((*bt).a.as_mut_ptr().add(at) as *mut _, _mm512_maskz_compress_epi64(keep, ckey));
-    _mm512_storeu_si512((*bt).ukey.as_mut_ptr().add(at) as *mut _, _mm512_maskz_compress_epi64(keep, ukey));
-    _mm512_storeu_si512((*bt).tx.as_mut_ptr().add(at) as *mut _, _mm512_maskz_compress_epi64(keep, tx));
-    _mm256_storeu_si256((*bt).home.as_mut_ptr().add(at) as *mut _, _mm256_maskz_compress_epi32(keep, _mm512_cvtepi64_epi32(_mm512_srli_epi64::<4>(home))));
-    (*bt).n = at + keep.count_ones() as usize;
+    _mm512_storeu_si512((*bt).a.as_mut_ptr().add(at) as *mut _, _mm512_maskz_compress_epi64(now, ckey));
+    _mm512_storeu_si512((*bt).ukey.as_mut_ptr().add(at) as *mut _, _mm512_maskz_compress_epi64(now, ukey));
+    _mm512_storeu_si512((*bt).tx.as_mut_ptr().add(at) as *mut _, _mm512_maskz_compress_epi64(now, tx));
+    _mm256_storeu_si256((*bt).home.as_mut_ptr().add(at) as *mut _, _mm256_maskz_compress_epi32(now, _mm512_cvtepi64_epi32(_mm512_srli_epi64::<4>(home))));
+    (*bt).n = at + now.count_ones() as usize;
     if (*bt).n >= BATCH {
         (*st).drain::<false>(cx);
+    }
+    // a kept click with another ID: waits for the next batch, the long-ID slots asked for meanwhile
+    let late = keep & !short;
+    if late != 0 {
+        sv!(l.cl, cl);
+        sv!(l.ul, ul);
+        sv!(l.tx, tx);
+        let mut m = late as u32;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let j = (l.ph + l.pn) % LATE; // pn < LATE: at most LATE - 16 wait before a batch, and it adds 8 at most
+            (l.pc[j], l.pcl[j], l.pu[j], l.pul[j], l.ptx[j]) = (l.ac[i], l.cl[i], l.au[i], l.ul[i], l.tx[i]);
+            l.pn += 1;
+            for (s, n) in [(l.ac[i], l.cl[i]), (l.au[i], l.ul[i])] {
+                if (33..=40).contains(&n) {
+                    // SAFETY: the 32 bytes before the ID's end are in the line
+                    cx.names.prefetch_long(buf.add((s + n - 32) as usize));
+                }
+            }
+        }
     }
     // every other line as a whole; a date it brings is remembered for the lines to come
     let mut m = (live & !usual) as u32;
@@ -985,7 +1089,7 @@ unsafe fn click_batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &
             day_fill(cx.ws, buf.add(l.at[i] as usize), &mut (*st).dv);
         }
         // where the line starts: its walk went e + 1 past it
-        l.cur[i] = defer::<false>(cx, buf, (l.cur[i] - 1 - l.e[i]) as usize, len, l.c[i], 0, &mut *st) as u64;
+        l.cur[i] = defer::<false>(cx, buf, (l.cur[i] - 1 - l.e[i]) as usize, len, l.c0[i], l.c1[i], &mut *st) as u64;
     }
     true
 }

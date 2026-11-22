@@ -4878,6 +4878,9 @@ struct Work {
     ses: Vec<Ses>,
     dcats: Vec<(u32, u16, i64)>, // (row, category, price sum)
     best: Vec<i64>,              // price sum of a row's top category
+    csum: Vec<i64>,              // with many purchases: the price sum per row * 256 + category,
+    cmark: Vec<u32>,             // valid where its mark is `cstamp`
+    cstamp: u32,
     eq: [u64; 64],               // per click of the person at hand, the clicks of the same campaign
     // people with more than 64 clicks
     sessions: Vec<Sess>,
@@ -4921,6 +4924,9 @@ impl Work {
             ses: vec![Ses { start: 0, d: 0, row: 0, rev: 0 }; nbins + 1],
             dcats: Vec::new(),
             best: vec![0; nbins + 1],
+            csum: vec![0; (cx.ndays + 1) * 256],
+            cmark: vec![0; (cx.ndays + 1) * 256],
+            cstamp: 0,
             eq: [0; 64],
             sessions: Vec::new(),
             sbit: vec![0; nbins / 64 + 1],
@@ -5089,7 +5095,7 @@ unsafe fn offsets(st: *mut u32, local: usize, act: *mut u32) -> (u32, usize) {
 const PLACE_PF: usize = 32;
 
 /// How many people ahead `partition_work` asks for a name's line.
-const NAME_PF: usize = 8;
+const NAME_PF: usize = 16;
 
 /// rules.md "Events" 5-7 and "Clicks" 4-7 for person partition `p`: the people whose slot number starts with p.
 #[inline(never)]
@@ -5344,9 +5350,18 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u32], pa: usize, np: usize, ca: usize
 
     // purchases: into their session and row; then each row's top category
     if np != 0 {
-        let Work { rows, pls, bins, ses, dcats, best, .. } = w;
+        let Work { rows, pls, bins, ses, dcats, best, csum, cmark, cstamp, .. } = w;
         let rows = &mut rows[row0..];
         dcats.clear();
+        // many purchases: the sums in a table by row and category (8 bits) instead of a search of the list
+        let table = np > 8 && rows.len() * 256 <= csum.len();
+        if table {
+            *cstamp = cstamp.wrapping_add(1);
+            if *cstamp == 0 {
+                cmark.fill(0);
+                *cstamp = 1;
+            }
+        }
         for &(ts, pay) in &pls[pa..pa + np] {
             // the bin of a kept event is one this person took, so its `sess` is this person's
             let s = &mut ses[bins[(ts / GAP as u32) as usize].sess as usize];
@@ -5354,9 +5369,24 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u32], pa: usize, np: usize, ca: usize
             s.rev += price;
             let g = s.row;
             rows[g as usize].revenue += price;
+            if table {
+                let k = g as usize * 256 + (cat & 0xff) as usize;
+                if cmark[k] != *cstamp {
+                    cmark[k] = *cstamp;
+                    csum[k] = 0;
+                    dcats.push((g, cat, 0));
+                }
+                csum[k] += price;
+                continue;
+            }
             match dcats.iter_mut().find(|c| c.0 == g && c.1 == cat) {
                 Some(c) => c.2 += price,
                 None => dcats.push((g, cat, price)),
+            }
+        }
+        if table {
+            for c in dcats.iter_mut() {
+                c.2 = csum[c.0 as usize * 256 + (c.1 & 0xff) as usize];
             }
         }
         // the highest sum; a tie goes to the category that sorts first
@@ -5424,6 +5454,8 @@ fn credit_clicks(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
             *cts.0.get_unchecked_mut(j) = c.ts();
             *ccamp.0.get_unchecked_mut(j) = c.camp() * width as u32; // the campaign's first cell
         }
+        // its days are one or two lines, read by the sessions below
+        prefetch(cells.as_ptr().wrapping_add(c.camp() as usize * width));
     }
     // the vector passes read up to 8 entries past the last click: the arrays hold 72
     let (tp, cp) = (cts.0.as_ptr(), ccamp.0.as_ptr());

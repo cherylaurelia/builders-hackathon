@@ -2549,6 +2549,109 @@ unsafe fn split_click(line: *const u8) -> Option<(Cut, usize)> {
     Some((Cut { s, e }, b3.trailing_zeros() as usize + 1))
 }
 
+/// `window` over 128 bytes.
+#[inline(always)]
+fn window128(b: u128, q: u128) -> (u128, u128, u128) {
+    let s = (b << 1) | 1;
+    let z = b >> 1;
+    let x = q & s;
+    let y = (q << 1) & b;
+    let bad = (q & !(s | z)) | (x & z) | (y.wrapping_sub(x) & b);
+    ((s ^ x) | (x << 1), (b & !y) | (y >> 1), bad)
+}
+
+/// `Cut` over 128 bytes.
+#[derive(Clone, Copy)]
+struct Cut128 {
+    s: u128,
+    e: u128,
+}
+
+/// The fields of a line, in order: (start, length), quotes removed.
+trait Fields {
+    fn field(&mut self) -> (usize, usize);
+}
+
+impl Fields for Cut {
+    #[inline(always)]
+    fn field(&mut self) -> (usize, usize) {
+        self.next()
+    }
+}
+
+impl Fields for Cut128 {
+    #[inline(always)]
+    fn field(&mut self) -> (usize, usize) {
+        let (s, e) = (self.s.trailing_zeros() as usize, self.e.trailing_zeros() as usize);
+        (self.s, self.e) = (self.s & self.s.wrapping_sub(1), self.e & self.e.wrapping_sub(1));
+        (s, e - s)
+    }
+}
+
+/// [commas, quotes, newlines] of the 128 bytes at `p` (all must be readable).
+#[inline(always)]
+unsafe fn masks128(p: *const u8) -> [u128; 3] {
+    let ([c0, q0, n0], [c1, q1, n1]) = (masks64(p), masks64(p.add(64)));
+    [c0 as u128 | (c1 as u128) << 64, q0 as u128 | (q1 as u128) << 64, n0 as u128 | (n1 as u128) << 64]
+}
+
+/// `split_click` of a line that ends in its first 128 bytes (136 must be readable; v5: a 33-byte ID).
+#[inline(always)]
+unsafe fn split_click128(line: *const u8) -> Option<(Cut128, usize)> {
+    let [c, q, n] = masks128(line);
+    let b = c | n;
+    let d = |x: u128| x & x.wrapping_sub(1);
+    let b3 = d(d(d(b)));
+    if b3 == 0 {
+        return None;
+    }
+    let m = b3 ^ b3.wrapping_sub(1);
+    let (s, e, bad) = window128(b & m, q & m);
+    if ((n & m) ^ (b3 & b3.wrapping_neg())) | bad != 0 {
+        return None;
+    }
+    Some((Cut128 { s, e }, b3.trailing_zeros() as usize + 1))
+}
+
+/// `split::<7>` of an event line that ends in its first 128 bytes (136 must be readable; v5: a 33-byte ID), as
+/// `split_click128`: its fields, and its length with its `\n`.
+#[inline(always)]
+unsafe fn split_event128(line: *const u8) -> Option<([(usize, usize); 7], usize)> {
+    let [c, q, n] = masks128(line);
+    let b = c | n;
+    let mut b6 = b;
+    for _ in 0..6 {
+        b6 &= b6.wrapping_sub(1);
+    }
+    if b6 == 0 {
+        return None;
+    }
+    let m = b6 ^ b6.wrapping_sub(1);
+    let (s, e, bad) = window128(b & m, q & m);
+    if ((n & m) ^ (b6 & b6.wrapping_neg())) | bad != 0 {
+        return None;
+    }
+    let mut f = Cut128 { s, e };
+    Some(([f.field(), f.field(), f.field(), f.field(), f.field(), f.field(), f.field()], b6.trailing_zeros() as usize + 1))
+}
+
+/// `split_link` of a line that ends in its first 128 bytes (136 must be readable; v5: two 33-byte IDs).
+#[inline(always)]
+unsafe fn split_link128(line: *const u8) -> Option<(Cut128, usize)> {
+    let [c, q, n] = masks128(line);
+    let b = c | n;
+    let b1 = b & b.wrapping_sub(1);
+    if b1 == 0 {
+        return None;
+    }
+    let m = b1 ^ b1.wrapping_sub(1);
+    let (s, e, bad) = window128(b & m, q & m);
+    if ((n & m) ^ (b1 & b1.wrapping_neg())) | bad != 0 {
+        return None;
+    }
+    Some((Cut128 { s, e }, b1.trailing_zeros() as usize + 1))
+}
+
 /// `split::<2>` of the link line at `line` (72 bytes must be readable), as `split_click`: its two fields, and its
 /// length with its `\n`. None unless the whole line is in its first 64 bytes.
 #[inline(always)]
@@ -3755,6 +3858,14 @@ fn build_links(ids: &IdTable, names: &Interner, files: &[InFile], threads: usize
                             p += n;
                             continue;
                         }
+                        if let Some((mut f, n)) = split_link128(line) {
+                            let ((sa, la), (sb, lb)) = (f.field(), f.field());
+                            if la != 0 && lb != 0 {
+                                bt.push(ids, names, names.key_at(line.add(sa), la), names.key_at(line.add(sb), lb));
+                            }
+                            p += n;
+                            continue;
+                        }
                     }
                     let eol = memchr::memchr(b'\n', &text[p..]).map_or(len, |i| p + i);
                     // SAFETY: the fields live in `buf`, which outlives this use; nothing keeps them
@@ -3871,6 +3982,10 @@ unsafe fn event_line(cx: &Ctx, buf: *const u8, p: usize, len: usize, st: &mut Sh
     let line = buf.add(p);
     if let Some((a, b, o, n)) = split_event(line) {
         fast_event(cx, line, a, line.add(o), b, st);
+        return p + n;
+    }
+    if let Some((f, n)) = split_event128(line) {
+        fast_event_at(cx, line, f, st);
         return p + n;
     }
     // 192 bytes from the line are readable: 144 past len
@@ -4094,14 +4209,14 @@ fn click_fields(cx: &Ctx, [cid, uid, camp, ts]: [Bytes; 4], st: &mut Shard) {
 }
 
 #[inline(always)]
-unsafe fn fast_click(cx: &Ctx, line: *const u8, mut f: Cut, st: &mut Shard) {
-    let (cs, cl) = f.next();
-    let (us, ul) = f.next();
+unsafe fn fast_click(cx: &Ctx, line: *const u8, mut f: impl Fields, st: &mut Shard) {
+    let (cs, cl) = f.field();
+    let (us, ul) = f.field();
     if cl == 0 || ul == 0 {
         return;
     }
-    let (ks, kl) = f.next();
-    let (ts, tl) = f.next();
+    let (ks, kl) = f.field();
+    let (ts, tl) = f.field();
     let t = match ts_memo(line.add(ts), tl, &mut st.days) {
         Some(t) if t >= cx.base && t < cx.we => t,
         _ => return,
@@ -4118,6 +4233,10 @@ unsafe fn fast_click(cx: &Ctx, line: *const u8, mut f: Cut, st: &mut Shard) {
 unsafe fn click_line(cx: &Ctx, buf: *const u8, p: usize, len: usize, st: &mut Shard) -> usize {
     let line = buf.add(p);
     if let Some((f, n)) = split_click(line) {
+        fast_click(cx, line, f, st);
+        return p + n;
+    }
+    if let Some((f, n)) = split_click128(line) {
         fast_click(cx, line, f, st);
         return p + n;
     }

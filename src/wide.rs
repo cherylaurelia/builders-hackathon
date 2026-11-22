@@ -360,6 +360,12 @@ struct Lanes {
     ing: [u64; 8],
     tx: [u64; 8],
     home: [u64; 8], // the byte offset of the user's line in the ID table
+    // a long user_id (`long_lane`): its prefix as `Interner::long_prefix` (0: not a prefix and 32 lowercase hex
+    // digits, which the long-ID table does not take), its digits' 16 bytes and its home slot
+    upre: [u64; 8],
+    ulo: [u64; 8],
+    uhi: [u64; 8],
+    uhome: [u64; 8],
 }
 
 /// Parses the event lines that start in [start, end) of the `len` bytes at `buf` into `st`, as `parse_events_v3`
@@ -435,46 +441,39 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
 ///
 /// The cut bytes are seen by no check here: the long-ID table takes only 32 lowercase hex digits after a 1-byte
 /// prefix (no comma, quote, newline or odd byte among them), and a lane whose ID it refuses goes to `event_line`.
+/// A long user_id is checked and converted here (`upre`, `ulo`, `uhi`, `uhome`), for `batch` to look up.
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,avx2")]
 unsafe fn long_lane(cx: &Ctx, l: &mut Lanes, j: usize, line: *const u8) {
-    let c = *l.c0.get_unchecked(j) as u128 | (*l.c1.get_unchecked(j) as u128) << 64;
-    let q = *l.q0.get_unchecked(j) as u128 | (*l.q1.get_unchecked(j) as u128) << 64;
-    // event_id: from byte qe; user_id: from s1 + qu
-    let qe = (q & 1) as u32;
-    let p1 = c.trailing_zeros();
-    let s1 = p1 + 1;
-    let qu = if s1 < 128 { ((q >> s1) & 1) as u32 } else { 0 };
-    let p2 = (c & c.wrapping_sub(1)).trailing_zeros();
-    let l0 = p1 < 128 && p1 == 33 + 2 * qe;
-    let l1 = p2 < 128 && p2 == s1 + 33 + 2 * qu;
-    if !(l0 | l1) {
-        *l.sh1.get_unchecked_mut(j) = 0;
-        *l.sh2.get_unchecked_mut(j) = 0;
+    // (`lane!` left sh1 and sh2 at 0: a return before they are set keeps the line as it is)
+    let (c0, q0) = (*l.c0.get_unchecked(j), *l.q0.get_unchecked(j));
+    // event_id: from byte qe; user_id: from s1 + qu. A first comma past byte 61 makes no usual line whatever is cut
+    // (only a 33-byte event_id is, and its comma is byte 33 or 35): such a line stays as it is
+    let p1 = c0.trailing_zeros();
+    if p1 > 61 {
         return;
     }
-    // virtual byte k is real byte k below cut0, k + d1 below cut1, k + d2 from there
+    let qe = (q0 & 1) as u32;
+    let s1 = p1 + 1;
+    let qu = ((q0 >> s1) & 1) as u32;
+    let c2 = c0 & c0.wrapping_sub(1);
+    let p2 = if c2 != 0 { c2.trailing_zeros() } else { 64 + (*l.c1.get_unchecked(j)).trailing_zeros() };
+    let l0 = p1 == 33 + 2 * qe;
+    let l1 = p2 == s1 + 33 + 2 * qu;
+    if !(l0 | l1) {
+        return;
+    }
+    // virtual byte k is real byte k below cut0, k + d1 below cut1, k + d2 from there; both cuts are in the first
+    // 64 bytes of a line that can be usual (cut1 is past them only after a first comma past byte 54, where all
+    // of bytes 64..128 come from k + d2 here)
     let d1 = if l0 { 24 } else { 0 };
     let d2 = d1 + if l1 { 24 } else { 0 };
-    let cut0 = if l0 { qe + 9 } else { 0 };
-    let cut1 = if l1 { s1 + qu + 9 - d1 } else { 128 };
-    let below = |x: u32, from: u32| -> u64 {
-        let x = x.saturating_sub(from);
-        if x >= 64 {
-            !0
-        } else {
-            (1u64 << x) - 1
-        }
-    };
-    // (a macro, not a closure: the 512-bit code stays in this function)
-    macro_rules! half {
-        ($o:expr) => {{
-            let x = _mm512_loadu_si512(line.add($o + d2 as usize) as *const _);
-            let x = _mm512_mask_blend_epi8(below(cut1, $o as u32), x, _mm512_loadu_si512(line.add($o + d1 as usize) as *const _));
-            _mm512_mask_blend_epi8(below(cut0, $o as u32), x, _mm512_loadu_si512(line.add($o) as *const _))
-        }};
-    }
-    let (v0, v1) = (half!(0usize), half!(64usize));
+    let m0 = if l0 { _bzhi_u64(!0, qe + 9) } else { 0 };
+    let m1 = if l1 { _bzhi_u64(!0, s1 + qu + 9 - d1) } else { 0 };
+    let v0 = _mm512_loadu_si512(line.add(d2 as usize) as *const _);
+    let v0 = _mm512_mask_blend_epi8(m1, v0, _mm512_loadu_si512(line.add(d1 as usize) as *const _));
+    let v0 = _mm512_mask_blend_epi8(m0, v0, _mm512_loadu_si512(line as *const _));
+    let v1 = _mm512_loadu_si512(line.add(64 + d2 as usize) as *const _);
     let (cm, qt, nv, lowest) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'"' as i8), _mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(0x20));
     *l.c0.get_unchecked_mut(j) = _mm512_cmpeq_epi8_mask(v0, cm);
     *l.q0.get_unchecked_mut(j) = _mm512_cmpeq_epi8_mask(v0, qt);
@@ -484,11 +483,21 @@ unsafe fn long_lane(cx: &Ctx, l: &mut Lanes, j: usize, line: *const u8) {
     *l.e2.get_unchecked_mut(j) = tz(_mm512_cmpeq_epi8_mask(v1, nv)) as u64;
     *l.sh1.get_unchecked_mut(j) = d1 as u64;
     *l.sh2.get_unchecked_mut(j) = d2 as u64;
-    if l0 && !cx.evhash {
+    if !cx.evhash && l0 {
         cx.names.prefetch_long(line.add(qe as usize + 1));
     }
     if l1 {
-        cx.names.prefetch_long(line.add((s1 + qu) as usize + 1));
+        let u = line.add((s1 + qu) as usize);
+        let pre = Interner::long_prefix(u, 1);
+        *l.upre.get_unchecked_mut(j) = 0;
+        if let Some((lo, hi)) = hex32(u.add(1)) {
+            let home = cx.names.long_home(lo, hi);
+            prefetch(cx.names.slot(home) as *const _ as *const u8);
+            *l.upre.get_unchecked_mut(j) = pre;
+            *l.ulo.get_unchecked_mut(j) = lo;
+            *l.uhi.get_unchecked_mut(j) = hi;
+            *l.uhome.get_unchecked_mut(j) = home as u64;
+        }
     }
 }
 
@@ -640,9 +649,9 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
     let (mut ekey, mut ukey) = (ekey, ukey);
     let zero = _mm512_setzero_si512();
     let (kl0, kl1) = (_mm512_mask_cmpneq_epi64_mask(usual, sh1, zero), _mm512_mask_cmpneq_epi64_mask(usual, sh2, sh1));
+    // (each key goes into its lane of the register as it comes: a store to `l` per lane and a load of all eight
+    // after them would wait for the stores, as a load wider than a store cannot take its data from it)
     if (kl0 | kl1) != 0 {
-        sv!(l.ek, ekey);
-        sv!(l.uk, ukey);
         let mut m = kl0 as u32;
         while m != 0 {
             let i = m.trailing_zeros() as usize;
@@ -651,24 +660,25 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
             match if cx.evhash { ev_hash(p) } else { None } {
                 Some((k, r)) => {
                     (*st).evh_push(k, r);
-                    l.ek[i] = k;
+                    ekey = _mm512_mask_set1_epi64(ekey, 1 << i, k as i64);
                 }
                 None => match cx.names.long(p, 33) {
                     0 => usual &= !(1 << i),
-                    k => l.ek[i] = k,
+                    k => ekey = _mm512_mask_set1_epi64(ekey, 1 << i, k as i64),
                 },
             }
         }
+        // (checked and converted in `long_lane`: the same bytes as at `l.au[i]`)
         let mut m = kl1 as u32;
         while m != 0 {
             let i = m.trailing_zeros() as usize;
             m &= m - 1;
-            match cx.names.long(buf.add(l.au[i] as usize), 33) {
+            let pre = l.upre[i];
+            match if pre == 0 { 0 } else { cx.names.long_find(pre, l.ulo[i], l.uhi[i], l.uhome[i] as usize) } {
                 0 => usual &= !(1 << i),
-                k => l.uk[i] = k,
+                k => ukey = _mm512_mask_set1_epi64(ukey, 1 << i, k as i64),
             }
         }
-        (ekey, ukey) = (ld!(l.ek), ld!(l.uk));
     }
     // rules.md "Events" 3 and 4: product_id not empty, ts in the window, ingested no more than 24 hours after it
     let ok = _mm512_mask_cmple_epi64_mask(
@@ -853,6 +863,12 @@ struct ClickLanes {
     pu: [u64; LATE],
     pul: [u64; LATE],
     ptx: [u64; LATE],
+    // a 33-byte user_id the long-ID table takes, checked and converted when the click began to wait: its prefix
+    // (`Interner::long_prefix`; 0: any other user_id), digits and home slot
+    ppre: [u64; LATE],
+    plo: [u64; LATE],
+    phi: [u64; LATE],
+    phome: [u64; LATE],
     ph: usize, // the oldest
     pn: usize,
 }
@@ -925,7 +941,12 @@ unsafe fn click_late(cx: &Ctx, buf: *const u8, st: &mut Shard, l: &mut ClickLane
         (l.ph, l.pn) = (j + 1, l.pn - 1);
         // SAFETY: an ID of the line, which is in the buffer: 9 bytes readable from its start (PAD)
         let ck = st.click_key(cx, buf.add(l.pc[j] as usize), l.pcl[j] as usize);
-        let uk = cx.names.key_at(buf.add(l.pu[j] as usize), l.pul[j] as usize);
+        let uk = match l.ppre[j] {
+            0 => 0,
+            pre => cx.names.long_find(pre, l.plo[j], l.phi[j], l.phome[j] as usize),
+        };
+        // (0: not such an ID, or the table full)
+        let uk = if uk != 0 { uk } else { cx.names.key_at(buf.add(l.pu[j] as usize), l.pul[j] as usize) };
         let n = st.bt.n;
         // SAFETY: n < BATCH between calls: a full batch is drained at once
         *st.bt.a.get_unchecked_mut(n) = ck;
@@ -1109,7 +1130,19 @@ unsafe fn click_batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &
             l.pn += 1;
             // (a click ID is not looked up: `Shard::click_key`)
             let (s, n) = (l.au[i], l.ul[i]);
-            if (33..=40).contains(&n) {
+            l.ppre[j] = 0;
+            if n == 33 {
+                // SAFETY: the user_id's bytes are in the line
+                let u = buf.add(s as usize);
+                let pre = Interner::long_prefix(u, 1);
+                if pre != 0 {
+                    if let Some((lo, hi)) = hex32(u.add(1)) {
+                        let home = cx.names.long_home(lo, hi);
+                        prefetch(cx.names.slot(home) as *const _ as *const u8);
+                        (l.ppre[j], l.plo[j], l.phi[j], l.phome[j]) = (pre, lo, hi, home as u64);
+                    }
+                }
+            } else if (34..=40).contains(&n) {
                 // SAFETY: the 32 bytes before the ID's end are in the line
                 cx.names.prefetch_long(buf.add((s + n - 32) as usize));
             }

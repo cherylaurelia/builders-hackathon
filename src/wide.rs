@@ -437,12 +437,13 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
                 let c0 = *l.c0.get_unchecked($j);
                 let (p1, p2) = (tz(c0), tz(c0 & c0.wrapping_sub(1)));
                 long |= ((((p1 > 11) | (p2 - p1 > 12)) & (*l.cur.get_unchecked($j) < *l.lim.get_unchecked($j))) as u32) << $j;
-                *l.sh1.get_unchecked_mut($j) = 0;
-                *l.sh2.get_unchecked_mut($j) = 0;
             }};
         }
         loop {
             long = 0;
+            // no cut bytes unless `long_lane` says so: two stores, not one a lane per field
+            sv!(l.sh1, _mm512_setzero_si512());
+            sv!(l.sh2, _mm512_setzero_si512());
             lane!(0);
             lane!(1);
             lane!(2);
@@ -479,7 +480,7 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,avx2")]
 unsafe fn long_lane(cx: &Ctx, l: &mut Lanes, j: usize, line: *const u8) {
-    // (`lane!` left sh1 and sh2 at 0: a return before they are set keeps the line as it is)
+    // (the loop left sh1 and sh2 at 0: a return before they are set keeps the line as it is)
     let (c0, q0) = (*l.c0.get_unchecked(j), *l.q0.get_unchecked(j));
     // event_id: from byte qe; user_id: from s1 + qu. A first comma past byte 61 makes no usual line whatever is cut
     // (only a 33-byte event_id is, and its comma is byte 33 or 35): such a line stays as it is

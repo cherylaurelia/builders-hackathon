@@ -3092,6 +3092,35 @@ struct UserRow {
 }
 const NO_CAT: u16 = u16::MAX;
 
+/// A thread's user_daily rows, a column each: the rows of each partition move here from the `UserRow`s the
+/// sessions code writes (`take`), while they are still in the cache, so that the file's columns are encoded from
+/// arrays of their own values (the encoders reading the 24-byte rows from memory once per column took 40% longer).
+struct Rows {
+    day: Vec<i32>,
+    sessions: Vec<u32>,
+    events: Vec<u32>,
+    revenue: Vec<i64>,
+    top: Vec<u16>, // NO_CAT when there is no purchase
+}
+
+impl Rows {
+    fn new(cap: usize) -> Rows {
+        Rows { day: huge_vec(cap), sessions: huge_vec(cap), events: huge_vec(cap), revenue: huge_vec(cap), top: huge_vec(cap) }
+    }
+    fn len(&self) -> usize {
+        self.day.len()
+    }
+    /// `rows` appended, column by column; `rows` left empty.
+    fn take(&mut self, rows: &mut Vec<UserRow>) {
+        self.day.extend(rows.iter().map(|r| r.day));
+        self.sessions.extend(rows.iter().map(|r| r.sessions));
+        self.events.extend(rows.iter().map(|r| r.events));
+        self.revenue.extend(rows.iter().map(|r| r.revenue));
+        self.top.extend(rows.iter().map(|r| r.top));
+        rows.clear();
+    }
+}
+
 struct Ctx {
     ws: i64,
     we: i64,
@@ -3591,17 +3620,18 @@ fn main() {
                             break;
                         }
                         partition_work(cx, shards, order[i].1, &mut w);
+                        w.cols.take(&mut w.rows);
                     }
                     let cred: Vec<Cred> = w.cred.iter().zip(&w.buy).map(|(&c, b)| Cred { sessions: c, purchasing: b.purchasing }).collect();
                     let rev: Vec<i64> = w.buy.iter().map(|b| b.revenue).collect();
                     let assist: Vec<u32> = w.assist.iter().zip(&w.around).map(|(&a, &r)| a as u32 + (r << 16)).collect();
                     tx.send((cred, rev, assist)).unwrap_or_else(|_| die("campaign merger gone"));
                     // thread 0 writes even with no rows: the table needs at least one file
-                    if t == 0 || !w.rows.is_empty() {
-                        write_users(&ud.join(format!("part-{t}.parquet")), &w.rows, &w.people, cat_names, &cx.names)
+                    if t == 0 || w.cols.len() > 0 {
+                        write_users(&ud.join(format!("part-{t}.parquet")), &w.cols, &w.people, cat_names, &cx.names)
                             .unwrap_or_else(|e| die(&format!("write user_daily: {e}")));
                     }
-                    n_rows.fetch_add(w.rows.len(), Relaxed);
+                    n_rows.fetch_add(w.cols.len(), Relaxed);
                     w
                 })
             })
@@ -4655,7 +4685,8 @@ struct Sess {
 
 /// One sessions thread: its results, and scratch reused across partitions.
 struct Work {
-    rows: Vec<UserRow>,
+    rows: Vec<UserRow>, // the rows of the partition at hand (then in `cols`)
+    cols: Rows,
     people: Vec<(u64, u32)>, // the people of `rows` in order: name, rows
     // Per campaign and day (cell = campaign * days + day), in arrays of their own so that the ones every session
     // touches stay small: sessions credited; sessions assisted, in 16 bits with the times each count went round
@@ -4704,7 +4735,8 @@ impl Work {
         let local = (1usize << cx.pshift) + 1;
         let nbins = ((cx.we - cx.base) / GAP) as usize + 2;
         Work {
-            rows: huge_vec(rows_cap),
+            rows: Vec::new(),
+            cols: Rows::new(rows_cap),
             people: huge_vec(rows_cap / 2),
             cred: filled(cells, 0),
             assist: filled(cells, 0),
@@ -5709,18 +5741,6 @@ fn plain_i64(buf: &mut Vec<u8>, vals: impl Iterator<Item = i64>) {
 }
 
 
-fn page_slices<'a>(segs: &[&'a [UserRow]], lo: usize, hi: usize, out: &mut Vec<&'a [UserRow]>) {
-    out.clear();
-    let mut base = 0;
-    for &s in segs {
-        let (a, b) = (base, base + s.len());
-        if b > lo && a < hi {
-            out.push(&s[lo.max(a) - a..hi.min(b) - a]);
-        }
-        base = b;
-    }
-}
-
 /// Appends the ID of key `k` as a PLAIN byte array: 4-byte length, then the bytes.
 #[inline]
 fn put_name(b: &mut Vec<u8>, names: &Interner, k: u64, tmp: &mut Vec<u8>) {
@@ -5900,11 +5920,20 @@ fn put_run(b: &mut Vec<u8>, run: usize, idx: u32, vb: usize) {
     b.extend_from_slice(&idx.to_le_bytes()[..vb]);
 }
 
-fn write_users(path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: &[Bytes], names: &Interner) -> std::io::Result<()> {
-    let segs: &[&[UserRow]] = &[rows];
+fn write_users(path: &Path, rows: &Rows, people: &[(u64, u32)], cat_names: &[Bytes], names: &Interner) -> std::io::Result<()> {
     let mut tmp = Vec::with_capacity(64);
-    let n: usize = segs.iter().map(|s| s.len()).sum();
-    let mut part: Vec<&[UserRow]> = Vec::new();
+    let n = rows.len();
+    // the categories as PLAIN values (4-byte length, then the bytes) in 32 bytes each, at their number, with an
+    // empty one at 256 for NO_CAT (at most 256 categories): when every name fits in 28 bytes
+    let spelled: Option<Vec<([u8; 32], usize)>> = (cat_names.len() <= 256 && cat_names.iter().all(|c| c.len() <= 28)).then(|| {
+        let mut v = vec![([0u8; 32], 0usize); 257];
+        for (e, c) in v.iter_mut().zip(cat_names) {
+            e.0[..4].copy_from_slice(&(c.len() as u32).to_le_bytes());
+            e.0[4..4 + c.len()].copy_from_slice(c);
+            e.1 = 4 + c.len();
+        }
+        v
+    });
     let mut run: Vec<u8> = Vec::new();
     // user_id is dictionary encoded: one entry per person (a person's days are consecutive rows), and the data
     // pages are runs of that entry's index. `at` = the person the next page starts in, and how many of its rows
@@ -5914,12 +5943,19 @@ fn write_users(path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: 
     // sessions and events stay far below 2^31: main() refuses inputs with that many events
     write_parquet(path, &USER_COLS, n, |c, lo, hi, b| {
         if c == 0 && lo == DICT_PAGE {
-            for &(name, _) in people {
+            b.reserve(entries * 16);
+            for (i, &(name, _)) in people.iter().enumerate() {
+                // a long-ID-table name is read from its slot, a line of the table far from the last: asked for
+                // 48 names ahead (about six long ones)
+                if let Some(&(ahead, _)) = people.get(i + 48) {
+                    if ahead & (INTERNED | LONG) == INTERNED | LONG {
+                        prefetch(names.slot(ahead as usize));
+                    }
+                }
                 put_name(b, names, name, &mut tmp);
             }
             return entries;
         }
-        page_slices(segs, lo, hi, &mut part);
         match c {
             0 => {
                 let w = (usize::BITS - (entries.max(2) - 1).leading_zeros()) as usize;
@@ -5934,14 +5970,25 @@ fn write_users(path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: 
                 }
             }
             1..=4 => {
-                // straight from the rows, one loop per column
-                let rs = &rows[lo..hi];
-                // SAFETY (the four): put_delta asks for indices below rs.len()
+                // straight from the columns
+                // SAFETY (the four): put_delta asks for indices below hi - lo
                 match c {
-                    1 => put_delta(b, rs.len(), |i| unsafe { rs.get_unchecked(i) }.day as i64),
-                    2 => put_delta(b, rs.len(), |i| unsafe { rs.get_unchecked(i) }.sessions as i64),
-                    3 => put_delta(b, rs.len(), |i| unsafe { rs.get_unchecked(i) }.events as i64),
-                    _ => put_delta(b, rs.len(), |i| unsafe { rs.get_unchecked(i) }.revenue),
+                    1 => {
+                        let v = &rows.day[lo..hi];
+                        put_delta(b, v.len(), |i| *unsafe { v.get_unchecked(i) } as i64)
+                    }
+                    2 => {
+                        let v = &rows.sessions[lo..hi];
+                        put_delta(b, v.len(), |i| *unsafe { v.get_unchecked(i) } as i64)
+                    }
+                    3 => {
+                        let v = &rows.events[lo..hi];
+                        put_delta(b, v.len(), |i| *unsafe { v.get_unchecked(i) } as i64)
+                    }
+                    _ => {
+                        let v = &rows.revenue[lo..hi];
+                        put_delta(b, v.len(), |i| *unsafe { v.get_unchecked(i) })
+                    }
                 }
             }
             _ => {
@@ -5954,25 +6001,36 @@ fn write_users(path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: 
                     v >>= 7;
                 }
                 run.push(v as u8);
-                let (mut cur, mut k) = (0u8, 0);
-                for r in part.iter().flat_map(|s| s.iter()) {
-                    cur |= ((r.top != NO_CAT) as u8) << k;
-                    k += 1;
-                    if k == 8 {
-                        run.push(cur);
-                        (cur, k) = (0, 0);
-                    }
+                let tops = &rows.top[lo..hi];
+                let mut eight = tops.chunks_exact(8);
+                for t in &mut eight {
+                    run.push(t.iter().enumerate().fold(0u8, |a, (k, &t)| a | ((t != NO_CAT) as u8) << k));
                 }
-                if k > 0 {
-                    run.push(cur);
+                if !eight.remainder().is_empty() {
+                    run.push(eight.remainder().iter().enumerate().fold(0u8, |a, (k, &t)| a | ((t != NO_CAT) as u8) << k));
                 }
                 b.extend_from_slice(&((run.len()) as u32).to_le_bytes());
                 b.extend_from_slice(&run);
-                for r in part.iter().flat_map(|s| s.iter()) {
-                    if r.top != NO_CAT {
-                        let v = cat_names[r.top as usize];
-                        b.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                        b.extend_from_slice(v);
+                if let Some(spelled) = &spelled {
+                    // each value written whole as its 32 bytes, of which its length counts (none for NO_CAT)
+                    b.reserve(tops.len() * 32);
+                    // SAFETY: 32 bytes a row are reserved; an index is at most 256, the table's last entry
+                    unsafe {
+                        let mut p = b.as_mut_ptr().add(b.len());
+                        for &t in tops {
+                            let (v, len) = spelled.get_unchecked((t as usize).min(256));
+                            (p as *mut [u8; 32]).write_unaligned(*v);
+                            p = p.add(*len);
+                        }
+                        b.set_len(p as usize - b.as_ptr() as usize);
+                    }
+                } else {
+                    for &t in tops {
+                        if t != NO_CAT {
+                            let v = cat_names[t as usize];
+                            b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                            b.extend_from_slice(v);
+                        }
                     }
                 }
             }

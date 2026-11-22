@@ -435,7 +435,7 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
 /// The cut bytes are seen by no check here: the long-ID table takes only 32 lowercase hex digits after a 1-byte
 /// prefix (no comma, quote, newline or odd byte among them), and a lane whose ID it refuses goes to `event_line`.
 /// A long user_id is checked and converted here (`upre`, `ulo`, `uhi`, `uhome`), for `batch` to look up.
-#[inline(never)]
+#[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,avx2")]
 unsafe fn long_lane(cx: &Ctx, l: &mut Lanes, j: usize, line: *const u8) {
     // (`lane!` left sh1 and sh2 at 0: a return before they are set keeps the line as it is)

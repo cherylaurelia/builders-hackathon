@@ -490,11 +490,50 @@ impl Interner {
         }
     }
 
+    /// The ID of a packed or long-ID-table key into `out`, without the heap; its length.
+    #[inline]
+    fn short_bytes(&self, key: u64, out: &mut [u8; 48]) -> usize {
+        let mut n = 0;
+        let mut put = |k: u64| {
+            for i in 0..9 {
+                let d = (k >> (56 - 7 * i)) & 127;
+                if d == 0 {
+                    break;
+                }
+                out[n] = d as u8;
+                n += 1;
+            }
+        };
+        if key & INTERNED == 0 {
+            put(key);
+            return n;
+        }
+        let s = self.slot(key as usize);
+        put((s.meta.load(Acquire) & !(LONG_BUSY | LONG_READY)) << 7);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for w in [s.lo.load(Relaxed), s.hi.load(Relaxed)] {
+            for k in 0..8 {
+                let b = (w >> (8 * k)) as u8;
+                out[n] = HEX[(b >> 4) as usize];
+                out[n + 1] = HEX[(b & 15) as usize];
+                n += 2;
+            }
+        }
+        n
+    }
+
     /// Byte-wise `a < b` of the two IDs.
     #[inline]
     fn less(&self, a: u64, b: u64) -> bool {
         if (a | b) & INTERNED == 0 {
             return a < b;
+        }
+        // packed or in the long-ID table: compared on the stack
+        let heap = |k: u64| k & (INTERNED | LONG) == INTERNED;
+        if !heap(a) && !heap(b) {
+            let (mut x, mut y) = ([0u8; 48], [0u8; 48]);
+            let (nx, ny) = (self.short_bytes(a, &mut x), self.short_bytes(b, &mut y));
+            return x[..nx] < y[..ny];
         }
         let (mut x, mut y) = (Vec::new(), Vec::new());
         self.bytes(a, &mut x);

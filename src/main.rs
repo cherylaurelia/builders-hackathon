@@ -3110,13 +3110,30 @@ impl Rows {
     fn len(&self) -> usize {
         self.day.len()
     }
-    /// `rows` appended, column by column; `rows` left empty.
+    /// `rows` appended, in one pass over them; `rows` left empty.
     fn take(&mut self, rows: &mut Vec<UserRow>) {
-        self.day.extend(rows.iter().map(|r| r.day));
-        self.sessions.extend(rows.iter().map(|r| r.sessions));
-        self.events.extend(rows.iter().map(|r| r.events));
-        self.revenue.extend(rows.iter().map(|r| r.revenue));
-        self.top.extend(rows.iter().map(|r| r.top));
+        let (n, at) = (rows.len(), self.len());
+        self.day.reserve(n);
+        self.sessions.reserve(n);
+        self.events.reserve(n);
+        self.revenue.reserve(n);
+        self.top.reserve(n);
+        // SAFETY: every column has room for n more, and gets the n entries before its length moves
+        unsafe {
+            let (d, s, e, v, t) = (self.day.as_mut_ptr().add(at), self.sessions.as_mut_ptr().add(at), self.events.as_mut_ptr().add(at), self.revenue.as_mut_ptr().add(at), self.top.as_mut_ptr().add(at));
+            for (k, r) in rows.iter().enumerate() {
+                d.add(k).write(r.day);
+                s.add(k).write(r.sessions);
+                e.add(k).write(r.events);
+                v.add(k).write(r.revenue);
+                t.add(k).write(r.top);
+            }
+            self.day.set_len(at + n);
+            self.sessions.set_len(at + n);
+            self.events.set_len(at + n);
+            self.revenue.set_len(at + n);
+            self.top.set_len(at + n);
+        }
         rows.clear();
     }
 }

@@ -1479,6 +1479,16 @@ impl IdTable {
         }
     }
 
+    /// Asks for the line `name(person)` reads.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn prefetch_name(&self, person: u32) {
+        if let Some(l) = self.lines.get((self.slot_of(person) >> 3) as usize) {
+            // SAFETY: a prefetch of a line of the table
+            unsafe { std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(l as *const _ as *const i8) };
+        }
+    }
+
     /// The person of the ID in slot `t`, once the links are flattened.
     #[inline(always)]
     fn person(&self, t: u32) -> u32 {
@@ -5011,6 +5021,11 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
 
     let ev = std::mem::take(&mut w.ev);
     for i in 0..w.nact {
+        // the ID table line with the name of the person 4 ahead: a cache miss a person otherwise
+        #[cfg(target_arch = "x86_64")]
+        if let Some(&l4) = w.act.get(i + 4).filter(|_| i + 4 < w.nact) {
+            cx.ids.prefetch_name(((p << cx.pshift) | l4 as usize) as u32);
+        }
         let l = w.act[i] as usize;
         let (a, b) = (w.start[l] as usize, w.start[l + 1] as usize);
         let name = cx.ids.name(((p << cx.pshift) | l) as u32);
@@ -5709,18 +5724,6 @@ fn plain_i64(buf: &mut Vec<u8>, vals: impl Iterator<Item = i64>) {
 }
 
 
-fn page_slices<'a>(segs: &[&'a [UserRow]], lo: usize, hi: usize, out: &mut Vec<&'a [UserRow]>) {
-    out.clear();
-    let mut base = 0;
-    for &s in segs {
-        let (a, b) = (base, base + s.len());
-        if b > lo && a < hi {
-            out.push(&s[lo.max(a) - a..hi.min(b) - a]);
-        }
-        base = b;
-    }
-}
-
 /// Appends the ID of key `k` as a PLAIN byte array: 4-byte length, then the bytes.
 #[inline]
 fn put_name(b: &mut Vec<u8>, names: &Interner, k: u64, tmp: &mut Vec<u8>) {
@@ -5901,11 +5904,52 @@ fn put_run(b: &mut Vec<u8>, run: usize, idx: u32, vb: usize) {
 }
 
 fn write_users(path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: &[Bytes], names: &Interner) -> std::io::Result<()> {
-    let segs: &[&[UserRow]] = &[rows];
     let mut tmp = Vec::with_capacity(64);
-    let n: usize = segs.iter().map(|s| s.len()).sum();
-    let mut part: Vec<&[UserRow]> = Vec::new();
-    let mut run: Vec<u8> = Vec::new();
+    let n = rows.len();
+    // Columns 1 to 5 (day to top_category) are encoded page by page before the file is put together: a page's rows
+    // come from memory once, and stay in the cache for its five bodies (column by column over the whole file they
+    // came from memory five times). `body` holds the bodies one after another, `ends` per page where they end.
+    // reserved once for the most the pages can take (put_delta asks for 8 bytes a value + 1040 a block of 128
+    // ahead, top_body 32 a row): a vector of 1 MiB or more that grows is moved by mremap, which interrupts every
+    // CPU of the process to drop the old mapping
+    let pages = n / PAGE_ROWS + 1;
+    let mut body: [Vec<u8>; 5] = std::array::from_fn(|c| huge_vec(if c < 4 { n * 8 + pages * 64 + (PAGE_ROWS / 128 + 1) * 1040 + 64 } else { n * 33 + pages * 64 + 64 }));
+    let mut ends: Vec<[usize; 5]> = Vec::with_capacity(n / PAGE_ROWS + 1);
+    // top_category as PLAIN byte arrays: per category its 4-byte length and bytes in a 32-byte entry, written whole
+    // with the output moved past the length that counts (0 for a row without one, entry cat_names.len()); a name
+    // over 28 bytes leaves the entries unused
+    let ent: Vec<[u8; 32]> = cat_names
+        .iter()
+        .map(|v| {
+            let mut e = [0u8; 32];
+            if v.len() <= 28 {
+                e[..4].copy_from_slice(&(v.len() as u32).to_le_bytes());
+                e[4..4 + v.len()].copy_from_slice(v);
+            }
+            e
+        })
+        .chain(std::iter::once([0u8; 32]))
+        .collect();
+    let esz: Vec<usize> = cat_names.iter().map(|v| 4 + v.len()).chain(std::iter::once(0)).collect();
+    let whole = cat_names.iter().all(|v| v.len() <= 28) && cat_names.len() < NO_CAT as usize;
+    let (mut run, mut top) = (Vec::new(), Vec::with_capacity(PAGE_ROWS));
+    let mut lo = 0;
+    loop {
+        let rs = &rows[lo..(lo + PAGE_ROWS).min(n)];
+        // SAFETY (the four): put_delta asks for indices below rs.len()
+        put_delta(&mut body[0], rs.len(), |i| unsafe { rs.get_unchecked(i) }.day as i64);
+        put_delta(&mut body[1], rs.len(), |i| unsafe { rs.get_unchecked(i) }.sessions as i64);
+        put_delta(&mut body[2], rs.len(), |i| unsafe { rs.get_unchecked(i) }.events as i64);
+        put_delta(&mut body[3], rs.len(), |i| unsafe { rs.get_unchecked(i) }.revenue);
+        top.clear();
+        top.extend(rs.iter().map(|r| r.top));
+        top_body(&mut body[4], &top, &mut run, cat_names, &ent, &esz, whole);
+        ends.push(std::array::from_fn(|c| body[c].len()));
+        lo += rs.len();
+        if lo >= n {
+            break;
+        }
+    }
     // user_id is dictionary encoded: one entry per person (a person's days are consecutive rows), and the data
     // pages are runs of that entry's index. `at` = the person the next page starts in, and how many of its rows
     // the pages before took.
@@ -5914,71 +5958,101 @@ fn write_users(path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: 
     // sessions and events stay far below 2^31: main() refuses inputs with that many events
     write_parquet(path, &USER_COLS, n, |c, lo, hi, b| {
         if c == 0 && lo == DICT_PAGE {
-            for &(name, _) in people {
+            for (i, &(name, _)) in people.iter().enumerate() {
+                // a long-ID-table name's slot is a cache miss: asked for 16 people ahead
+                #[cfg(target_arch = "x86_64")]
+                if let Some(&(k, _)) = people.get(i + 16) {
+                    if k & (INTERNED | LONG) == INTERNED | LONG {
+                        // SAFETY: a prefetch of a slot of the table, which is mapped
+                        unsafe {
+                            use std::arch::x86_64::*;
+                            _mm_prefetch::<_MM_HINT_T0>(names.slot(k as usize) as *const LongSlot as *const i8);
+                        }
+                    }
+                }
                 put_name(b, names, name, &mut tmp);
             }
             return entries;
         }
-        page_slices(segs, lo, hi, &mut part);
-        match c {
-            0 => {
-                let w = (usize::BITS - (entries.max(2) - 1).leading_zeros()) as usize;
-                b.push(w as u8);
-                let mut left = hi - lo;
-                while left > 0 {
-                    let (i, used) = at;
-                    let run = (people[i].1 as usize - used).min(left);
-                    put_run(b, run, i as u32, w.div_ceil(8));
-                    left -= run;
-                    at = if used + run == people[i].1 as usize { (i + 1, 0) } else { (i, used + run) };
-                }
+        if c == 0 {
+            let w = (usize::BITS - (entries.max(2) - 1).leading_zeros()) as usize;
+            b.push(w as u8);
+            let mut left = hi - lo;
+            while left > 0 {
+                let (i, used) = at;
+                let run = (people[i].1 as usize - used).min(left);
+                put_run(b, run, i as u32, w.div_ceil(8));
+                left -= run;
+                at = if used + run == people[i].1 as usize { (i + 1, 0) } else { (i, used + run) };
             }
-            1..=4 => {
-                // straight from the rows, one loop per column
-                let rs = &rows[lo..hi];
-                // SAFETY (the four): put_delta asks for indices below rs.len()
-                match c {
-                    1 => put_delta(b, rs.len(), |i| unsafe { rs.get_unchecked(i) }.day as i64),
-                    2 => put_delta(b, rs.len(), |i| unsafe { rs.get_unchecked(i) }.sessions as i64),
-                    3 => put_delta(b, rs.len(), |i| unsafe { rs.get_unchecked(i) }.events as i64),
-                    _ => put_delta(b, rs.len(), |i| unsafe { rs.get_unchecked(i) }.revenue),
-                }
-            }
-            _ => {
-                // definition levels: one bit-packed run of ceil(rows / 8) groups of 8 bits (1 = present)
-                let groups = (hi - lo).div_ceil(8);
-                run.clear();
-                let mut v = ((groups as u64) << 1) | 1;
-                while v >= 0x80 {
-                    run.push(v as u8 | 0x80);
-                    v >>= 7;
-                }
-                run.push(v as u8);
-                let (mut cur, mut k) = (0u8, 0);
-                for r in part.iter().flat_map(|s| s.iter()) {
-                    cur |= ((r.top != NO_CAT) as u8) << k;
-                    k += 1;
-                    if k == 8 {
-                        run.push(cur);
-                        (cur, k) = (0, 0);
-                    }
-                }
-                if k > 0 {
-                    run.push(cur);
-                }
-                b.extend_from_slice(&((run.len()) as u32).to_le_bytes());
-                b.extend_from_slice(&run);
-                for r in part.iter().flat_map(|s| s.iter()) {
-                    if r.top != NO_CAT {
-                        let v = cat_names[r.top as usize];
-                        b.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                        b.extend_from_slice(v);
-                    }
-                }
-            }
+        } else {
+            let p = lo / PAGE_ROWS;
+            let start = if p == 0 { 0 } else { ends[p - 1][c - 1] };
+            b.extend_from_slice(&body[c - 1][start..ends[p][c - 1]]);
         }
         0
     })
+}
+
+/// Appends the body of a top_category page whose rows have categories `top`: definition levels, then the names
+/// (see write_users for `ent`, `esz` and `whole`).
+fn top_body(b: &mut Vec<u8>, top: &[u16], run: &mut Vec<u8>, cat_names: &[Bytes], ent: &[[u8; 32]], esz: &[usize], whole: bool) {
+    // definition levels: one bit-packed run of ceil(rows / 8) groups of 8 bits (1 = present)
+    let groups = top.len().div_ceil(8);
+    run.clear();
+    let mut v = ((groups as u64) << 1) | 1;
+    while v >= 0x80 {
+        run.push(v as u8 | 0x80);
+        v >>= 7;
+    }
+    run.push(v as u8);
+    let mut i = 0;
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        // 16 rows a step: lanes equal to NO_CAT, packed to bytes (the pack works per 128-bit half, so the mask has
+        // rows 0-7 in bits 0-7 and rows 8-15 in bits 16-23)
+        while i + 16 <= top.len() {
+            // SAFETY: rows i..i + 16 are in `top`
+            let m = unsafe {
+                let x = _mm256_loadu_si256(top.as_ptr().add(i) as *const __m256i);
+                let e = _mm256_cmpeq_epi16(x, _mm256_set1_epi16(-1));
+                _mm256_movemask_epi8(_mm256_packs_epi16(e, e)) as u32
+            };
+            let absent = (m & 0xff) | ((m >> 8) & 0xff00);
+            run.extend_from_slice(&(!absent as u16).to_le_bytes());
+            i += 16;
+        }
+    }
+    for g in top[i..].chunks(8) {
+        run.push(g.iter().enumerate().fold(0u8, |a, (k, &t)| a | (((t != NO_CAT) as u8) << k)));
+    }
+    b.extend_from_slice(&(run.len() as u32).to_le_bytes());
+    b.extend_from_slice(run);
+    if whole {
+        b.reserve(top.len() * 32 + 32);
+        // SAFETY: at most 32 bytes a row are written, inside the room just reserved; a category is below
+        // cat_names.len(), and NO_CAT is mapped to the empty entry past them
+        unsafe {
+            let start = b.as_mut_ptr().add(b.len());
+            let mut p = start;
+            let last = cat_names.len();
+            for &t in top {
+                let k = if t == NO_CAT { last } else { t as usize };
+                (p as *mut [u8; 32]).write_unaligned(*ent.get_unchecked(k));
+                p = p.add(*esz.get_unchecked(k));
+            }
+            b.set_len(b.len() + (p as usize - start as usize));
+        }
+    } else {
+        for &t in top {
+            if t != NO_CAT {
+                let v = cat_names[t as usize];
+                b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                b.extend_from_slice(v);
+            }
+        }
+    }
 }
 
 fn write_camps(path: &Path, rows: &[CampRow]) -> std::io::Result<()> {

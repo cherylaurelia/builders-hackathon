@@ -3101,9 +3101,11 @@ fn main() {
     let bytes = |v: &[InFile]| v.iter().map(|f| f.len).sum::<usize>();
     let (link_bytes, ev_bytes) = (bytes(&link_files), bytes(&ev_files));
 
-    // sizes: a link line is ~21 bytes and names ~1.4 new IDs; ~1 in 40 event lines brings an unlinked ID; an event
-    // line is ~75 bytes. A wrong guess costs speed, never rows: the ID table restarts the run when it fills up.
-    let id_est = link_bytes / 14 + ev_bytes / 3000 + bytes(&ck_files) / 3000;
+    // sizes: a link line names ~1.4 new IDs and is ~26 bytes on v5 (one ID in eight is 33 bytes; ~21 on v4);
+    // ~1 in 40 event lines brings an unlinked ID; an event line is ~75 bytes. v5 60M: 4.45M IDs, 71% of the
+    // limit of 2^23 slots (at link_bytes / 14 it was 2^24: twice the table to zero and to flatten, 4% of the run
+    // on the box). A wrong guess costs speed, never rows: the ID table restarts the run when it fills up.
+    let id_est = link_bytes / 18 + ev_bytes / 3000 + bytes(&ck_files) / 3000;
     let id_bits = env_num("SESS_ID_BITS").map(|v| v as u32).unwrap_or(usize::BITS - (id_est * 7 / 5).leading_zeros()).clamp(16, 30);
     // about 90,000 events per person partition and per event-key bucket: more of them slow the parse (one open
     // block each per thread), fewer leave the later phases with work that no longer fits a core's cache

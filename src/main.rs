@@ -5684,7 +5684,7 @@ const USER_COLS: [ColSpec; 6] = [
     ColSpec { delta: true, ..col("sessions", T_INT32, None) },
     ColSpec { delta: true, ..col("events", T_INT32, None) },
     ColSpec { delta: true, ..col("revenue_cents", T_INT64, None) },
-    ColSpec { optional: true, ..col("top_category", T_BYTES, Some(CT_UTF8)) },
+    ColSpec { optional: true, dict: true, ..col("top_category", T_BYTES, Some(CT_UTF8)) },
 ];
 
 const CAMP_COLS: [ColSpec; 7] = [
@@ -6073,6 +6073,11 @@ fn write_users(path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: 
             }
             return entries;
         }
+        if lo == DICT_PAGE {
+            // top_category: the dictionary is every category name, a row's value is its category index
+            plain_bytes(b, cat_names.iter().copied());
+            return cat_names.len();
+        }
         page_slices(segs, lo, hi, &mut part);
         match c {
             0 => {
@@ -6108,8 +6113,9 @@ fn write_users(path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: 
                     v >>= 7;
                 }
                 run.push(v as u8);
-                let (mut cur, mut k) = (0u8, 0);
+                let (mut cur, mut k, mut present) = (0u8, 0, 0usize);
                 for r in part.iter().flat_map(|s| s.iter()) {
+                    present += (r.top != NO_CAT) as usize;
                     cur |= ((r.top != NO_CAT) as u8) << k;
                     k += 1;
                     if k == 8 {
@@ -6122,11 +6128,36 @@ fn write_users(path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: 
                 }
                 b.extend_from_slice(&((run.len()) as u32).to_le_bytes());
                 b.extend_from_slice(&run);
-                for r in part.iter().flat_map(|s| s.iter()) {
-                    if r.top != NO_CAT {
-                        let v = cat_names[r.top as usize];
-                        b.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                        b.extend_from_slice(v);
+                if hi > lo {
+                    // dictionary indices of the present values: bit width, then one bit-packed run of
+                    // ceil(present / 8) groups of 8 values of w bits (the last group padded with zeros)
+                    let w = (usize::BITS - (cat_names.len().max(2) - 1).leading_zeros()) as usize;
+                    b.push(w as u8);
+                    let groups = present.div_ceil(8);
+                    if groups > 0 {
+                        let mut v = ((groups as u64) << 1) | 1;
+                        while v >= 0x80 {
+                            b.push(v as u8 | 0x80);
+                            v >>= 7;
+                        }
+                        b.push(v as u8);
+                        let end = b.len() + groups * w;
+                        let (mut acc, mut nb) = (0u64, 0usize);
+                        for r in part.iter().flat_map(|s| s.iter()) {
+                            if r.top != NO_CAT {
+                                acc |= (r.top as u64) << nb;
+                                nb += w;
+                                while nb >= 8 {
+                                    b.push(acc as u8);
+                                    acc >>= 8;
+                                    nb -= 8;
+                                }
+                            }
+                        }
+                        while b.len() < end {
+                            b.push(acc as u8);
+                            acc >>= 8;
+                        }
                     }
                 }
             }

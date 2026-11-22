@@ -4705,6 +4705,7 @@ struct Work {
     pstart: Vec<u32>,       // like `start`, for `pls`
     ck: Vec<CRec>,  // the partition's clicks by person
     ckt: Vec<CRec>, // room for the sort of a person's many clicks
+    bts: Vec<u32>,  // their ts in order, then u32::MAX
     sat: Vec<u32>,  // and its counts per 30-minute bin
     // the ts and the campaign of the clicks of the person at hand (up to 64), as arrays for the vector passes
     cts: A32,
@@ -4751,6 +4752,7 @@ impl Work {
             pstart: filled(local + 2, 0),
             ck: huge_vec(ck_cap),
             ckt: Vec::new(),
+            bts: Vec::new(),
             sat: vec![0; nbins.next_multiple_of(8) + 3],
             cts: A32([0; 72]),
             ccamp: A32([0; 72]),
@@ -5333,9 +5335,15 @@ fn sort_clicks(v: &mut [CRec], tmp: &mut Vec<CRec>, cnt: &mut [u32]) {
 fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
     let width = cx.ndays;
     let organic = cx.ncamp;
-    let Work { cell, cwrap, around, buy, stamp, iv, seen, sctr, sessions, touched, ck, ckt, sat, ses, sbit, spre, sday, .. } = w;
+    let Work { cell, cwrap, around, buy, stamp, iv, seen, sctr, sessions, touched, ck, ckt, bts, sat, ses, sbit, spre, sday, .. } = w;
     sort_clicks(&mut ck[ca..ca + nc], ckt, sat);
     let cs: &[CRec] = &ck[ca..ca + nc];
+    // the ts in order with a sentinel above every session start: the sweeps below stop on it, with no bounds check
+    bts.clear();
+    bts.extend(cs.iter().map(|c| c.ts()));
+    bts.push(u32::MAX);
+    let tp = bts.as_ptr();
+    // SAFETY (for every tp.add below): the sweeps stop at the sentinel, index nc, and lo <= hi
     sessions.clear();
     sessions.extend(ses[..ns].iter().map(|s| Sess { start: s.start as i64, d: s.d as usize, revenue: s.rev }));
 
@@ -5357,13 +5365,19 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
     if nc * ns <= 2048 {
         // few sessions: per session, look at the clicks of its 7-day window [start - 7d, start]
         // (a contiguous run of cs) for the credit and for the distinct assisting campaigns
-        let (mut lo, mut hi) = (0, 0);
+        let (mut lo, mut hi) = (0usize, 0usize);
         for s in sessions.iter() {
-            while hi < nc && cts(&cs[hi]) <= s.start {
-                hi += 1;
-            }
-            while lo < hi && s.start - cts(&cs[lo]) > WEEK {
-                lo += 1;
+            let st = s.start;
+            unsafe {
+                hi += (*tp.add(hi) as i64 <= st) as usize;
+                hi += (*tp.add(hi) as i64 <= st) as usize;
+                while *tp.add(hi) as i64 <= st {
+                    hi += 1;
+                }
+                // a click past the start (at hi, at the latest) ends this one as well
+                while st - *tp.add(lo) as i64 > WEEK {
+                    lo += 1;
+                }
             }
             let mut camp = organic;
             if hi > lo {
@@ -5388,8 +5402,10 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
         // credit: latest click with start - 7d <= ts <= start
         let mut q = 0;
         for s in sessions.iter() {
-            while q < nc && cts(&cs[q]) <= s.start {
-                q += 1;
+            unsafe {
+                while *tp.add(q) as i64 <= s.start {
+                    q += 1;
+                }
             }
             let mut camp = organic;
             if q > 0 && s.start - cts(&cs[q - 1]) <= WEEK {

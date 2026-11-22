@@ -328,6 +328,27 @@ const LONG_READY: u64 = 1 << 62;
 /// put within this many slots of its home always is, as slots are never emptied.
 const LONG_PROBES: usize = 1024;
 
+/// Replaces the process with itself and a 4x larger long-ID table, as `restart_bigger` does for the ID table;
+/// returns when the table cannot grow (the locked maps then take what does not fit).
+#[cold]
+#[cfg_attr(test, allow(dead_code))]
+fn restart_long_bigger(bits: u32) {
+    use std::os::unix::process::CommandExt;
+    static ONCE: AtomicBool = AtomicBool::new(false);
+    if bits + 2 > 28 {
+        return;
+    }
+    if ONCE.swap(true, Relaxed) {
+        loop {
+            std::thread::park(); // another thread is already restarting
+        }
+    }
+    eprintln!("long-ID table of 2^{bits} slots filled up: restarting with 2^{}", bits + 2);
+    let exe = std::env::current_exe().unwrap_or_else(|e| die(&format!("current_exe: {e}")));
+    let err = std::process::Command::new(exe).args(std::env::args_os().skip(1)).env("SESS_LONG_BITS", (bits + 2).to_string()).exec();
+    die(&format!("restart: {err}"))
+}
+
 /// The 32 lowercase hex digits at `p` as 16 bytes (the first two digits the first byte, the low one of `lo`);
 /// None when one is not a digit or `a`..=`f`.
 #[inline(always)]
@@ -469,6 +490,11 @@ impl Interner {
             }
             i += 1;
         }
+        // LONG_PROBES slots in a row taken: the table is too small for this input (the locked maps would take the
+        // rest, some 8x slower). Nothing has been written yet when IDs are added: the run starts again with 4x
+        #[cfg(not(test))]
+        restart_long_bigger(self.lbits);
+        #[allow(unreachable_code)]
         0
     }
 

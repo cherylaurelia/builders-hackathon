@@ -751,7 +751,7 @@ fn release_regions(threads: usize) {
         if i >= pieces.len() {
             break;
         }
-        // SAFETY: a piece of a live anonymous mapping that nothing reads any more
+        // SAFETY: a piece of a live mapping (anonymous, or of an input file) that nothing reads any more
         unsafe { libc::madvise(pieces[i].0 as *mut libc::c_void, pieces[i].1, libc::MADV_DONTNEED) };
     };
     std::thread::scope(|sc| {
@@ -2374,8 +2374,7 @@ fn map_file(p: &Path) -> Bytes {
 struct InFile {
     f: File,
     len: usize,
-    map: usize,         // where the file is mapped (events and clicks: `map_inputs`), 0 when it is not
-    left: AtomicUsize,  // pieces of the parse queue not yet parsed: the thread that takes it to 0 unmaps the file
+    map: usize, // where the file is mapped (events and clicks: `map_inputs`), 0 when it is not
 }
 
 /// The `*.csv` files of `dir`, by name.
@@ -2393,7 +2392,7 @@ fn csv_files(dir: &Path) -> Vec<InFile> {
         .map(|p| {
             let f = File::open(p).unwrap_or_else(|e| die(&format!("open {}: {e}", p.display())));
             let len = f.metadata().unwrap_or_else(|e| die(&format!("stat {}: {e}", p.display()))).len() as usize;
-            InFile { f, len, map: 0, left: AtomicUsize::new(0) }
+            InFile { f, len, map: 0 }
         })
         .collect()
 }
@@ -2527,22 +2526,15 @@ fn map_inputs(files: &mut [InFile]) {
         let p = unsafe { libc::mmap(std::ptr::null_mut(), f.len, libc::PROT_READ, libc::MAP_SHARED, f.f.as_raw_fd(), 0) };
         if p != libc::MAP_FAILED {
             f.map = p as usize;
+            // its page table entries go at the end, on all threads (`release_regions`), not when its last piece is
+            // parsed: an unmap then held up the other threads (their TLBs shot down, the address space locked), and
+            // at the exit they would go on one thread. Intel 60M: the parse ends 0.923 -> 0.874 s
+            REGIONS.lock().unwrap_or_else(|_| die("region list poisoned")).push((p as usize, f.len));
         }
     }
 }
 #[cfg(not(target_os = "linux"))]
 fn map_inputs(_files: &mut [InFile]) {}
-
-/// One piece of the parse queue is done: the file's mapping goes when it was its last.
-fn piece_done(f: &InFile) {
-    if f.left.fetch_sub(1, Relaxed) == 1 && f.map != 0 {
-        #[cfg(target_os = "linux")]
-        // SAFETY: every piece of the file is parsed, and nothing keeps a pointer into the mapping
-        unsafe {
-            libc::munmap(f.map as *mut libc::c_void, f.len);
-        }
-    }
-}
 
 /// `read_span` without the copy where the file is mapped and the piece ends far enough before the file's end:
 /// (data, len, start, end), the data in the mapping. Every line that starts in [start, end) then has its newline
@@ -3308,9 +3300,6 @@ fn main() {
     let mut work = Vec::new();
     chunks_of(0, ev_files, chunk, &mut work);
     chunks_of(1, ck_files, chunk, &mut work);
-    for &(kind, fi, _, _) in &work {
-        (if kind == 0 { &ev_files[fi] } else { &ck_files[fi] }).left.fetch_add(1, Relaxed);
-    }
     read_ahead(
         link_files
             .iter()
@@ -3387,7 +3376,6 @@ fn main() {
                 }
             }
             st.buf = buf;
-            piece_done(f);
         },
     );
     // the records of groups not yet full, written by this thread (each parse thread fenced its own before the join)
@@ -3505,7 +3493,7 @@ fn main() {
         }
     }
     // every output file is written and closed: end here, without destructors. The kernel frees the memory, about
-    // 1 GB per 20M events and most of it in huge pages, in a few ms; no input file is mapped.
+    // 1 GB per 20M events and most of it in huge pages, in a few ms; the input mappings hold no pages any more.
     unsafe { libc::_exit(0) }
 }
 

@@ -2565,13 +2565,20 @@ fn map_inputs(files: &mut [InFile]) {
 #[cfg(not(target_os = "linux"))]
 fn map_inputs(_files: &mut [InFile]) {}
 
-/// One piece of the parse queue is done: the file's mapping goes when it was its last.
+/// One piece of the parse queue is done: when it was the file's last, the mapping's page table entries go.
+///
+/// The mapping itself stays (to the end of the process): `munmap` takes the address space's lock for writing, so
+/// every other thread's page fault (on its next piece of input, or the arenas' next pages) waited for each file's
+/// unmapping, and `MADV_DONTNEED` frees the same entries under the lock for reading. Left mapped and whole, the
+/// entries cost more still at the end: the exit frees the 2^19 of a 2 GB input on one thread (Intel 20M: parse 268
+/// ms with munmap, 261 with MADV_DONTNEED, 254 with neither, but then the run 11 ms longer).
 fn piece_done(f: &InFile) {
     if f.left.fetch_sub(1, Relaxed) == 1 && f.map != 0 {
         #[cfg(target_os = "linux")]
-        // SAFETY: every piece of the file is parsed, and nothing keeps a pointer into the mapping
+        // SAFETY: every piece of the file is parsed, and nothing keeps a pointer into the mapping; the file's pages
+        // stay in the page cache, and a read of the mapping would only fault them in again
         unsafe {
-            libc::munmap(f.map as *mut libc::c_void, f.len);
+            libc::madvise(f.map as *mut libc::c_void, f.len, libc::MADV_DONTNEED);
         }
     }
 }

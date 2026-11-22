@@ -328,11 +328,32 @@ impl HexTable {
         );
     }
 
+    /// Where the search for the ID `c` + the digits (hi, lo) starts.
+    #[inline(always)]
+    fn home(&self, c: u8, hi: u64, lo: u64) -> usize {
+        (spread(lo ^ hi.rotate_left(32) ^ c as u64) >> (64 - self.bits)) as usize
+    }
+
+    /// `home`, with its slot and tag on the way: the lookup (`key_from`) comes a few lines of input later.
+    #[inline(always)]
+    fn aim(&self, c: u8, hi: u64, lo: u64) -> u32 {
+        let h = self.home(c, hi, lo);
+        prefetch(unsafe { self.slots.as_ptr().add(h) });
+        prefetch(unsafe { self.tag.as_ptr().add(h) });
+        h as u32
+    }
+
     /// The key of the ID `c` + the digits (hi, lo), both non-zero; added if new.
     #[inline(always)]
     fn key(&self, c: u8, hi: u64, lo: u64) -> u64 {
+        self.key_from(self.home(c, hi, lo), c, hi, lo)
+    }
+
+    /// `key`, searching from its `home`.
+    #[inline(always)]
+    fn key_from(&self, home: usize, c: u8, hi: u64, lo: u64) -> u64 {
         let mask = self.slots.len() - 1;
-        let mut i = (spread(lo ^ hi.rotate_left(32) ^ c as u64) >> (64 - self.bits)) as usize;
+        let mut i = home & mask;
         let mut probes = 0usize;
         loop {
             // SAFETY: i <= mask
@@ -2682,8 +2703,32 @@ struct Batch {
     home: [u32; BATCH], // where the search for `ukey` starts
 }
 
+/// A key not known yet: the line's ID is a byte and 32 hex digits, held in `Shard::px` until it joins the batch,
+/// where its slot of the hex table is asked for and looked up a few lines later (`Shard::wait`, `Shard::drain`).
+/// No key is all ones (a hex key's slot is below 2^32).
+const PEND: u64 = u64::MAX;
+/// How many lines after it joins the batch a user ID of the hex table is looked up, and its ID table line asked for.
+const LAG: usize = 8;
+
+/// The hex IDs of the batch (`PEND`): `a` the event or click IDs, `u` the user IDs; bit i of a mask set while
+/// entry i waits.
+struct HexPend {
+    am: u64,
+    ac: [u8; BATCH],
+    ah: [u64; BATCH],
+    al: [u64; BATCH],
+    ahome: [u32; BATCH],
+    um: u64,
+    uc: [u8; BATCH],
+    uh: [u64; BATCH],
+    ul: [u64; BATCH],
+    uhome: [u32; BATCH],
+}
+
 /// One parse thread's output.
 struct Shard {
+    px: [(u8, u64, u64); 2], // the line's hex IDs (event or click ID, user ID) while their keys are PEND
+    hp: HexPend,
     arena: Arena,
     ev: Vec<Stream<ERec, EV_LINES>>,
     ck: Vec<Stream<CRec, CK_LINES>>,
@@ -2795,6 +2840,8 @@ impl Shard {
             buf: Vec::new(),
             ins: 0,
             bt: Batch { n: 0, a: [0; BATCH], b: [0; BATCH], ukey: [0; BATCH], tx: [0; BATCH], home: [0; BATCH] },
+            px: [(0, 0, 0); 2],
+            hp: HexPend { am: 0, ac: [0; BATCH], ah: [0; BATCH], al: [0; BATCH], ahome: [0; BATCH], um: 0, uc: [0; BATCH], uh: [0; BATCH], ul: [0; BATCH], uhome: [0; BATCH] },
             days: [NO_DAY; 64],
             dm: [NO_DAYM; 64],
             fm: [NO_MSM; 64],
@@ -2813,6 +2860,9 @@ impl Shard {
     /// stay in the L2 (Intel 20M: asking cost 1.4% wall).
     #[inline(never)]
     fn drain<const EVENTS: bool>(&mut self, cx: &Ctx) {
+        if self.hp.um | self.hp.am != 0 {
+            self.settle(cx);
+        }
         let Shard { arena, larena, ev, ck, lg, far, ins, bt, .. } = self;
         let n = bt.n.min(BATCH);
         bt.n = 0;
@@ -2855,6 +2905,55 @@ impl Shard {
         }
     }
 
+    /// The user ID of batch entry `j`, from the hex table (its slot asked for when it joined): its key, and its
+    /// line of the ID table asked for.
+    #[inline(always)]
+    fn settle_user(&mut self, cx: &Ctx, j: usize) {
+        let j = j & (BATCH - 1);
+        let hp = &mut self.hp;
+        let k = cx.names.hex.key_from(hp.uhome[j] as usize, hp.uc[j], hp.uh[j], hp.ul[j]);
+        hp.um &= !(1 << j);
+        self.bt.ukey[j] = k;
+        self.bt.home[j] = cx.ids.aim(k);
+    }
+
+    /// Every hex ID of the batch still waiting gets its key.
+    #[inline(never)]
+    fn settle(&mut self, cx: &Ctx) {
+        let mut m = self.hp.um;
+        while m != 0 {
+            self.settle_user(cx, m.trailing_zeros() as usize);
+            m &= m - 1;
+        }
+        let mut m = self.hp.am;
+        while m != 0 {
+            let j = m.trailing_zeros() as usize & (BATCH - 1);
+            let hp = &self.hp;
+            self.bt.a[j] = cx.names.hex.key_from(hp.ahome[j] as usize, hp.ac[j], hp.ah[j], hp.al[j]);
+            m &= m - 1;
+        }
+        self.hp.am = 0;
+    }
+
+    /// The key of the ID of `len` (> 0) bytes at `p` (33 readable), as `Interner::key_at`, except that an ID of the
+    /// hex table is PEND, held in px[w] (0: event or click ID, 1: user ID) for `wait` or `log`.
+    #[inline(always)]
+    unsafe fn idk(&mut self, cx: &Ctx, p: *const u8, len: usize, w: usize) -> u64 {
+        let k = pack_at(p, len);
+        if k != 0 {
+            return k;
+        }
+        if len == 33 && (*p).wrapping_sub(1) < 127 {
+            if let Some((hi, lo)) = hex128(p.add(1)) {
+                if hi != 0 && lo != 0 {
+                    *self.px.get_unchecked_mut(w & 1) = (*p, hi, lo);
+                    return PEND;
+                }
+            }
+        }
+        cx.names.intern(std::slice::from_raw_parts(p, len))
+    }
+
     /// A valid event (`events`) or click joins the batch, its user ID's line of the ID table asked for.
     #[inline(always)]
     fn wait(&mut self, cx: &Ctx, events: bool, a: u64, b: i64, ukey: u64, ts: i64, x: u32) {
@@ -2865,7 +2964,25 @@ impl Shard {
             *self.bt.b.get_unchecked_mut(i) = b;
             *self.bt.ukey.get_unchecked_mut(i) = ukey;
             *self.bt.tx.get_unchecked_mut(i) = ((ts - cx.base) as u32 as u64) << 32 | x as u64;
-            *self.bt.home.get_unchecked_mut(i) = cx.ids.aim(ukey);
+            if a == PEND {
+                let (c, hi, lo) = self.px[0];
+                let hp = &mut self.hp;
+                (*hp.ac.get_unchecked_mut(i), *hp.ah.get_unchecked_mut(i), *hp.al.get_unchecked_mut(i)) = (c, hi, lo);
+                *hp.ahome.get_unchecked_mut(i) = cx.names.hex.aim(c, hi, lo);
+                hp.am |= 1 << i;
+            }
+            if ukey == PEND {
+                let (c, hi, lo) = self.px[1];
+                let hp = &mut self.hp;
+                (*hp.uc.get_unchecked_mut(i), *hp.uh.get_unchecked_mut(i), *hp.ul.get_unchecked_mut(i)) = (c, hi, lo);
+                *hp.uhome.get_unchecked_mut(i) = cx.names.hex.aim(c, hi, lo);
+                hp.um |= 1 << i;
+            } else {
+                *self.bt.home.get_unchecked_mut(i) = cx.ids.aim(ukey);
+            }
+            if i >= LAG && (self.hp.um >> (i - LAG)) & 1 != 0 {
+                self.settle_user(cx, i - LAG);
+            }
         }
         self.bt.n = i + 1;
         if i + 1 == BATCH {
@@ -2880,6 +2997,12 @@ impl Shard {
     /// Any parsed event: its dedup record. `loc` = 0 for an invalid or late one.
     #[inline(always)]
     fn log(&mut self, cx: &Ctx, ekey: u64, ingest: i64, loc: u32) {
+        let ekey = if ekey == PEND {
+            let (c, hi, lo) = self.px[0];
+            cx.names.hex.key(c, hi, lo)
+        } else {
+            ekey
+        };
         let q = (spread(ekey) >> cx.qshift) as usize;
         let ing = cx.ing(ingest).unwrap_or_else(|| {
             self.far.push((ekey, loc, ingest));
@@ -3509,7 +3632,7 @@ unsafe fn fast_event(cx: &Ctx, line: *const u8, mut a: Cut, rest: *const u8, mut
     }
     let (is, il) = b.next();
     let Some(ingest) = ts_memo(rest.add(is), il, &mut st.days) else { return };
-    let ekey = cx.names.key_at(line.add(es), el);
+    let ekey = st.idk(cx, line.add(es), el, 0);
     let (us, ul) = a.next();
     let (ts, tl) = a.next();
     let (ks, kl) = b.next();
@@ -3529,7 +3652,8 @@ unsafe fn fast_event(cx: &Ctx, line: *const u8, mut a: Cut, rest: *const u8, mut
         }
         _ => return st.log(cx, ekey, ingest, 0),
     };
-    st.keep(cx, ekey, ingest, cx.names.key_at(line.add(us), ul), ts, pay);
+    let ukey = st.idk(cx, line.add(us), ul, 1);
+    st.keep(cx, ekey, ingest, ukey, ts, pay);
 }
 
 /// `fast_event` for a line split by `split_wide`; line[..192] is readable.
@@ -3540,7 +3664,7 @@ unsafe fn fast_event_at(cx: &Ctx, line: *const u8, f: [(usize, usize); 7], st: &
         return;
     }
     let Some(ingest) = ts_memo(line.add(is), il, &mut st.days) else { return };
-    let ekey = cx.names.key_at(line.add(es), el);
+    let ekey = st.idk(cx, line.add(es), el, 0);
     let ts = match ts_memo(line.add(ts), tl, &mut st.days) {
         Some(t) if ul != 0 && pl != 0 && t >= cx.ws && t < cx.we && ingest - t <= DAY => t,
         _ => return st.log(cx, ekey, ingest, 0),
@@ -3555,7 +3679,8 @@ unsafe fn fast_event_at(cx: &Ctx, line: *const u8, f: [(usize, usize); 7], st: &
         }
         _ => return st.log(cx, ekey, ingest, 0),
     };
-    st.keep(cx, ekey, ingest, cx.names.key_at(line.add(us), ul), ts, pay);
+    let ukey = st.idk(cx, line.add(us), ul, 1);
+    st.keep(cx, ekey, ingest, ukey, ts, pay);
 }
 
 /// The event line at `buf + p` through the two-window parser (`split_event`, `fast_event`), or, when that does not
@@ -3800,7 +3925,9 @@ unsafe fn fast_click(cx: &Ctx, line: *const u8, mut f: Cut, st: &mut Shard) {
         _ => return,
     };
     let Some(camp) = cx.campaigns.get_short(line.add(ks), kl) else { return };
-    st.click(cx, cx.names.key_at(line.add(cs), cl), cx.names.key_at(line.add(us), ul), t, camp);
+    let ck = st.idk(cx, line.add(cs), cl, 0);
+    let uk = st.idk(cx, line.add(us), ul, 1);
+    st.click(cx, ck, uk, t, camp);
 }
 
 /// The click line at `buf + p` through `split_click` and `fast_click`, or, when that does not take it, as a whole
@@ -3818,7 +3945,9 @@ unsafe fn click_line(cx: &Ctx, buf: *const u8, p: usize, len: usize, st: &mut Sh
                 if let Some(t) = ts_memo(line.add(ts), tl, &mut st.days) {
                     if t >= cx.base && t < cx.we {
                         if let Some(camp) = cx.campaigns.get_short(line.add(ks), kl) {
-                            st.click(cx, cx.names.key_at(line.add(cs), cl), cx.names.key_at(line.add(us), ul), t, camp);
+                            let ck = st.idk(cx, line.add(cs), cl, 0);
+                            let uk = st.idk(cx, line.add(us), ul, 1);
+                            st.click(cx, ck, uk, t, camp);
                         }
                     }
                 }

@@ -396,13 +396,7 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
                 break;
             }
         }
-        // the lines still waiting
-        let st = &mut *st;
-        while st.pn != 0 {
-            let p = st.pend[st.ph];
-            (st.ph, st.pn) = ((st.ph + 1) % PEND, st.pn - 1);
-            event_line(cx, buf, p, len, st);
-        }
+        flush::<true>(cx, buf, len, &mut *st);
     }
     st.drain::<true>(cx);
     sfence();
@@ -632,17 +626,32 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
                 day_fill(cx.ws, buf.add(l.ai[i] as usize), &mut (*st).dv);
             }
         }
-        l.cur[i] = defer_event(cx, buf, (l.cur[i] - 65 - l.e2[i]) as usize, len, l.c0[i], l.c1[i], &mut *st) as u64;
+        l.cur[i] = defer::<true>(cx, buf, (l.cur[i] - 65 - l.e2[i]) as usize, len, l.c0[i], l.c1[i], &mut *st) as u64;
     }
     true
 }
 
-/// Leaves the event line at `buf + p` (`c0`, `c1` the commas of its bytes 0..128) to `event_line` a few lines later,
+/// The lines `defer` left waiting, through `event_line` (`EVENTS`) or `click_line`.
+#[inline(never)]
+unsafe fn flush<const EVENTS: bool>(cx: &Ctx, buf: *const u8, len: usize, st: &mut Shard) {
+    while st.pn != 0 {
+        let p = st.pend[st.ph];
+        (st.ph, st.pn) = ((st.ph + 1) % PEND, st.pn - 1);
+        if EVENTS {
+            event_line(cx, buf, p, len, st);
+        } else {
+            click_line(cx, buf, p, len, st);
+        }
+    }
+}
+
+/// Leaves the event (`EVENTS`) or click line at `buf + p` (`c0`, `c1` the commas of its bytes 0..64, 64..128; c1 may
+/// be 0) to `event_line` or `click_line` a few lines later,
 /// after asking for the long-ID table's slots of its event_id and user_id when they look like long IDs (33 bytes,
 /// quoted or not), and runs `event_line` on the line that waited longest when `Shard::pend` is full. Returns
 /// where the next line starts. (A wrong guess only asks for a slot in vain: `event_line` does the parse.)
 #[inline(never)]
-unsafe fn defer_event(cx: &Ctx, buf: *const u8, p: usize, len: usize, c0: u64, c1: u64, st: &mut Shard) -> usize {
+unsafe fn defer<const EVENTS: bool>(cx: &Ctx, buf: *const u8, p: usize, len: usize, c0: u64, c1: u64, st: &mut Shard) -> usize {
     let line = buf.add(p);
     let c = c0 as u128 | (c1 as u128) << 64;
     if c != 0 {
@@ -666,7 +675,11 @@ unsafe fn defer_event(cx: &Ctx, buf: *const u8, p: usize, len: usize, c0: u64, c
         let q = st.pend[st.ph];
         st.pend[st.ph] = p;
         st.ph = (st.ph + 1) % PEND;
-        event_line(cx, buf, q, len, st);
+        if EVENTS {
+            event_line(cx, buf, q, len, st);
+        } else {
+            click_line(cx, buf, q, len, st);
+        }
     } else {
         st.pend[(st.ph + st.pn) % PEND] = p;
         st.pn += 1;
@@ -736,6 +749,7 @@ pub unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
                 break;
             }
         }
+        flush::<false>(cx, buf, len, &mut *st);
     }
     st.drain::<false>(cx);
     sfence();
@@ -878,7 +892,7 @@ unsafe fn click_batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &
             day_fill(cx.ws, buf.add(l.at[i] as usize), &mut (*st).dv);
         }
         // where the line starts: its walk went e + 1 past it
-        l.cur[i] = click_line(cx, buf, (l.cur[i] - 1 - l.e[i]) as usize, len, &mut *st) as u64;
+        l.cur[i] = defer::<false>(cx, buf, (l.cur[i] - 1 - l.e[i]) as usize, len, l.c[i], 0, &mut *st) as u64;
     }
     true
 }

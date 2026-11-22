@@ -2385,6 +2385,48 @@ unsafe fn split_event(line: *const u8) -> Option<(Cut, Cut, usize, usize)> {
     Some((Cut { s: sa, e: ea }, Cut { s: sb, e: eb }, o, o + b3.trailing_zeros() as usize + 1))
 }
 
+/// `split::<N>` of the line at `line`, through 64-byte windows that each start where a field starts: every field as
+/// (start, length) in the line, quotes removed, and the line's length with its `\n`. None sends the line to `split`:
+/// it is malformed, or a field is longer than 63 bytes. 64 bytes past the line's end must be readable.
+///
+/// For the lines `split_event` and `split_click` do not take: long IDs (v5) push their fields past the first window.
+#[inline(always)]
+unsafe fn split_n<const N: usize>(line: *const u8) -> Option<([(usize, usize); N], usize)> {
+    let mut f = [(0, 0); N];
+    let (mut pos, mut i) = (0, 0);
+    loop {
+        let [c, q, n] = masks64(line.add(pos));
+        let b = c | n;
+        if b == 0 {
+            return None;
+        }
+        // the boundaries this window gives: all it has, or as many as the line still wants
+        let take = (b.count_ones() as usize).min(N - i);
+        let mut k = b;
+        for _ in 1..take {
+            k = drop_low(k);
+        }
+        let last = k & k.wrapping_neg();
+        let m = last ^ last.wrapping_sub(1);
+        let (mut fs, mut fe, bad) = window(b & m, q & m);
+        // a newline only as the last boundary of all
+        let nl = if i + take == N { last } else { 0 };
+        if bad | ((n & m) ^ nl) != 0 {
+            return None;
+        }
+        for _ in 0..take {
+            let (a, e) = (fs.trailing_zeros() as usize, fe.trailing_zeros() as usize);
+            (fs, fe) = (drop_low(fs), drop_low(fe));
+            *f.get_unchecked_mut(i) = (pos + a, e - a);
+            i += 1;
+        }
+        pos += last.trailing_zeros() as usize + 1;
+        if i == N {
+            return Some((f, pos));
+        }
+    }
+}
+
 /// `split::<4>` of the click line at `line` (72 bytes must be readable), as `split_event`: its fields, and its
 /// length with its `\n`. None unless the whole line is in its first 64 bytes.
 #[inline(always)]
@@ -2625,8 +2667,8 @@ struct Shard {
     // the dates the 512-bit event loop remembers (`wide::parse_events`)
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
     dv: wide::DayV,
-    // event lines the 512-bit loop leaves to `event_line`, a few lines later: their long IDs' slots were asked for
-    // (`wide::defer_event`); `pn` of them from `ph` on, in a ring
+    // event or click lines the 512-bit loops leave to `event_line` or `click_line`, a few lines later: their long IDs' slots were asked for
+    // (`wide::defer`); `pn` of them from `ph` on, in a ring
     #[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
     pend: [usize; PEND],
     #[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
@@ -3462,13 +3504,44 @@ unsafe fn fast_event(cx: &Ctx, line: *const u8, mut a: Cut, rest: *const u8, mut
     st.keep(cx, ekey, ingest, cx.names.key_at(line.add(us), ul), ts, pay);
 }
 
-/// The event line at `buf + p` through the two-window parser (`split_event`, `fast_event`), or, when that does not
-/// take it, as a whole line through `split` and `event_fields`. Returns where the next line starts.
+/// `fast_event` for the line at `line` with its fields `f` (`split_n`).
+#[inline(always)]
+unsafe fn fast_event_n(cx: &Ctx, line: *const u8, f: [(usize, usize); 7], st: &mut Shard) {
+    let [(es, el), (us, ul), (ts, tl), (is, il), (ks, kl), (ps, pl), (cs, cl)] = f;
+    if el == 0 {
+        return;
+    }
+    let Some(ingest) = ts_memo(line.add(is), il, &mut st.days) else { return };
+    let ekey = cx.names.key_at(line.add(es), el);
+    let ts = match ts_memo(line.add(ts), tl, &mut st.days) {
+        Some(t) if ul != 0 && pl != 0 && t >= cx.ws && t < cx.we && ingest - t <= DAY => t,
+        _ => return st.log(cx, ekey, ingest, 0),
+    };
+    let w = (line.add(ks) as *const u64).read_unaligned();
+    let pay = match kl {
+        4 if w as u32 == u32::from_le_bytes(*b"view") || w as u32 == u32::from_le_bytes(*b"cart") => 0,
+        8 if w == u64::from_le_bytes(*b"purchase") => {
+            let Some(p) = parse_price(std::slice::from_raw_parts(line.add(cs), cl)) else { return st.log(cx, ekey, ingest, 0) };
+            let cat = cx.products.get_at(line.add(ps), pl).unwrap_or(cx.unknown_cat);
+            (cat as u32) << 24 | p
+        }
+        _ => return st.log(cx, ekey, ingest, 0),
+    };
+    st.keep(cx, ekey, ingest, cx.names.key_at(line.add(us), ul), ts, pay);
+}
+
+/// The event line at `buf + p` through the two-window parser (`split_event`, `fast_event`) or the window walk
+/// (`split_n`, `fast_event_n`), or, when neither takes it, as a whole line through `split` and `event_fields`.
+/// Returns where the next line starts.
 #[inline(never)]
 unsafe fn event_line(cx: &Ctx, buf: *const u8, p: usize, len: usize, st: &mut Shard) -> usize {
     let line = buf.add(p);
     if let Some((a, b, o, n)) = split_event(line) {
         fast_event(cx, line, a, line.add(o), b, st);
+        return p + n;
+    }
+    if let Some((f, n)) = split_n::<7>(line) {
+        fast_event_n(cx, line, f, st);
         return p + n;
     }
     let file = std::slice::from_raw_parts(buf, len);
@@ -3700,13 +3773,32 @@ unsafe fn fast_click(cx: &Ctx, line: *const u8, mut f: Cut, st: &mut Shard) {
     st.click(cx, cx.names.key_at(line.add(cs), cl), cx.names.key_at(line.add(us), ul), t, camp);
 }
 
-/// The click line at `buf + p` through `split_click` and `fast_click`, or, when that does not take it, as a whole
-/// line through `split` and `click_fields`. Returns where the next line starts.
+/// `fast_click` for the line at `line` with its fields `f` (`split_n`).
+#[inline(always)]
+unsafe fn fast_click_n(cx: &Ctx, line: *const u8, f: [(usize, usize); 4], st: &mut Shard) {
+    let [(cs, cl), (us, ul), (ks, kl), (ts, tl)] = f;
+    if cl == 0 || ul == 0 {
+        return;
+    }
+    let t = match ts_memo(line.add(ts), tl, &mut st.days) {
+        Some(t) if t >= cx.base && t < cx.we => t,
+        _ => return,
+    };
+    let Some(camp) = cx.campaigns.get_short(line.add(ks), kl) else { return };
+    st.click(cx, cx.names.key_at(line.add(cs), cl), cx.names.key_at(line.add(us), ul), t, camp);
+}
+
+/// The click line at `buf + p` through `split_click` and `fast_click` or `split_n` and `fast_click_n`, or, when
+/// neither takes it, as a whole line through `split` and `click_fields`. Returns where the next line starts.
 #[inline(never)]
 unsafe fn click_line(cx: &Ctx, buf: *const u8, p: usize, len: usize, st: &mut Shard) -> usize {
     let line = buf.add(p);
     if let Some((f, n)) = split_click(line) {
         fast_click(cx, line, f, st);
+        return p + n;
+    }
+    if let Some((f, n)) = split_n::<4>(line) {
+        fast_click_n(cx, line, f, st);
         return p + n;
     }
     let file = std::slice::from_raw_parts(buf, len);
@@ -5415,10 +5507,19 @@ mod tests {
             return String::new();
         }
         let id = |r: &mut Rng, c: char| -> String {
-            match r.below(12) {
+            match r.below(14) {
                 0 => String::new(),
                 1 => format!("{c}{}", "x".repeat(r.below(40))),
                 2 => format!(" {c}{}", r.below(1000)),
+                // v5: a prefix and 32 hex digits (now and then not lowercase, or one short)
+                3 | 4 => {
+                    let h = format!("{c}{:016x}{:016x}", r.next(), r.next());
+                    match r.below(8) {
+                        0 => h.to_uppercase(),
+                        1 => h[..32].to_string(),
+                        _ => h,
+                    }
+                }
                 _ => format!("{c}{:x}", r.next() % (1u64 << (4 * (4 + r.below(8))))),
             }
         };
@@ -5796,6 +5897,7 @@ mod tests {
                     format!("{c}{}", b36(r, n))
                 }
                 2..=5 => format!("{c}{}", b36(r, 7)),
+                6..=10 => format!("{c}{:016x}{:016x}", r.next(), r.next()),
                 _ => format!("{c}{}", b36(r, 8)),
             }
         }
@@ -5917,6 +6019,7 @@ mod tests {
             4 => format!("{c}{}\u{7f}", edge_b36(r, 7)),
             5 => format!("{c}{}é", edge_b36(r, 6)),
             6..=20 => format!("{c}{}", edge_b36(r, 7)),
+            21..=28 => format!("{c}{:016x}{:016x}", r.next(), r.next()),
             _ => format!("{c}{}", edge_b36(r, 8)),
         }
     }

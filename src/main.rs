@@ -3493,9 +3493,10 @@ fn main() {
                         }
                         partition_work(cx, shards, order[i].1, &mut w);
                     }
-                    let cred: Vec<Cred> = w.cred.iter().zip(&w.buy).map(|(&c, b)| Cred { sessions: c, purchasing: b.purchasing }).collect();
+                    let cred: Vec<Cred> =
+                        w.cell.iter().zip(&w.cwrap).zip(&w.buy).map(|((c, &x), b)| Cred { sessions: c[0] as u32 + (x << 8), purchasing: b.purchasing }).collect();
                     let rev: Vec<i64> = w.buy.iter().map(|b| b.revenue).collect();
-                    let assist: Vec<u32> = w.assist.iter().zip(&w.around).map(|(&a, &r)| a as u32 + (r << 16)).collect();
+                    let assist: Vec<u32> = w.cell.iter().zip(&w.around).map(|(c, &r)| c[1] as u32 + (r << 8)).collect();
                     tx.send((cred, rev, assist)).unwrap_or_else(|_| die("campaign merger gone"));
                     // thread 0 writes even with no rows: the table needs at least one file
                     if t == 0 || !w.rows.is_empty() {
@@ -4563,9 +4564,9 @@ struct Work {
     // Per campaign and day (cell = campaign * days + day), in arrays of their own so that the ones every session
     // touches stay small: sessions credited; sessions assisted, in 16 bits with the times each count went round
     // apart (`around`); and for the credited sessions with a purchase their number and revenue.
-    cred: Vec<u32>,
-    assist: Vec<u16>,
-    around: Vec<u32>,
+    cell: Vec<[u8; 2]>, // sessions credited, sessions assisted: each modulo 256, in one line of the cache
+    cwrap: Vec<u32>,    // the times the credit count went round
+    around: Vec<u32>,   // the times the assist count went round
     buy: Vec<Buy>,
     doff: i64, // ts (ms after `Ctx::base`) + doff = ms after the midnight that starts day 0 of the window
     start: Vec<u32>, // see partition_work
@@ -4609,8 +4610,8 @@ impl Work {
         Work {
             rows: huge_vec(rows_cap),
             people: huge_vec(rows_cap / 2),
-            cred: filled(cells, 0),
-            assist: filled(cells, 0),
+            cell: filled(cells, [0, 0]),
+            cwrap: filled(cells, 0),
             around: filled(cells, 0),
             buy: filled(cells, Buy { purchasing: 0, revenue: 0 }),
             doff: cx.base - cx.day0 * DAY,
@@ -5072,10 +5073,10 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u32], pa: usize, np: usize, ca: usize
 
     // credit and assists
     if nc == 0 {
-        let Work { cred, buy, ses, .. } = w;
+        let Work { cell, cwrap, buy, ses, .. } = w;
         let (width, organic) = (cx.ndays, cx.ncamp);
         for s in &ses[..ns] {
-            credit(cred, buy, organic * width + s.d as usize, s.rev);
+            credit(cell, cwrap, buy, organic * width + s.d as usize, s.rev);
         }
     } else if nc <= 64 {
         credit_clicks(cx, ca, nc, ns, w);
@@ -5086,18 +5087,22 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u32], pa: usize, np: usize, ca: usize
 
 /// `n` more sessions assisted by the campaign on the day of cell `at`.
 #[inline(always)]
-fn assisted(assist: &mut [u16], around: &mut [u32], at: usize, n: u32) {
-    let v = assist[at] as u32 + n;
-    assist[at] = v as u16;
-    if v >> 16 != 0 {
-        around[at] += v >> 16;
+fn assisted(cell: &mut [[u8; 2]], around: &mut [u32], at: usize, n: u32) {
+    let v = cell[at][1] as u32 + n;
+    cell[at][1] = v as u8;
+    if v >> 8 != 0 {
+        around[at] += v >> 8;
     }
 }
 
 /// A session credited to the campaign and day of cell `at`.
 #[inline(always)]
-fn credit(cred: &mut [u32], buy: &mut [Buy], at: usize, revenue: i64) {
-    cred[at] += 1;
+fn credit(cell: &mut [[u8; 2]], cwrap: &mut [u32], buy: &mut [Buy], at: usize, revenue: i64) {
+    let v = cell[at][0].wrapping_add(1);
+    cell[at][0] = v;
+    if v == 0 {
+        cwrap[at] += 1;
+    }
     if revenue != 0 {
         let b = &mut buy[at];
         b.purchasing += 1;
@@ -5111,9 +5116,9 @@ fn credit(cred: &mut [u32], buy: &mut [Buy], at: usize, revenue: i64) {
 #[inline(never)]
 fn credit_clicks(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
     let (width, organic) = (cx.ndays, cx.ncamp);
-    let Work { cred, assist, around, buy, ses, ck, cts, ccamp, eq, .. } = w;
+    let Work { cell, cwrap, around, buy, ses, ck, cts, ccamp, eq, .. } = w;
     let cs = &ck[ca..ca + nc];
-    assert!(nc <= 64 && assist.len() == (organic + 1) * width);
+    assert!(nc <= 64 && cell.len() == (organic + 1) * width);
     for (j, c) in cs.iter().enumerate() {
         // SAFETY: j < nc <= 64, and the arrays hold 72
         unsafe {
@@ -5144,19 +5149,19 @@ fn credit_clicks(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
             }
             let at = if m != 0 { *cp.add(best) as usize } else { organic * width } + d;
             // assists: one click of each campaign in the window
-            let day = assist.as_mut_ptr().add(d);
+            let day = cell.as_mut_ptr().add(d);
             let mut c = m;
             while c != 0 {
                 let j = c.trailing_zeros() as usize;
                 let a = day.add(*cp.add(j) as usize);
-                let v = (*a).wrapping_add(1);
-                *a = v;
+                let v = (*a)[1].wrapping_add(1);
+                (*a)[1] = v;
                 if v == 0 {
                     around[*cp.add(j) as usize + d] += 1;
                 }
                 c &= !*eq.get_unchecked(j);
             }
-            credit(cred, buy, at, s.rev);
+            credit(cell, cwrap, buy, at, s.rev);
         }
     }
 }
@@ -5202,7 +5207,7 @@ fn sort_clicks(v: &mut [CRec], tmp: &mut Vec<CRec>, cnt: &mut [u32]) {
 fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
     let width = cx.ndays;
     let organic = cx.ncamp;
-    let Work { cred, assist, around, buy, stamp, iv, seen, sctr, sessions, touched, ck, ckt, sat, ses, sbit, spre, sday, .. } = w;
+    let Work { cell, cwrap, around, buy, stamp, iv, seen, sctr, sessions, touched, ck, ckt, sat, ses, sbit, spre, sday, .. } = w;
     sort_clicks(&mut ck[ca..ca + nc], ckt, sat);
     let cs: &[CRec] = &ck[ca..ca + nc];
     sessions.clear();
@@ -5210,7 +5215,6 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
 
     let cts = |c: &CRec| c.ts() as i64;
     let ccamp = |c: &CRec| c.camp() as usize;
-    let mut credit = |camp: usize, s: &Sess| credit(cred, buy, camp * width + s.d, s.revenue);
     // the campaign of the latest click among cs[lo..hi] (all at or before the session start); tie -> smallest click_id
     let latest = |lo: usize, hi: usize| -> usize {
         let t = cts(&cs[hi - 1]);
@@ -5248,11 +5252,11 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
                     let kk = ccamp(c);
                     if seen[kk] != *sctr {
                         seen[kk] = *sctr;
-                        assisted(assist, around, kk * width + s.d, 1);
+                        assisted(cell, around, kk * width + s.d, 1);
                     }
                 }
             }
-            credit(camp, s);
+            credit(cell, cwrap, buy, camp * width + s.d, s.revenue);
         }
     } else {
         // credit: latest click with start - 7d <= ts <= start
@@ -5265,7 +5269,7 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
             if q > 0 && s.start - cts(&cs[q - 1]) <= WEEK {
                 camp = latest(0, q);
             }
-            credit(camp, s);
+            credit(cell, cwrap, buy, camp * width + s.d, s.revenue);
         }
         // assists: a click at t assists sessions starting in [t, t + 7d]; merge per campaign. The sessions of an
         // interval without a search: at most one session starts in a 30-minute bin (two starts are more than 30
@@ -5303,7 +5307,7 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
                 return;
             }
             for d in ses[a].d as usize..=ses[b - 1].d as usize {
-                assisted(assist, around, k * width + d, (sday[d + 1] as usize).min(b) as u32 - (sday[d] as usize).max(a) as u32);
+                assisted(cell, around, k * width + d, (sday[d + 1] as usize).min(b) as u32 - (sday[d] as usize).max(a) as u32);
             }
         };
         touched.clear();

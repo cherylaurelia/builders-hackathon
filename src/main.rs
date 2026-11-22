@@ -5946,8 +5946,8 @@ fn put_name(b: &mut Vec<u8>, names: &Interner, k: u64, tmp: &mut Vec<u8>) {
 fn put_delta(b: &mut Vec<u8>, n: usize, get: impl Fn(usize) -> i64) {
     let zz = |x: i64| ((x << 1) ^ (x >> 63)) as u64;
     // room for everything at once: four varints, then per block a varint, four widths and up to 128 * 8 bytes
-    // (+ 8: a packed value is stored as a whole word)
-    b.reserve(48 + n.div_ceil(128) * (16 + 1024) + 8);
+    // (+ 16: packed values are stored as whole words of up to 16 bytes)
+    b.reserve(48 + n.div_ceil(128) * (16 + 1024) + 16);
     // SAFETY: every write below stays inside the room just reserved
     unsafe {
         let start = b.as_mut_ptr().add(b.len());
@@ -5994,6 +5994,26 @@ fn put_delta(b: &mut Vec<u8>, n: usize, get: impl Fn(usize) -> i64) {
                 let w = w[k] as u32;
                 let vals = &r[k * 32..k * 32 + 32];
                 if w == 0 {
+                    continue;
+                }
+                #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+                if w <= 16 {
+                    use std::arch::x86_64::_pext_u64;
+                    // 8 values a step: as bytes (w <= 8) or 16-bit lanes of words, their low w bits taken out by
+                    // pext are 8w bits in the order of the values, written whole (16 bytes) and w bytes counted
+                    for e in vals.chunks_exact(8) {
+                        if w <= 8 {
+                            let word = e.iter().enumerate().fold(0u64, |a, (j, &x)| a | x << (8 * j));
+                            (p as *mut u64).write_unaligned(_pext_u64(word, 0x0101_0101_0101_0101 * ((1 << w) - 1)).to_le());
+                        } else {
+                            let m = 0x0001_0001_0001_0001 * ((1 << w) - 1);
+                            let lo = e[..4].iter().enumerate().fold(0u64, |a, (j, &x)| a | x << (16 * j));
+                            let hi = e[4..].iter().enumerate().fold(0u64, |a, (j, &x)| a | x << (16 * j));
+                            let v = _pext_u64(lo, m) as u128 | (_pext_u64(hi, m) as u128) << (4 * w);
+                            (p as *mut u128).write_unaligned(v.to_le());
+                        }
+                        p = p.add(w as usize);
+                    }
                     continue;
                 }
                 if w <= 56 {

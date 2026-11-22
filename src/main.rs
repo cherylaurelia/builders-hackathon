@@ -3287,7 +3287,7 @@ fn main() {
     let ids = IdTable::new(id_bits, pbits);
     // the long-ID table: user IDs only (an event ID is a `LONG_EV` key, a click ID a `KEPT` one), one in eight of
     // them long in generated data; about a quarter full
-    let lbits = env_num("SESS_LONG_BITS").map(|v| v as u32).unwrap_or(usize::BITS - (id_est / 4).max(1).leading_zeros()).clamp(12, 28);
+    let lbits = env_num("SESS_LONG_BITS").map(|v| v as u32).unwrap_or(usize::BITS - (id_est / 3).max(1).leading_zeros()).clamp(12, 28);
     let names = Interner::sized(lbits, threads);
     mark("files listed, ID table mapped");
     let (n_links, small) = std::thread::scope(|sc| {

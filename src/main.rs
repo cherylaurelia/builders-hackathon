@@ -3285,8 +3285,11 @@ fn main() {
     // ~1 in 40 event lines brings an unlinked ID; an event line is ~75 bytes. v5 60M: 4.45M IDs, 71% of the
     // limit of 2^23 slots (at link_bytes / 14 it was 2^24: twice the table to zero and to flatten, 4% of the run
     // on the box). A wrong guess costs speed, never rows: the ID table restarts the run when it fills up.
+    // The estimate is high: generated v5 data has 0.74 of it (20M: 1.48M IDs of 2.00M, 60M: 4.44M of 5.99M).
+    // The table takes 3/4 of its slots (`IdTable::limit`), so slots > 5/4 x the estimate leave ~27% room over
+    // that ratio. (7/5 put v5 60M sets right at 2^23 slots: those a few MB larger got 2^24, Intel 60M +1.8%.)
     let id_est = link_bytes / 18 + ev_bytes / 3000 + bytes(&ck_files) / 3000;
-    let id_bits = env_num("SESS_ID_BITS").map(|v| v as u32).unwrap_or(usize::BITS - (id_est * 7 / 5).leading_zeros()).clamp(16, 30);
+    let id_bits = env_num("SESS_ID_BITS").map(|v| v as u32).unwrap_or(usize::BITS - (id_est * 5 / 4).leading_zeros()).clamp(16, 30);
     // about 90,000 events per person partition and per event-key bucket: more of them slow the parse (one open
     // block each per thread), fewer leave the later phases with work that no longer fits a core's cache
     let ev_est = ev_bytes / 72;

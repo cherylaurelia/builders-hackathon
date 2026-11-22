@@ -5263,16 +5263,18 @@ unsafe fn bin_events(evs: &[u32], bp: *mut Bin, wp: *mut u64) -> u64 {
     let mut one = |ts: u32| {
         let b = (ts / GAP as u32) as usize;
         let bin = bp.add(b);
-        (*bin).cnt += 1;
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
             use std::arch::x86_64::*;
-            // lanes (ts, !ts) against the bin's (min, nmax)
-            let t = _mm_xor_si128(_mm_set1_epi32(ts as i32), _mm_setr_epi32(0, -1, 0, 0));
-            _mm_storel_epi64(bin as *mut __m128i, _mm_min_epu32(_mm_loadl_epi64(bin as *const __m128i), t));
+            // the whole bin at once: lanes (ts, !ts, MAX, MAX) against (min, nmax, cnt, sess), then cnt + 1
+            let t = _mm_xor_si128(_mm_set1_epi32(ts as i32), _mm_setr_epi32(0, -1, -1, -1));
+            let t = _mm_or_si128(t, _mm_setr_epi32(0, 0, -1, -1));
+            let v = _mm_min_epu32(_mm_loadu_si128(bin as *const __m128i), t);
+            _mm_storeu_si128(bin as *mut __m128i, _mm_add_epi32(v, _mm_setr_epi32(0, 0, 1, 0)));
         }
         #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
         {
+            (*bin).cnt += 1;
             (*bin).min = (*bin).min.min(ts);
             (*bin).nmax = (*bin).nmax.min(!ts);
         }

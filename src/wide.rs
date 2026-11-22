@@ -525,7 +525,7 @@ unsafe fn unlong(c0: __m512i, c1: __m512i, q0: __m512i, q1: __m512i, o0: __m512i
 /// when no walk stood on a line of its part: the piece is done.
 ///
 /// The usual line: its first 64 bytes are 0x20..=0x7F, its third comma is among the first 63 of them and its
-/// newline within 64 bytes of the fourth field's start; seven fields, well quoted; both IDs 8 or 9 bytes; ts is
+/// newline within 64 bytes of the fourth field's start; seven fields, well quoted; both IDs 1 to 9 bytes; ts is
 /// F1 or F2 of a date seen before, or 13 digits, and valid; ingest_ts is a valid F1 of a date seen before;
 /// event_type is `view`, `cart` or `purchase`. For such a line this does what `event_fields` does.
 #[inline]
@@ -589,10 +589,11 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
     let il = _mm512_sub_epi64(r1, _mm512_add_epi64(qi, qi));
     // (each compare takes the lanes the one before left: one instruction, where an AND of two masks is two)
     // three commas in the first 63 bytes, the newline inside the second window (and so in bytes 64..128); both
-    // IDs 8 or 9 bytes (the two lengths less 8 are both 0 or 1), ingest_ts 20, ts 13, 20 or 25: every start is
+    // IDs 1 to 9 bytes, ingest_ts 20, ts 13, 20 or 25: every start is
     // then within the first 66 bytes
     let k_w = _mm512_mask_cmple_epu64_mask(_mm512_mask_cmplt_epu64_mask(_mm512_test_epi64_mask(t2, t2), e2, o), p3, k!(62));
-    let k_len = _mm512_mask_cmpeq_epi64_mask(_mm512_mask_cmple_epu64_mask(k_w, _mm512_or_si512(_mm512_sub_epi64(el, k!(8)), _mm512_sub_epi64(ul, k!(8))), one), il, k!(20));
+    let k_len = _mm512_mask_cmple_epu64_mask(_mm512_mask_cmple_epu64_mask(k_w, _mm512_sub_epi64(el, one), k!(8)), _mm512_sub_epi64(ul, one), k!(8));
+    let k_len = _mm512_mask_cmpeq_epi64_mask(k_len, il, k!(20));
     let (kf1, kf2, kf3) = (_mm512_mask_cmpeq_epi64_mask(k_len, tl, k!(20)), _mm512_mask_cmpeq_epi64_mask(k_len, tl, k!(25)), _mm512_mask_cmpeq_epi64_mask(k_len, tl, k!(13)));
     let k_pos = kf1 | kf2 | kf3;
     // any other lane copies from its line's start
@@ -651,8 +652,10 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
     // ---- D: the copies, a word of every line to a register
     let (elo, ehi) = words2!(l.se);
     let (ulo, uhi) = words2!(l.su);
-    let ekey = pack8(elo, ehi, _mm512_cmpeq_epi64_mask(el, k!(9)));
-    let ukey = pack8(ulo, uhi, _mm512_cmpeq_epi64_mask(ul, k!(9)));
+    // an ID of 1 to 7 bytes: the bytes after it (its comma, ...) cleared first (8 and 9: a shift by 64 or more is 0)
+    let below = |n: __m512i| _mm512_andnot_si512(_mm512_sllv_epi64(m1, _mm512_slli_epi64::<3>(n)), m1);
+    let ekey = pack8(_mm512_and_si512(elo, below(el)), ehi, _mm512_cmpeq_epi64_mask(el, k!(9)));
+    let ukey = pack8(_mm512_and_si512(ulo, below(ul)), uhi, _mm512_cmpeq_epi64_mask(ul, k!(9)));
     let (w0, w1, w2, w3) = words4!(l.st);
     let (i0, i1, i2, i3) = words4!(l.si);
     let dv: *const DayV = &(*st).dv;

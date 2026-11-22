@@ -396,6 +396,13 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
                 break;
             }
         }
+        // the lines still waiting
+        let st = &mut *st;
+        while st.pn != 0 {
+            let p = st.pend[st.ph];
+            (st.ph, st.pn) = ((st.ph + 1) % PEND, st.pn - 1);
+            event_line(cx, buf, p, len, st);
+        }
     }
     st.drain::<true>(cx);
     sfence();
@@ -625,9 +632,46 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
                 day_fill(cx.ws, buf.add(l.ai[i] as usize), &mut (*st).dv);
             }
         }
-        l.cur[i] = event_line(cx, buf, (l.cur[i] - 65 - l.e2[i]) as usize, len, &mut *st) as u64;
+        l.cur[i] = defer_event(cx, buf, (l.cur[i] - 65 - l.e2[i]) as usize, len, l.c0[i], l.c1[i], &mut *st) as u64;
     }
     true
+}
+
+/// Leaves the event line at `buf + p` (`c0`, `c1` the commas of its bytes 0..128) to `event_line` a few lines later,
+/// after asking for the long-ID table's slots of its event_id and user_id when they look like long IDs (33 bytes,
+/// quoted or not), and runs `event_line` on the line that waited longest when `Shard::pend` is full. Returns
+/// where the next line starts. (A wrong guess only asks for a slot in vain: `event_line` does the parse.)
+#[inline(never)]
+unsafe fn defer_event(cx: &Ctx, buf: *const u8, p: usize, len: usize, c0: u64, c1: u64, st: &mut Shard) -> usize {
+    let line = buf.add(p);
+    let c = c0 as u128 | (c1 as u128) << 64;
+    if c != 0 {
+        let p1 = c.trailing_zeros() as usize;
+        let q = (*line == b'"') as usize;
+        if p1 == 33 + 2 * q {
+            cx.names.prefetch_long(line.add(q + 1));
+        }
+        let c2 = c & (c - 1);
+        if c2 != 0 {
+            let (s, p2) = (p1 + 1, c2.trailing_zeros() as usize);
+            let q = (*line.add(s) == b'"') as usize;
+            if p2 == s + 33 + 2 * q {
+                cx.names.prefetch_long(line.add(s + q + 1));
+            }
+        }
+    }
+    // SAFETY: buf[len] is a newline
+    let e = p + memchr::memchr(b'\n', std::slice::from_raw_parts(line, len + 1 - p)).unwrap_or(len - p);
+    if st.pn == PEND {
+        let q = st.pend[st.ph];
+        st.pend[st.ph] = p;
+        st.ph = (st.ph + 1) % PEND;
+        event_line(cx, buf, q, len, st);
+    } else {
+        st.pend[(st.ph + st.pn) % PEND] = p;
+        st.pn += 1;
+    }
+    e + 1
 }
 
 // ---------------------------------------------------------------- clicks

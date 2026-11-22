@@ -332,6 +332,20 @@ impl Interner {
         unsafe { &*(self.long as *const LongSlot).add(i & ((1 << self.lbits) - 1)) }
     }
 
+    /// Where the search for the ID whose 32 hex digits are at `p` starts (the prefix plays no part): a hash of
+    /// the digits as they are, so that `prefetch_long` need not check or convert them.
+    #[inline(always)]
+    unsafe fn long_home(&self, p: *const u8) -> usize {
+        let w = |k: usize| (p.add(8 * k) as *const u64).read_unaligned();
+        (mix(w(0) ^ w(1).rotate_left(16) ^ w(2).rotate_left(32) ^ w(3).rotate_left(48)) >> (64 - self.lbits)) as usize
+    }
+
+    /// Asks for the slot where the search for the ID whose 32 hex digits are at `p` starts.
+    #[inline(always)]
+    unsafe fn prefetch_long(&self, p: *const u8) {
+        prefetch(self.slot(self.long_home(p)) as *const LongSlot);
+    }
+
     /// The key of the `len` (33..=40) bytes at `p` from the long-ID table, when they are a prefix and 32 lowercase hex
     /// digits and the table has room near the ID's home; else 0.
     #[inline(never)]
@@ -342,7 +356,7 @@ impl Interner {
             return 0;
         }
         let Some((lo, hi)) = hex32(p.add(plen)) else { return 0 };
-        let mut i = (mix(lo ^ hi.rotate_left(29) ^ pre) >> (64 - self.lbits)) as usize;
+        let mut i = self.long_home(p.add(plen));
         for _ in 0..LONG_PROBES {
             let s = self.slot(i);
             let mut m = s.meta.load(Acquire);
@@ -2611,7 +2625,17 @@ struct Shard {
     // the dates the 512-bit event loop remembers (`wide::parse_events`)
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
     dv: wide::DayV,
+    // event lines the 512-bit loop leaves to `event_line`, a few lines later: their long IDs' slots were asked for
+    // (`wide::defer_event`); `pn` of them from `ph` on, in a ring
+    #[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
+    pend: [usize; PEND],
+    #[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
+    pn: usize,
+    #[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
+    ph: usize,
 }
+/// Lines `Shard::pend` holds.
+const PEND: usize = 8;
 // SAFETY: the streams own their blocks; after the parse they are only read, except for `ERec::person` of distinct
 // records written by the dedup phase while nothing reads them
 unsafe impl Send for Shard {}
@@ -2707,6 +2731,9 @@ impl Shard {
             heads: vec![NO_HEAD; HEADS],
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
             dv: wide::DayV::new(),
+            pend: [0; PEND],
+            pn: 0,
+            ph: 0,
         }
     }
 

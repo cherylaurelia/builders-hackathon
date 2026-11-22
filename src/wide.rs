@@ -1116,12 +1116,11 @@ unsafe fn click_batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &
 
     let now = keep & short;
     let home = homes(cx, ukey);
-    sv!(l.home, home);
+    // the ID table's line of every lane taken now asked for (a lane not taken asks for the first line): the
+    // same eight every time, no branch on which lanes
+    sv!(l.home, _mm512_maskz_mov_epi64(now, home));
     let slots = cx.ids.slots.as_ptr() as *const u8;
-    let mut m = now as u32;
-    while m != 0 {
-        let i = m.trailing_zeros() as usize;
-        m &= m - 1;
+    for i in 0..8 {
         prefetch(slots.add(std::ptr::read_volatile(l.home.as_ptr().add(i)) as usize));
     }
     let tx = _mm512_or_si512(_mm512_slli_epi64::<32>(tw), ld!(l.camp));

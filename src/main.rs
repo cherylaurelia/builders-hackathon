@@ -3646,6 +3646,32 @@ fn main() {
         f.left.fetch_add(1, Relaxed);
         f.zap[s >> ZAP_SHIFT].fetch_add(1, Relaxed);
     }
+    // the mapped inputs' page tables filled by a thread of their own, in the order the parse reads them: a fault
+    // maps 64 KiB, and one thread faulting in order costs the kernel less than eight parse threads each faulting
+    // its own place. The thread holds a piece of each file so the mapping stays until it is done with it.
+    if env_num("SESS_TOUCH") != Some(0) {
+        for f in ev_files.iter().chain(ck_files.iter()).filter(|f| f.map != 0) {
+            f.left.fetch_add(1, Relaxed);
+        }
+        let all: Vec<&'static InFile> = ev_files.iter().chain(ck_files.iter()).filter(|f| f.map != 0).collect();
+        let held = all.clone();
+        if std::thread::Builder::new()
+            .spawn(move || {
+                for f in all {
+                    let mut o = 0;
+                    while o < f.len {
+                        // SAFETY: inside the mapping, which stays until this thread's piece_done
+                        unsafe { std::ptr::read_volatile((f.map + o) as *const u8) };
+                        o += 64 << 10;
+                    }
+                    piece_done(f);
+                }
+            })
+            .is_err()
+        {
+            held.into_iter().for_each(piece_done);
+        }
+    }
     read_ahead(
         link_files
             .iter()

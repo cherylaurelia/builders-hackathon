@@ -1214,7 +1214,7 @@ fn prefetch<T>(p: *const T) {
     let _ = p;
 }
 
-/// Asks for the cache line at `p`, to be written; a hint only.
+/// Asks for the cache line at `p`, about to be written (PREFETCHT0: x86-64-v3 has no PREFETCHW); a hint only.
 #[inline(always)]
 fn prefetch_w<T>(p: *const T) {
     #[cfg(target_arch = "x86_64")]
@@ -4980,8 +4980,8 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
                 pl.push([l as u32, r.ts, (*(r as *const ERec).sub(1)).ts]);
             }
         };
-        // the place of the record PLACE_PF ahead is asked for (for writing): about one person in six has two
-        // events in a line of `ev`, so most stores would wait for their line
+        // the line the record PLACE_PF ahead goes to is asked for: a partition's ~20K people spread the stores
+        // over more lines of `ev` than the core's caches keep, so most stores would wait for their line
         let ahead = |r: &ERec| prefetch_w(ev.add(*st.add(ev_bin(r) + 1) as usize));
         for s in shards {
             for blk in s.ev[p].slices(EV_BLOCK) {

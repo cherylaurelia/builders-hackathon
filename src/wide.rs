@@ -320,6 +320,49 @@ macro_rules! words2 {
     };
 }
 
+/// A of event lane `$j` of the lanes `$l` (`Lanes`): the masks of the 128 bytes where its walk stands; the
+/// lane's bit when its user_id looks long (longer than 11 bytes: v5's 33). `$k` = the bytes , " \n and 0x20 in
+/// every byte of a register. SAFETY: a walk stands at len + 1 at most, and 176 bytes are readable from there.
+macro_rules! lane_a {
+    ($l:expr, $buf:expr, $j:expr, $pf:expr, $k:expr) => {{
+        let (cm, qt, nv, lowest) = $k;
+        let line = $buf.add(*$l.cur.get_unchecked($j) as usize);
+        prefetch(line.wrapping_add($pf));
+        prefetch(line.wrapping_add($pf + 64));
+        let v0 = _mm512_loadu_si512(line as *const _);
+        let v1 = _mm512_loadu_si512(line.add(64) as *const _);
+        let c0 = _mm512_cmpeq_epi8_mask(v0, cm);
+        *$l.c0.get_unchecked_mut($j) = c0;
+        *$l.q0.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v0, qt);
+        *$l.c1.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v1, cm);
+        *$l.q1.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v1, qt);
+        // as signed bytes, those above 0x7F are below 0x20 too
+        *$l.odd.get_unchecked_mut($j) = _mm512_cmplt_epi8_mask(v0, lowest);
+        *$l.odd1.get_unchecked_mut($j) = _mm512_cmplt_epi8_mask(v1, lowest);
+        *$l.nl1.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v1, nv);
+        (((tz(c0 & c0.wrapping_sub(1)) - tz(c0) > 12) as u32) << $j)
+    }};
+}
+/// The long-ID table's slots of the user_ids of the lanes `$lu` of `$l` (their A done) asked for.
+macro_rules! user_slots {
+    ($cx:expr, $l:expr, $buf:expr, $lu:expr) => {{
+        let mut lu: u32 = $lu;
+        while lu != 0 {
+            let j = lu.trailing_zeros() as usize;
+            lu &= lu - 1;
+            let line = $buf.add(*$l.cur.get_unchecked(j) as usize);
+            let s1 = tz(*$l.c0.get_unchecked(j)) + 1;
+            $cx.names.prefetch_long(line.add(s1 + (*line.add(s1) == b'"') as usize + 1));
+        }
+    }};
+}
+/// The four byte patterns `lane_a!` compares with.
+macro_rules! lane_k {
+    () => {
+        (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'"' as i8), _mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(0x20))
+    };
+}
+
 // ---------------------------------------------------------------- events
 
 /// Eight event lines on their way through `batch`: every field is 64 bytes, a register's worth.
@@ -336,6 +379,9 @@ struct Lanes {
     odd: [u64; 8],  // bytes of its first 64 below 0x20 or above 0x7F
     odd1: [u64; 8], // of its bytes 64..128
     nl1: [u64; 8],  // newlines of its bytes 64..128
+    // the commas of the lines `batch` works on (c0, c1 are already those of the next eight then)
+    pc0: [u64; 8],
+    pc1: [u64; 8],
     // B: the line as `batch` sees it (`unlong`): its newline is byte 64 + e2 (64: none in bytes 64..128); the
     // bytes cut out before user_id (24 or 0) and before ts (0, 24 or 48)
     e2: [u64; 8],
@@ -375,52 +421,15 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
         let st: *mut Shard = st;
         let mut l: Lanes = std::mem::zeroed();
         (l.cur, l.lim) = (cur, lim);
-        let (cm, qt, nv, lowest) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'"' as i8), _mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(0x20));
         let pf = *PF.get_or_init(|| env_num("SESS_PF").unwrap_or(192));
-        let mut lu: u32; // the lanes whose user_id looks long
-        // SAFETY: a walk stands at a line start below `len`, or right after a line's newline, which is at `len`
-        // at the latest: at most at len + 1, and 144 bytes are readable from there (PAD)
-        macro_rules! lane {
-            ($j:expr) => {{
-                let line = buf.add(*l.cur.get_unchecked($j) as usize);
-                prefetch(line.wrapping_add(pf));
-                prefetch(line.wrapping_add(pf + 64));
-                let v0 = _mm512_loadu_si512(line as *const _);
-                let v1 = _mm512_loadu_si512(line.add(64) as *const _);
-                let c0 = _mm512_cmpeq_epi8_mask(v0, cm);
-                // a user_id longer than 11 bytes (a long one, v5): its slot of the long-ID table asked for below
-                lu |= ((tz(c0 & c0.wrapping_sub(1)) - tz(c0) > 12) as u32) << $j;
-                *l.c0.get_unchecked_mut($j) = c0;
-                *l.q0.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v0, qt);
-                *l.c1.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v1, cm);
-                *l.q1.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v1, qt);
-                // as signed bytes, those above 0x7F are below 0x20 too
-                *l.odd.get_unchecked_mut($j) = _mm512_cmplt_epi8_mask(v0, lowest);
-                *l.odd1.get_unchecked_mut($j) = _mm512_cmplt_epi8_mask(v1, lowest);
-                *l.nl1.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v1, nv);
-            }};
+        // A of the first eight lines; `batch` does A of the next eight itself, while its own lines are converted
+        let k = lane_k!();
+        let mut lu = 0u32;
+        for j in 0..8 {
+            lu |= lane_a!(l, buf, j, pf, k);
         }
-        loop {
-            lu = 0;
-            lane!(0);
-            lane!(1);
-            lane!(2);
-            lane!(3);
-            lane!(4);
-            lane!(5);
-            lane!(6);
-            lane!(7);
-            while lu != 0 {
-                let j = lu.trailing_zeros() as usize;
-                lu &= lu - 1;
-                let line = buf.add(*l.cur.get_unchecked(j) as usize);
-                let s1 = tz(*l.c0.get_unchecked(j)) + 1;
-                cx.names.prefetch_long(line.add(s1 + (*line.add(s1) == b'"') as usize + 1));
-            }
-            if !batch(cx, buf, len, st, &mut l) {
-                break;
-            }
-        }
+        user_slots!(cx, l, buf, lu);
+        while batch(cx, buf, len, st, &mut l, pf) {}
         flush::<true>(cx, buf, len, &mut *st);
     }
     st.drain::<true>(cx);
@@ -488,7 +497,7 @@ unsafe fn unlong(c0: __m512i, c1: __m512i, q0: __m512i, q1: __m512i, o0: __m512i
 /// event_type is `view`, `cart` or `purchase`. For such a line this does what `event_fields` does.
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,avx2")]
-unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut Lanes) -> bool {
+unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut Lanes, pf: usize) -> bool {
     let (m1, one, c64) = (k!(-1), k!(1), k!(64));
     // room for eight more in the batch, made before anything is in a register (a call would spill it all)
     let bt: *mut Batch = &mut (*st).bt;
@@ -498,7 +507,10 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
 
     // ---- B, first part: where the four fields to copy start
     let pv = ld!(l.cur);
-    let (c0, c1, q0, q1, odd, e2, sh1, sh2) = unlong(ld!(l.c0), ld!(l.c1), ld!(l.q0), ld!(l.q1), ld!(l.odd), ld!(l.odd1), ld!(l.nl1));
+    let (rc0, rc1) = (ld!(l.c0), ld!(l.c1));
+    sv!(l.pc0, rc0);
+    sv!(l.pc1, rc1);
+    let (c0, c1, q0, q1, odd, e2, sh1, sh2) = unlong(rc0, rc1, ld!(l.q0), ld!(l.q1), ld!(l.odd), ld!(l.odd1), ld!(l.nl1));
     sv!(l.e2, e2);
     sv!(l.sh1, sh1);
     sv!(l.sh2, sh2);
@@ -564,6 +576,15 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
         copy32!(l.st, buf, l.at, i);
         copy32!(l.si, buf, l.ai, i);
     }
+
+    // ---- A of the next eight lines (every walk is past its line already): their loads go out while this batch
+    // is converted. A lane whose line here is not usual is walked again at the end, from where that line ends.
+    let k = lane_k!();
+    let mut lu = 0u32;
+    for j in 0..8 {
+        lu |= lane_a!(l, buf, j, pf, k);
+    }
+    user_slots!(cx, l, buf, lu);
 
     // ---- B, second part (it does not wait for the copies): the quotes, the other three boundaries
     let ma = _mm512_xor_si512(t2, t2m); // through the third comma
@@ -740,7 +761,9 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
                 day_fill(cx.ws, buf.add(l.ai[i] as usize), &mut (*st).dv);
             }
         }
-        l.cur[i] = defer::<true>(cx, buf, (l.cur[i] - 65 - l.e2[i] - l.sh2[i]) as usize, len, l.c0[i], l.c1[i], &mut *st) as u64;
+        l.cur[i] = defer::<true>(cx, buf, (l.cur[i] - 65 - l.e2[i] - l.sh2[i]) as usize, len, l.pc0[i], l.pc1[i], &mut *st) as u64;
+        let lu = lane_a!(l, buf, i, pf, k);
+        user_slots!(cx, l, buf, lu);
     }
     true
 }

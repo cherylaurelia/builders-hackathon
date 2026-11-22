@@ -2481,7 +2481,12 @@ struct InFile {
     len: usize,
     map: usize,         // where the file is mapped (events and clicks: `map_inputs`), 0 when it is not
     left: AtomicUsize,  // pieces of the parse queue not yet parsed: the thread that takes it to 0 unmaps the file
+    zap: Box<[AtomicU32]>, // the same per 2^ZAP_SHIFT bytes of the file, by where a piece starts
 }
+
+/// The parse drops the page-table entries of its input mapping 32 MiB at a time, as soon as every piece that
+/// starts in such a stretch is parsed (`piece_done`).
+const ZAP_SHIFT: u32 = 25;
 
 /// The `*.csv` files of `dir`, by name.
 fn csv_files(dir: &Path) -> Vec<InFile> {
@@ -2498,7 +2503,8 @@ fn csv_files(dir: &Path) -> Vec<InFile> {
         .map(|p| {
             let f = File::open(p).unwrap_or_else(|e| die(&format!("open {}: {e}", p.display())));
             let len = f.metadata().unwrap_or_else(|e| die(&format!("stat {}: {e}", p.display()))).len() as usize;
-            InFile { f, len, map: 0, left: AtomicUsize::new(0) }
+            let zap = (0..(len >> ZAP_SHIFT) + 1).map(|_| AtomicU32::new(0)).collect();
+            InFile { f, len, map: 0, left: AtomicUsize::new(0), zap }
         })
         .collect()
 }
@@ -2638,8 +2644,24 @@ fn map_inputs(files: &mut [InFile]) {
 #[cfg(not(target_os = "linux"))]
 fn map_inputs(_files: &mut [InFile]) {}
 
-/// One piece of the parse queue is done: the file's mapping goes when it was its last.
-fn piece_done(f: &InFile) {
+/// The piece of the parse queue that starts at `s` of `f` is done: the file's mapping goes when it was its last,
+/// and the page-table entries of its 32 MiB stretch when it was the last that starts there.
+///
+/// The munmap of a whole file at once was ~30 ms of the parse at 60M events (Intel, 8 threads): it removes the
+/// entries of ~70K mapped pages while it holds the address space's lock for writing, and every other thread's
+/// page fault (input and records) waits for it. MADV_DONTNEED takes the lock for reading only, so the faults go
+/// on, and the munmap that follows finds next to nothing mapped. Never a question of rows: an access to a dropped
+/// page of a shared file mapping maps it again from the page cache, so a neighbouring piece that still reads
+/// a few bytes of the stretch only takes a fault.
+fn piece_done(f: &InFile, s: usize) {
+    if f.map != 0 && f.zap[s >> ZAP_SHIFT].fetch_sub(1, Relaxed) == 1 {
+        let g = s >> ZAP_SHIFT << ZAP_SHIFT;
+        #[cfg(target_os = "linux")]
+        // SAFETY: a hint on a part of the file's live mapping (see above)
+        unsafe {
+            libc::madvise((f.map + g) as *mut libc::c_void, (f.len - g).min(1 << ZAP_SHIFT), libc::MADV_DONTNEED);
+        }
+    }
     if f.left.fetch_sub(1, Relaxed) == 1 && f.map != 0 {
         #[cfg(target_os = "linux")]
         // SAFETY: every piece of the file is parsed, and nothing keeps a pointer into the mapping
@@ -3438,8 +3460,10 @@ fn main() {
     let mut work = Vec::new();
     chunks_of(0, ev_files, chunk, &mut work);
     chunks_of(1, ck_files, chunk, &mut work);
-    for &(kind, fi, _, _) in &work {
-        (if kind == 0 { &ev_files[fi] } else { &ck_files[fi] }).left.fetch_add(1, Relaxed);
+    for &(kind, fi, s, _) in &work {
+        let f = if kind == 0 { &ev_files[fi] } else { &ck_files[fi] };
+        f.left.fetch_add(1, Relaxed);
+        f.zap[s >> ZAP_SHIFT].fetch_add(1, Relaxed);
     }
     read_ahead(
         link_files
@@ -3517,7 +3541,7 @@ fn main() {
                 }
             }
             st.buf = buf;
-            piece_done(f);
+            piece_done(f, s);
     };
     let mut shards = par(threads, n_evw, || Shard::new(np, nq), &parse);
     // the records of groups not yet full, written by this thread (each parse thread fenced its own before the join)

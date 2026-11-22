@@ -270,6 +270,33 @@ static HEXV: [u8; 256] = {
 /// The 32 lowercase hex digits at `p` as (first 16, last 16) numbers; None when a byte is not one.
 #[inline(always)]
 unsafe fn hex128(p: *const u8) -> Option<(u64, u64)> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        let v = _mm256_loadu_si256(p as *const __m256i);
+        // a digit is 0..=9 above '0', a letter 0..=5 above 'a' (bytes compared unsigned: below wraps high)
+        let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+        let l = _mm256_sub_epi8(v, _mm256_set1_epi8(b'a' as i8));
+        let isd = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+        let isl = _mm256_cmpeq_epi8(_mm256_min_epu8(l, _mm256_set1_epi8(5)), l);
+        if _mm256_movemask_epi8(_mm256_or_si256(isd, isl)) != -1 {
+            return None;
+        }
+        let nib = _mm256_blendv_epi8(_mm256_add_epi8(l, _mm256_set1_epi8(10)), d, isd);
+        // byte pairs to a byte: first << 4 | second, then the eight of each 128-bit half together
+        let w = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+        let b = _mm256_packus_epi16(w, w);
+        let (h, t) = (_mm256_extract_epi64::<0>(b) as u64, _mm256_extract_epi64::<2>(b) as u64);
+        return Some((h.swap_bytes(), t.swap_bytes()));
+    }
+    #[allow(unreachable_code)]
+    hex128_scalar(p)
+}
+
+/// `hex128` a byte at a time.
+#[inline(always)]
+#[allow(dead_code)]
+unsafe fn hex128_scalar(p: *const u8) -> Option<(u64, u64)> {
     let (mut hi, mut lo, mut bad) = (0u64, 0u64, 0u8);
     for i in 0..16 {
         let v = *HEXV.get_unchecked(*p.add(i) as usize);
@@ -6483,6 +6510,23 @@ mod tests {
         assert!(pack(b"u1") < pack(b"u10") && pack(b"U9zzzzzzz") < pack(b"u1") && pack(b"u1") != pack(b"u1\0"));
         assert_eq!(pack(b"0123456789"), 0);
         // IDs that do not pack: exact, and ordered by their bytes against packed ones
+        // hex IDs: the SIMD parse against the scalar one, every byte value in every place
+        let mut s = *b"0123456789abcdef0123456789abcdef";
+        for i in 0..32 {
+            for v in 0..=255u8 {
+                let keep = s[i];
+                s[i] = v;
+                unsafe { assert_eq!(hex128(s.as_ptr()), hex128_scalar(s.as_ptr()), "{i} {v}") };
+                s[i] = keep;
+            }
+        }
+        let id = b"u02423c3d84ab053af78764ce49f23b5c";
+        let k = names.key(id);
+        assert!(k & HEX != 0 && k & INTERNED != 0);
+        let mut back = Vec::new();
+        names.bytes(k, &mut back);
+        assert_eq!(&back[..], &id[..]);
+        assert!(names.less(names.key(b"u0"), k) && names.less(k, names.key(b"u1")) && names.less(k, names.key(b"u02423c3d84ab053af78764ce49f23b5d")));
         let (a, b, c) = (names.key(b"user-with-dash"), names.key(b"user-with-dash"), names.key(" \u{e9}1".as_bytes()));
         assert!(a == b && a != c && a & INTERNED != 0);
         assert!(names.less(c, pack(b"u1")) && names.less(pack(b"u1"), a) && !names.less(a, a));

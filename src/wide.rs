@@ -44,7 +44,7 @@ pub fn available() -> bool {
     })
 }
 
-/// How far ahead of a walk its bytes are asked for (a mapped file comes from memory, a page at a time).
+/// How far ahead of a walk its bytes are asked for (a mapped file comes from memory, a page at a time): 256 bytes
 pub static PF: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// Lines the eight-line paths took themselves (the tests check that it is most of them).
@@ -454,7 +454,7 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
         let st: *mut Shard = st;
         let mut l: Lanes = std::mem::zeroed();
         (l.cur, l.lim) = (cur, lim);
-        let pf = *PF.get_or_init(|| env_num("SESS_PF").unwrap_or(192));
+        let pf = *PF.get_or_init(|| env_num("SESS_PF").unwrap_or(256));
         // A of the first eight lines; `batch` does A of the next eight itself, while its own lines are converted
         let k = lane_k!();
         let mut lu = 0u32;
@@ -915,7 +915,7 @@ pub unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
         let mut l: ClickLanes = std::mem::zeroed();
         (l.cur, l.lim) = (cur, lim);
         let (cm, qt, nv, lowest) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'"' as i8), _mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(0x20));
-        let pf = *PF.get_or_init(|| env_num("SESS_PF").unwrap_or(192));
+        let pf = *PF.get_or_init(|| env_num("SESS_PF").unwrap_or(256));
         // SAFETY: as in `parse_events`: a walk stands at len + 1 at most, and 144 bytes are readable from there
         macro_rules! lane {
             ($j:expr) => {{

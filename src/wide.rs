@@ -862,11 +862,12 @@ struct ClickLanes {
     key: [u64; 8],  // the campaign's length
     camp: [u64; 8], // its number, for the lanes whose campaign is in campaigns.csv
     home: [u64; 8],
+    ck: [u64; 8], // the click ID packed (8 or 9 bytes)
+    uk: [u64; 8], // the user ID packed
     tx: [u64; 8],
-    // kept clicks with an ID that is not 8 or 9 bytes (a long ID: its slot asked for): their IDs (buffer offset,
-    // length) and `Batch::tx`, into the batch at the next `click_batch` (`click_late`)
-    pc: [u64; LATE],
-    pcl: [u64; LATE],
+    // kept clicks with a user ID that is not 8 or 9 bytes (a long one: its slot asked for): their click keys,
+    // user IDs (buffer offset, length) and `Batch::tx`, into the batch at the next `click_batch` (`click_late`)
+    pk: [u64; LATE], // the click key (`Shard::click_key`)
     pu: [u64; LATE],
     pul: [u64; LATE],
     ptx: [u64; LATE],
@@ -934,19 +935,24 @@ pub unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
     sfence();
 }
 
+/// The lanes whose click ID (length `cl`) is 8 or 9 bytes: packed in `click_batch`.
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,avx2,bmi1,bmi2,popcnt")]
+unsafe fn short_c(cl: __m512i) -> __mmask8 {
+    _mm512_cmple_epu64_mask(_mm512_sub_epi64(cl, k!(8)), k!(1))
+}
+
 /// The clicks `click_batch` left waiting in `l` into the batch, the oldest first, until `keep` wait.
 #[inline(never)]
 unsafe fn click_late(cx: &Ctx, buf: *const u8, st: &mut Shard, l: &mut ClickLanes, keep: usize) {
     while l.pn > keep {
         let j = l.ph % LATE;
         (l.ph, l.pn) = (j + 1, l.pn - 1);
-        // SAFETY: an ID of the line, which is in the buffer: it starts within the line's first 120 bytes, so 48
-        // bytes from its start are readable (PAD)
-        let ck = st.click_key48(cx, buf.add(l.pc[j] as usize), l.pcl[j] as usize);
+        // SAFETY: an ID of the line, which is in the buffer: 9 bytes readable from its start (PAD)
         let uk = cx.names.key_at(buf.add(l.pu[j] as usize), l.pul[j] as usize);
         let n = st.bt.n;
         // SAFETY: n < BATCH between calls: a full batch is drained at once
-        *st.bt.a.get_unchecked_mut(n) = ck;
+        *st.bt.a.get_unchecked_mut(n) = l.pk[j];
         *st.bt.ukey.get_unchecked_mut(n) = uk;
         *st.bt.tx.get_unchecked_mut(n) = l.ptx[j];
         *st.bt.home.get_unchecked_mut(n) = cx.ids.aim(uk);
@@ -1084,10 +1090,14 @@ unsafe fn click_batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &
     USUAL.fetch_add(usual.count_ones() as usize, Relaxed);
 
     let now = keep & short;
+    // a kept click with a long click ID and a user ID of 8 or 9 bytes: into the batch now too (a click ID is not
+    // looked up: `Shard::click_key`), after the others
+    let ushort = _mm512_cmple_epu64_mask(_mm512_sub_epi64(ul, k!(8)), one);
+    let cnow = keep & ushort & !short;
     let home = homes(cx, ukey);
     // the ID table's line of every lane taken now asked for (a lane not taken asks for the first line): the
     // same eight every time, no branch on which lanes
-    sv!(l.home, _mm512_maskz_mov_epi64(now, home));
+    sv!(l.home, _mm512_maskz_mov_epi64(now | cnow, home));
     let slots = cx.ids.slots.as_ptr() as *const u8;
     for i in 0..8 {
         prefetch(slots.add(std::ptr::read_volatile(l.home.as_ptr().add(i)) as usize));
@@ -1102,27 +1112,45 @@ unsafe fn click_batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &
     if (*bt).n >= BATCH {
         (*st).drain::<false>(cx);
     }
-    // a kept click with another ID: waits for the next batch, the long-ID slots asked for meanwhile
-    let late = keep & !short;
-    if late != 0 {
+    let late = keep & !ushort;
+    if cnow | late != 0 {
         sv!(l.cl, cl);
         sv!(l.ul, ul);
         sv!(l.tx, tx);
+        sv!(l.ck, ckey);
+        sv!(l.uk, ukey);
+        // SAFETY: a click ID starts within its line's first 120 bytes, so 48 bytes from its start are readable
+        // (PAD); n < BATCH between pushes: a full batch is drained at once
+        let mut m = cnow as u32;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let ck = (*st).click_key48(cx, buf.add(l.ac[i] as usize), l.cl[i] as usize);
+            let n = (*bt).n;
+            *(*bt).a.get_unchecked_mut(n) = ck;
+            *(*bt).ukey.get_unchecked_mut(n) = l.uk[i];
+            *(*bt).tx.get_unchecked_mut(n) = l.tx[i];
+            *(*bt).home.get_unchecked_mut(n) = (l.home[i] >> 4) as u32;
+            (*bt).n = n + 1;
+            if n + 1 == BATCH {
+                (*st).drain::<false>(cx);
+            }
+        }
+        // a kept click with a long user ID: waits for the next batch, its slot asked for meanwhile
+        let cs = short_c(cl);
         let mut m = late as u32;
         while m != 0 {
             let i = m.trailing_zeros() as usize;
             m &= m - 1;
+            let ck = if (cs >> i) & 1 != 0 { l.ck[i] } else { (*st).click_key48(cx, buf.add(l.ac[i] as usize), l.cl[i] as usize) };
             let j = (l.ph + l.pn) % LATE; // pn < LATE: at most LATE - 16 wait before a batch, and it adds 8 at most
-            (l.pc[j], l.pcl[j], l.pu[j], l.pul[j], l.ptx[j]) = (l.ac[i], l.cl[i], l.au[i], l.ul[i], l.tx[i]);
+            (l.pk[j], l.pu[j], l.pul[j], l.ptx[j]) = (ck, l.au[i], l.ul[i], l.tx[i]);
             l.pn += 1;
-            // (a click ID is not looked up: `Shard::click_key`)
-            // a long user ID's slot asked for, without a branch on whether the user ID is the long one (else the
-            // first slot is asked for). SAFETY: the 32 bytes before a long ID's end are in the line, and 32 bytes
-            // from the start of any are readable (it starts within the line's first 120 bytes)
             let (s, n) = (l.au[i], l.ul[i]);
-            let long = n.wrapping_sub(33) <= 7;
-            let h = cx.names.long_home(buf.add((s + if long { n - 32 } else { 0 }) as usize));
-            prefetch(cx.names.slot(h & (long as usize).wrapping_neg()) as *const LongSlot);
+            if (33..=40).contains(&n) {
+                // SAFETY: the 32 bytes before the ID's end are in the line
+                cx.names.prefetch_long(buf.add((s + n - 32) as usize));
+            }
         }
     }
     // every other line as a whole; a date it brings is remembered for the lines to come

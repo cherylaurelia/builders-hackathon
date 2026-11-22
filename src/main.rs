@@ -3615,10 +3615,7 @@ unsafe fn fast_event_n(cx: &Ctx, line: *const u8, f: [(usize, usize); 7], st: &m
 #[inline(never)]
 unsafe fn event_line(cx: &Ctx, buf: *const u8, p: usize, len: usize, st: &mut Shard) -> usize {
     let line = buf.add(p);
-    if let Some((a, b, o, n)) = split_event(line) {
-        fast_event(cx, line, a, line.add(o), b, st);
-        return p + n;
-    }
+    // the lines that come here are mostly those with a long ID (v5), which only `split_n` takes
     if let Some((f, n)) = split_n::<7>(line) {
         fast_event_n(cx, line, f, st);
         return p + n;
@@ -3872,10 +3869,6 @@ unsafe fn fast_click_n(cx: &Ctx, line: *const u8, f: [(usize, usize); 4], st: &m
 #[inline(never)]
 unsafe fn click_line(cx: &Ctx, buf: *const u8, p: usize, len: usize, st: &mut Shard) -> usize {
     let line = buf.add(p);
-    if let Some((f, n)) = split_click(line) {
-        fast_click(cx, line, f, st);
-        return p + n;
-    }
     if let Some((f, n)) = split_n::<4>(line) {
         fast_click_n(cx, line, f, st);
         return p + n;

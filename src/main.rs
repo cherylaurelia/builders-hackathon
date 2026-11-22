@@ -558,7 +558,7 @@ impl Interner {
 
     /// The key of the `len` (33..=40) bytes at `p` from the long-ID table, when they are a prefix and 32 lowercase hex
     /// digits and the table has room near the ID's home; else 0.
-    #[inline(never)]
+    #[inline]
     unsafe fn long(&self, p: *const u8, len: usize) -> u64 {
         let plen = len - 32;
         let pre = Self::long_prefix(p, plen);

@@ -4371,7 +4371,8 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
     let done = par(
         threads,
         buckets,
-        || (Vec::<u64>::new(), Vec::<(u64, usize)>::new(), Vec::<LRec>::new(), 0usize, Vec::<u64>::new()),
+        // 1 MiB or more each, so that they are in huge pages (`huge_alloc`): the table and the bits are read at random
+        || (huge_vec::<u64>(1 << 17), huge_vec::<(u64, usize)>(1 << 16), huge_vec::<LRec>(1 << 16), 0usize, Vec::<u64>::new()),
         |(seen, cand, table, total, dup), b| {
             let n: usize = shards.iter().map(|s| s.lg[b].len()).sum();
             if n == 0 {

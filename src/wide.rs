@@ -367,10 +367,12 @@ struct Lanes {
     q0: [u64; 8],  // quotes
     c1: [u64; 8],  // commas of its bytes 64..128
     q1: [u64; 8],  // quotes
-    odd: [u64; 8], // bytes of its first 64 below 0x20 or above 0x7F
-    e2: [u64; 8],  // its newline is byte 64 + e2 (64: none in bytes 64..128)
-    // a line with a long ID (33 bytes, v5) is seen as if its long IDs were their first 9 bytes (`long_lane`): the
+    odd: [u64; 8],  // bytes of its first 64 below 0x20 or above 0x7F
+    odd1: [u64; 8], // of its bytes 64..128
+    nl1: [u64; 8],  // newlines of its bytes 64..128
+    // B: the line as `batch` sees it (`unlong`): its newline is byte 64 + e2 (64: none in bytes 64..128); the
     // bytes cut out before user_id (24 or 0) and before ts (0, 24 or 48)
+    e2: [u64; 8],
     sh1: [u64; 8],
     sh2: [u64; 8],
     // B: where to copy from (buffer offsets)
@@ -409,7 +411,7 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
         (l.cur, l.lim) = (cur, lim);
         let (cm, qt, nv, lowest) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'"' as i8), _mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(0x20));
         let pf = *PF.get_or_init(|| env_num("SESS_PF").unwrap_or(192));
-        let mut long: u32; // the lanes `long_lane` takes
+        let mut lu: u32; // the lanes whose user_id looks long
         // SAFETY: a walk stands at a line start below `len`, or right after a line's newline, which is at `len`
         // at the latest: at most at len + 1, and 144 bytes are readable from there (PAD)
         macro_rules! lane {
@@ -419,24 +421,21 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
                 prefetch(line.wrapping_add(pf + 64));
                 let v0 = _mm512_loadu_si512(line as *const _);
                 let v1 = _mm512_loadu_si512(line.add(64) as *const _);
-                *l.c0.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v0, cm);
+                let c0 = _mm512_cmpeq_epi8_mask(v0, cm);
+                // a user_id longer than 11 bytes (a long one, v5): its slot of the long-ID table asked for below
+                lu |= ((tz(c0 & c0.wrapping_sub(1)) - tz(c0) > 12) as u32) << $j;
+                *l.c0.get_unchecked_mut($j) = c0;
                 *l.q0.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v0, qt);
                 *l.c1.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v1, cm);
                 *l.q1.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v1, qt);
                 // as signed bytes, those above 0x7F are below 0x20 too
                 *l.odd.get_unchecked_mut($j) = _mm512_cmplt_epi8_mask(v0, lowest);
-                *l.e2.get_unchecked_mut($j) = tz(_mm512_cmpeq_epi8_mask(v1, nv)) as u64;
-                // an ID longer than 9 bytes (with its quotes 11): the line through `long_lane`, after the eight
-                // (one branch a batch, where one a lane missed one line in four)
-                let c0 = *l.c0.get_unchecked($j);
-                let (p1, p2) = (tz(c0), tz(c0 & c0.wrapping_sub(1)));
-                long |= ((((p1 > 11) | (p2 - p1 > 12)) & (*l.cur.get_unchecked($j) < *l.lim.get_unchecked($j))) as u32) << $j;
-                *l.sh1.get_unchecked_mut($j) = 0;
-                *l.sh2.get_unchecked_mut($j) = 0;
+                *l.odd1.get_unchecked_mut($j) = _mm512_cmplt_epi8_mask(v1, lowest);
+                *l.nl1.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v1, nv);
             }};
         }
         loop {
-            long = 0;
+            lu = 0;
             lane!(0);
             lane!(1);
             lane!(2);
@@ -445,11 +444,12 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
             lane!(5);
             lane!(6);
             lane!(7);
-            while long != 0 {
-                let j = long.trailing_zeros() as usize;
-                long &= long - 1;
+            while lu != 0 {
+                let j = lu.trailing_zeros() as usize;
+                lu &= lu - 1;
                 let line = buf.add(*l.cur.get_unchecked(j) as usize);
-                long_lane(cx, &mut l, j, line);
+                let s1 = tz(*l.c0.get_unchecked(j)) + 1;
+                cx.names.prefetch_long(line.add(s1 + (*line.add(s1) == b'"') as usize + 1));
             }
             if !batch(cx, buf, len, st, &mut l) {
                 break;
@@ -461,69 +461,55 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
     sfence();
 }
 
-/// A for the lane `j` of `l` (its masks taken), whose line at `line` (176 bytes readable) has a field before its
-/// second comma longer than 9 bytes: when event_id or user_id is 33 bytes (quotes left out), the masks become those
-/// of the line with the bytes 9..33 of each such ID cut out, and `sh1`/`sh2` say how many bytes were cut before
-/// user_id and before ts; otherwise the masks stay. The table slots of the long IDs are asked for (`batch` looks
-/// them up).
+/// The masks of eight lines (c0|c1 commas, q0|q1 quotes, o0|o1 odd bytes of each line's bytes 0..128; n1 the newlines
+/// of bytes 64..128) as those of the lines with the bytes 9..33 of a long ID (v5: 33 bytes, quotes left out) as
+/// event_id or user_id cut out: the commas, quotes and odd bytes of their first 64 bytes and 64..128, the newline
+/// of bytes 64..128 (64: none), and the bytes cut before user_id (24 or 0) and before ts (0, 24 or 48). A line
+/// with no such ID keeps its masks. A line whose bytes past 128 are needed for its cut masks sees zeros there (no
+/// comma, no newline): it is not usual, and `event_line` takes it.
 ///
-/// The cut bytes are seen by no check here: the long-ID table takes only 32 lowercase hex digits after a 1-byte
-/// prefix (no comma, quote, newline or odd byte among them), and a lane whose ID it refuses goes to `event_line`.
+/// The cut bytes are seen by no check here: the long-ID table (and `ev_hash`) take only 32 lowercase hex digits
+/// after a 1-byte prefix (no comma, quote, newline or odd byte among them), and a lane whose ID they refuse goes to
+/// `event_line`. A cut is made only where the comma after it shows a field of 33 bytes, quotes left out; any line
+/// that is usual afterwards has its event_id in bytes 0..36, so the quote bits read here are exact for it.
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,avx2")]
-unsafe fn long_lane(cx: &Ctx, l: &mut Lanes, j: usize, line: *const u8) {
-    let c = *l.c0.get_unchecked(j) as u128 | (*l.c1.get_unchecked(j) as u128) << 64;
-    let q = *l.q0.get_unchecked(j) as u128 | (*l.q1.get_unchecked(j) as u128) << 64;
-    // event_id: from byte qe; user_id: from s1 + qu
-    let qe = (q & 1) as u32;
-    let p1 = c.trailing_zeros();
-    let s1 = p1 + 1;
-    let qu = if s1 < 128 { ((q >> s1) & 1) as u32 } else { 0 };
-    let p2 = (c & c.wrapping_sub(1)).trailing_zeros();
-    let l0 = p1 < 128 && p1 == 33 + 2 * qe;
-    let l1 = p2 < 128 && p2 == s1 + 33 + 2 * qu;
-    if !(l0 | l1) {
-        *l.sh1.get_unchecked_mut(j) = 0;
-        *l.sh2.get_unchecked_mut(j) = 0;
-        return;
-    }
-    // virtual byte k is real byte k below cut0, k + d1 below cut1, k + d2 from there
-    let d1 = if l0 { 24 } else { 0 };
-    let d2 = d1 + if l1 { 24 } else { 0 };
-    let cut0 = if l0 { qe + 9 } else { 0 };
-    let cut1 = if l1 { s1 + qu + 9 - d1 } else { 128 };
-    let below = |x: u32, from: u32| -> u64 {
-        let x = x.saturating_sub(from);
-        if x >= 64 {
-            !0
-        } else {
-            (1u64 << x) - 1
+#[allow(clippy::type_complexity)]
+unsafe fn unlong(c0: __m512i, c1: __m512i, q0: __m512i, q1: __m512i, o0: __m512i, o1: __m512i, n1: __m512i) -> (__m512i, __m512i, __m512i, __m512i, __m512i, __m512i, __m512i, __m512i) {
+    let (m1, one) = (k!(-1), k!(1));
+    // event_id from byte qe, its comma p1; user_id from s1 + qu, its comma p2 (64 + the first comma of c1 when c0
+    // has one comma)
+    let qe = _mm512_and_si512(q0, one);
+    let c0m = _mm512_add_epi64(c0, m1);
+    let p1 = tzv!(c0, c0m);
+    let s1 = _mm512_add_epi64(p1, one);
+    let qu = qbit!(q0, s1);
+    let t1 = _mm512_and_si512(c0, c0m);
+    let p2 = _mm512_mask_blend_epi64(_mm512_test_epi64_mask(t1, t1), _mm512_add_epi64(tzv!(c1, _mm512_add_epi64(c1, m1)), k!(64)), tzv!(t1, _mm512_add_epi64(t1, m1)));
+    let l0 = _mm512_cmpeq_epi64_mask(p1, _mm512_add_epi64(k!(33), _mm512_add_epi64(qe, qe)));
+    let l1 = _mm512_cmpeq_epi64_mask(p2, _mm512_add_epi64(_mm512_add_epi64(s1, k!(33)), _mm512_add_epi64(qu, qu)));
+    let d1 = _mm512_maskz_mov_epi64(l0, k!(24));
+    let d2 = _mm512_add_epi64(d1, _mm512_maskz_mov_epi64(l1, k!(24)));
+    // 24 bits out of each 128-bit mask from bit `cut` on (192: none): the later cut first, so the earlier one's
+    // place is the same before and after it
+    let (mut c0, mut c1, mut q0, mut q1, mut o0, mut o1, mut n1) = (c0, c1, q0, q1, o0, o1, n1);
+    for cut in [_mm512_mask_blend_epi64(l1, k!(192), _mm512_add_epi64(_mm512_add_epi64(s1, qu), k!(9))), _mm512_mask_blend_epi64(l0, k!(192), _mm512_add_epi64(qe, k!(9)))] {
+        // the bits below the cut in the low and the high word
+        let lo = _mm512_andnot_si512(_mm512_sllv_epi64(m1, cut), m1);
+        let hi = _mm512_andnot_si512(_mm512_sllv_epi64(m1, _mm512_max_epi64(_mm512_sub_epi64(cut, k!(64)), _mm512_setzero_si512())), m1);
+        macro_rules! cut {
+            ($w0:expr, $w1:expr) => {{
+                let s0 = _mm512_ternarylogic_epi64::<{ TA | TB }>(_mm512_srli_epi64::<24>($w0), _mm512_slli_epi64::<40>($w1), $w1);
+                (_mm512_ternarylogic_epi64::<{ (TA & TB) | (!TA & TC) }>(lo, $w0, s0), _mm512_ternarylogic_epi64::<{ (TA & TB) | (!TA & TC) }>(hi, $w1, _mm512_srli_epi64::<24>($w1)))
+            }};
         }
-    };
-    // (a macro, not a closure: the 512-bit code stays in this function)
-    macro_rules! half {
-        ($o:expr) => {{
-            let x = _mm512_loadu_si512(line.add($o + d2 as usize) as *const _);
-            let x = _mm512_mask_blend_epi8(below(cut1, $o as u32), x, _mm512_loadu_si512(line.add($o + d1 as usize) as *const _));
-            _mm512_mask_blend_epi8(below(cut0, $o as u32), x, _mm512_loadu_si512(line.add($o) as *const _))
-        }};
+        (c0, c1) = cut!(c0, c1);
+        (q0, q1) = cut!(q0, q1);
+        (o0, o1) = cut!(o0, o1);
+        n1 = _mm512_ternarylogic_epi64::<{ (TA & TB) | (!TA & TC) }>(hi, n1, _mm512_srli_epi64::<24>(n1));
     }
-    let (v0, v1) = (half!(0usize), half!(64usize));
-    let (cm, qt, nv, lowest) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'"' as i8), _mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(0x20));
-    *l.c0.get_unchecked_mut(j) = _mm512_cmpeq_epi8_mask(v0, cm);
-    *l.q0.get_unchecked_mut(j) = _mm512_cmpeq_epi8_mask(v0, qt);
-    *l.c1.get_unchecked_mut(j) = _mm512_cmpeq_epi8_mask(v1, cm);
-    *l.q1.get_unchecked_mut(j) = _mm512_cmpeq_epi8_mask(v1, qt);
-    *l.odd.get_unchecked_mut(j) = _mm512_cmplt_epi8_mask(v0, lowest);
-    *l.e2.get_unchecked_mut(j) = tz(_mm512_cmpeq_epi8_mask(v1, nv)) as u64;
-    *l.sh1.get_unchecked_mut(j) = d1 as u64;
-    *l.sh2.get_unchecked_mut(j) = d2 as u64;
-    if l0 && !cx.evhash {
-        cx.names.prefetch_long(line.add(qe as usize + 1));
-    }
-    if l1 {
-        cx.names.prefetch_long(line.add((s1 + qu) as usize + 1));
-    }
+    let _ = o1;
+    (c0, c1, q0, q1, o0, tzv!(n1, _mm512_add_epi64(n1, m1)), d1, d2)
 }
 
 /// The lines the walks of `l` stand on (A filled in), each walk moved past its line: the usual ones into the
@@ -545,8 +531,11 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
     }
 
     // ---- B, first part: where the four fields to copy start
-    let (c0, q0, c1, q1, e2, pv) = (ld!(l.c0), ld!(l.q0), ld!(l.c1), ld!(l.q1), ld!(l.e2), ld!(l.cur));
-    let (sh1, sh2) = (ld!(l.sh1), ld!(l.sh2));
+    let pv = ld!(l.cur);
+    let (c0, c1, q0, q1, odd, e2, sh1, sh2) = unlong(ld!(l.c0), ld!(l.c1), ld!(l.q0), ld!(l.q1), ld!(l.odd), ld!(l.odd1), ld!(l.nl1));
+    sv!(l.e2, e2);
+    sv!(l.sh1, sh1);
+    sv!(l.sh2, sh2);
     // the walks that stand on a line of their part; each goes past its line (`event_line` below puts the walk
     // of a line that is not usual where that line really ends)
     let live = _mm512_cmplt_epu64_mask(pv, ld!(l.lim));
@@ -626,7 +615,7 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
     let bad = _mm512_or_si512(bad1, misquoted!(b2, q2));
     // well quoted, and four boundaries from the third comma through the newline: seven fields; no byte of the
     // first 64 that is a newline or does not pack
-    let bad = _mm512_or_si512(bad, ld!(l.odd));
+    let bad = _mm512_or_si512(bad, odd);
     let k_shape = _mm512_mask_testn_epi64_mask(_mm512_mask_testn_epi64_mask(_mm512_mask_test_epi64_mask(k_pos, x3, x3), x4, x4), bad, bad);
     let kl = _mm512_sub_epi64(_mm512_sub_epi64(r2, s4), _mm512_add_epi64(qk, qk));
     let s5 = _mm512_add_epi64(r2, one);

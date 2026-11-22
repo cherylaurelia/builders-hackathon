@@ -3465,6 +3465,9 @@ fn small_tables(data: &Path) -> Small {
 /// Link lines whose IDs are on their way from the ID table at a time (`LinkBatch`).
 const LINKS: usize = 32;
 
+/// Link lines that wait for their long IDs' slots of the long-ID table (`build_links`).
+const LINK_WAIT: usize = 8;
+
 /// The link lines a thread has parsed whose IDs wait for their lines of the ID table (`IdTable::aim`), as the
 /// events of a `Batch` do: when LINKS of them wait, `join` adds their IDs and joins them.
 struct LinkBatch {
@@ -3554,6 +3557,14 @@ fn build_links(ids: &IdTable, names: &Interner, files: &[InFile], threads: usize
             let (_, fi, s, e) = work[i];
             let (len, start, end) = read_span(&files[fi], s, e, buf);
             let (base, text) = (buf.as_ptr(), &buf[..len]);
+            // the lines `split_link` took wait here, oldest first, LINK_WAIT of them, as (start, length) of both IDs
+            // in `buf`: a long ID's slot of the long-ID table is asked for as its line comes in, and looked up
+            // (`Interner::key_at`) LINK_WAIT lines later. Every line goes through, so the IDs reach the ID table in
+            // the order of the lines
+            let mut wait = [[0usize; 4]; LINK_WAIT];
+            let (mut wh, mut wn) = (0usize, 0usize);
+            // SAFETY: the IDs of lines of `buf`, 9 bytes readable from each (PAD)
+            let take = |w: &[usize; 4], bt: &mut LinkBatch| unsafe { bt.push(ids, names, names.key_at(base.add(w[0]), w[1]), names.key_at(base.add(w[2]), w[3])) };
             let first = start.saturating_sub(1);
             if let Some(nl) = memchr::memchr(b'\n', &text[first..]) {
                 let mut p = first + nl + 1; // the header line is skipped
@@ -3566,12 +3577,28 @@ fn build_links(ids: &IdTable, names: &Interner, files: &[InFile], threads: usize
                         if let Some((mut f, n)) = split_link(line) {
                             let ((sa, la), (sb, lb)) = (f.next(), f.next());
                             if la != 0 && lb != 0 {
-                                bt.push(ids, names, names.key_at(line.add(sa), la), names.key_at(line.add(sb), lb));
+                                for (s, l) in [(sa, la), (sb, lb)] {
+                                    if (33..=40).contains(&l) {
+                                        names.prefetch_long(line.add(s + l - 32));
+                                    }
+                                }
+                                if wn == LINK_WAIT {
+                                    take(&wait[wh], bt);
+                                    wh = (wh + 1) % LINK_WAIT;
+                                    wn -= 1;
+                                }
+                                wait[(wh + wn) % LINK_WAIT] = [p + sa, la, p + sb, lb];
+                                wn += 1;
                             }
                             p += n;
                             continue;
                         }
                     }
+                    // a line split as a whole: the waiting ones first
+                    for k in 0..wn {
+                        take(&wait[(wh + k) % LINK_WAIT], bt);
+                    }
+                    wn = 0;
                     let eol = memchr::memchr(b'\n', &text[p..]).map_or(len, |i| p + i);
                     // SAFETY: the fields live in `buf`, which outlives this use; nothing keeps them
                     if let Some([a, b]) = split::<2>(unsafe { std::mem::transmute::<&[u8], Bytes>(&text[p..eol]) }) {
@@ -3581,6 +3608,9 @@ fn build_links(ids: &IdTable, names: &Interner, files: &[InFile], threads: usize
                     }
                     p = eol + 1;
                 }
+            }
+            for k in 0..wn {
+                take(&wait[(wh + k) % LINK_WAIT], bt);
             }
             bt.join(ids, names);
         },

@@ -324,49 +324,68 @@ unsafe fn ev_hash(p: *const u8) -> Option<(u64, [u64; 2])> {
     Some((EVHASH | (hi >> 3), [hi, lo]))
 }
 
-/// True when no two different event_ids got one key from `ev_hash`: per bucket, the records of every thread in
-/// a table by key.
-fn event_ids_distinct(shards: &mut [Shard], threads: usize) -> bool {
+/// True when no two different event_ids got one key from `ev_hash`. Only a key that more than one dedup record
+/// has can join two IDs (`mark_duplicates` lists them in `dup`, a key once per extra copy): per bucket, those keys
+/// in a small table, and every thread's digits of the bucket looked up in it.
+fn event_ids_distinct(shards: &mut [Shard], threads: usize, dup: &[u64]) -> bool {
     for s in shards.iter_mut() {
         s.evh.iter_mut().for_each(Stream::finish);
     }
     let shards = &*shards;
+    let mut groups: Vec<Vec<u64>> = vec![Vec::new(); EVH_BUCKETS];
+    for &k in dup {
+        groups[((k >> 55) & 63) as usize].push(k);
+    }
     let clash = AtomicBool::new(false);
-    // per thread, used again for every bucket: the bucket's records in one run, and a table of their places + 1
-    // (0 = free); some 40K records a bucket at 20M events, so both stay in the core's cache
+    // per thread, used again for every bucket: the keys (0 = free: an `ev_hash` key has its top bits set), and per
+    // key the digits of the first record seen with it (`seen`)
     par(
         threads,
         EVH_BUCKETS,
-        || (Vec::<[u64; 2]>::new(), Vec::<u32>::new()),
-        |(v, t), b| {
-            v.clear();
-            for s in shards {
-                for blk in s.evh[b].slices(EVH_BLOCK) {
-                    v.extend_from_slice(blk);
-                }
-            }
-            if v.is_empty() {
+        || (Vec::<u64>::new(), Vec::<[u64; 2]>::new(), Vec::<bool>::new()),
+        |(t, d, seen), b| {
+            let keys = &groups[b];
+            if keys.is_empty() {
                 return;
             }
-            let cap = (v.len() + v.len() / 2).next_power_of_two().max(2);
+            // at most a quarter full: most digits look at one free slot
+            let cap = (keys.len() * 4).next_power_of_two().max(16);
+            let sh = 64 - cap.trailing_zeros();
             t.clear();
             t.resize(cap, 0);
-            for (n, r) in v.iter().enumerate() {
-                let mut i = (spread(r[0] >> 3) >> (64 - cap.trailing_zeros())) as usize;
-                loop {
-                    let e = t[i];
-                    if e == 0 {
-                        t[i] = n as u32 + 1;
-                        break;
-                    }
-                    let o = &v[e as usize - 1];
-                    if o[0] >> 3 == r[0] >> 3 {
-                        if o != r {
-                            clash.store(true, Relaxed);
-                        }
-                        break;
-                    }
+            d.clear();
+            d.resize(cap, [0; 2]);
+            seen.clear();
+            seen.resize(cap, false);
+            for &k in keys {
+                let mut i = (spread(k) >> sh) as usize;
+                while t[i] != 0 && t[i] != k {
                     i = (i + 1) & (cap - 1);
+                }
+                t[i] = k;
+            }
+            for s in shards {
+                for blk in s.evh[b].slices(EVH_BLOCK) {
+                    for r in blk {
+                        let k = EVHASH | (r[0] >> 3);
+                        let mut i = (spread(k) >> sh) as usize;
+                        loop {
+                            let e = t[i];
+                            if e == k {
+                                if !seen[i] {
+                                    seen[i] = true;
+                                    d[i] = *r;
+                                } else if d[i] != *r {
+                                    clash.store(true, Relaxed);
+                                }
+                                break;
+                            }
+                            if e == 0 {
+                                break;
+                            }
+                            i = (i + 1) & (cap - 1);
+                        }
+                    }
                 }
             }
         },
@@ -3401,17 +3420,17 @@ fn main() {
         die("too many events for 32-bit session and event counts"); // user_daily writes them as INT32
     }
 
+    // 3. duplicates; then the `ev_hash` keys they share are checked (nothing has been written yet: a restart is
+    // still possible)
+    let (n_dups, dup) = mark_duplicates(&cx, &shards, nq, threads);
     if cx.evhash {
-        if !event_ids_distinct(&mut shards, threads) {
+        if !event_ids_distinct(&mut shards, threads, &dup) {
             restart_without_evhash();
         }
         for s in &mut shards {
             s.evh = Vec::new();
         }
     }
-
-    // 3. duplicates
-    let n_dups = mark_duplicates(&cx, &shards, nq, threads);
     lap(&format!("duplicates marked: {n_dups} candidates"));
 
     // 4. per person partition, the largest first; each thread writes its rows when the queue is empty
@@ -4331,15 +4350,16 @@ unsafe fn parse_clicks_v3(cx: &Ctx, buf: *const u8, start: usize, end: usize, le
 /// "seen", and "again" when it already was; the second keeps the records whose slot says "again" - every copy of a
 /// repeated key, plus the few other keys that share a slot with another. Only those go through an exact table on
 /// the key, where the copy with the smaller ingest_ts stays and the other is dropped.
-fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -> usize {
+/// Returns the number of candidates, and every `ev_hash` key that more than one record has (once per extra copy).
+fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -> (usize, Vec<u64>) {
     let far = far_map(shards); // empty unless an ingest_ts is far from the window
     let (far, abase) = (&far, cx.abase);
     let qb = buckets.trailing_zeros();
-    par(
+    let done = par(
         threads,
         buckets,
-        || (Vec::<u64>::new(), Vec::<(u64, usize)>::new(), Vec::<LRec>::new(), 0usize),
-        |(seen, cand, table, total), b| {
+        || (Vec::<u64>::new(), Vec::<(u64, usize)>::new(), Vec::<LRec>::new(), 0usize, Vec::<u64>::new()),
+        |(seen, cand, table, total, dup), b| {
             let n: usize = shards.iter().map(|s| s.lg[b].len()).sum();
             if n == 0 {
                 return;
@@ -4437,6 +4457,9 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
                         // SAFETY: h < slots, by the shift and the mask
                         let e = unsafe { &mut *table.as_mut_ptr().add(h) };
                         if e.key == r.key {
+                            if r.key & EVHASH == EVHASH {
+                                dup.push(r.key);
+                            }
                             break e;
                         }
                         if e.key == 0 {
@@ -4455,10 +4478,8 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
                 }
             }
         },
-    )
-    .iter()
-    .map(|x| x.3)
-    .sum()
+    );
+    (done.iter().map(|x| x.3).sum(), done.into_iter().flat_map(|x| x.4).collect())
 }
 
 #[derive(Clone, Copy, Default)]
@@ -6841,6 +6862,18 @@ mod tests {
         }
     }
 
+    /// Every key of the shards' `ev_hash` digits, as if each had more than one dedup record.
+    fn evh_keys(shards: &mut [Shard]) -> Vec<u64> {
+        let mut v = Vec::new();
+        for s in shards.iter_mut() {
+            for st in s.evh.iter_mut() {
+                st.finish();
+                v.extend(st.slices(EVH_BLOCK).flat_map(|b| b.iter().map(|r| EVHASH | (r[0] >> 3))));
+            }
+        }
+        v
+    }
+
     #[test]
     fn long_event_ids_are_keyed_by_their_digits_and_checked() {
         let c = ctx();
@@ -6866,7 +6899,7 @@ mod tests {
         for i in 0..100u64 {
             other.ekey(&c, id(i).as_bytes());
         }
-        assert!(event_ids_distinct(&mut [st, other], 2));
+        assert!({ let mut v = [st, other]; let k = evh_keys(&mut v); event_ids_distinct(&mut v, 2, &k) });
         // two IDs of one key are not: same top 61 bits of the second half, any other difference
         let k = |s: &str| unsafe { ev_hash(s.as_ptr()) }.unwrap().0;
         let (a, b) = ("e00000000000000001000000000000000", "e00000000000000011700000000000000");
@@ -6874,16 +6907,16 @@ mod tests {
         let (mut x, mut y) = (Shard::new(16, 16), Shard::new(16, 16));
         x.ekey(&c, a.as_bytes());
         y.ekey(&c, b.as_bytes());
-        assert!(!event_ids_distinct(&mut [x, y], 2));
+        assert!(!{ let mut v = [x, y]; let k = evh_keys(&mut v); event_ids_distinct(&mut v, 2, &k) });
         // the all-zero digits against a second half below 8
         let (mut x, mut y) = (Shard::new(16, 16), Shard::new(16, 16));
         x.ekey(&c, b"e00000000000000000000000000000000");
         y.ekey(&c, b"e00000000000000000700000000000000");
-        assert!(!event_ids_distinct(&mut [x, y], 2));
+        assert!(!{ let mut v = [x, y]; let k = evh_keys(&mut v); event_ids_distinct(&mut v, 2, &k) });
         let (mut x, mut y) = (Shard::new(16, 16), Shard::new(16, 16));
         x.ekey(&c, b"e00000000000000000000000000000000");
         y.ekey(&c, b"e00000000000000000000000000000000");
-        assert!(event_ids_distinct(&mut [x, y], 2));
+        assert!({ let mut v = [x, y]; let k = evh_keys(&mut v); event_ids_distinct(&mut v, 2, &k) });
     }
 
     #[test]
@@ -7007,7 +7040,7 @@ mod tests {
             s.lg.iter_mut().for_each(Log::finish);
         }
         assert!(n > 100_000 && shards.iter().all(|s| s.lg.iter().all(|l| l.len() > 4 * LG_BLOCK)));
-        let cands = mark_duplicates(&c, &shards, buckets, 3);
+        let (cands, _) = mark_duplicates(&c, &shards, buckets, 3);
         assert!(cands > n / 4 && cands <= n, "{cands} of {n}");
         // a dropped event has its ts zeroed (`mark_duplicates`)
         let dropped = |rec: *mut ERec| unsafe { (*rec).ts == 0 };

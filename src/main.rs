@@ -5021,13 +5021,13 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     w.ev = ev;
 }
 
-/// A person's events (their ts) into their 30-minute bins: returns the words of the bitmap at `wp` with a bin
-/// taken. On its own, with nothing else to keep in registers.
+/// A person's events (their ts) into their 30-minute bins: returns the words of the bitmap at `wp` (`nw` of
+/// them, all zero before) with a bin taken, found once after the events rather than kept up at each. On its own,
+/// with nothing else to keep in registers.
 ///
-/// SAFETY: every ts / GAP is a bin of `bp` and a bit of `wp`, in one of its first 64 words.
+/// SAFETY: every ts / GAP is a bin of `bp` and a bit of `wp`, in one of its first `nw` <= 64 words.
 #[inline(never)]
-unsafe fn bin_events(evs: &[u32], bp: *mut Bin, wp: *mut u64) -> u64 {
-    let mut wm = 0u64;
+unsafe fn bin_events(evs: &[u32], bp: *mut Bin, wp: *mut u64, nw: usize) -> u64 {
     let mut one = |ts: u32| {
         let b = (ts / GAP as u32) as usize;
         let bin = bp.add(b);
@@ -5045,7 +5045,6 @@ unsafe fn bin_events(evs: &[u32], bp: *mut Bin, wp: *mut u64) -> u64 {
             (*bin).nmax = (*bin).nmax.min(!ts);
         }
         *wp.add(b >> 6) |= 1 << (b & 63);
-        wm |= 1 << (b >> 6);
     };
     let mut two = evs.chunks_exact(2);
     for e in &mut two {
@@ -5053,7 +5052,7 @@ unsafe fn bin_events(evs: &[u32], bp: *mut Bin, wp: *mut u64) -> u64 {
         one(e[1]);
     }
     two.remainder().iter().for_each(|&e| one(e));
-    wm
+    (0..nw).fold(0u64, |wm, i| wm | ((*wp.add(i) != 0) as u64) << i)
 }
 
 /// The taken bins in order are the sessions, and the sessions in order the rows (one per day with a session
@@ -5115,7 +5114,7 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u32], pa: usize, np: usize, ca: usize
     // and the rows (room for nbins + 1 past row0) are written in order.
     let ns = unsafe {
         let (bp, wp) = (w.bins.as_mut_ptr(), w.bits.as_mut_ptr());
-        let mut wm = bin_events(evs, bp, wp);
+        let mut wm = bin_events(evs, bp, wp, w.bits.len());
         // the dropped copies are in bin 0 (ts 0), which no event of the window is in (it starts 7 days after
         // `Ctx::base`): out of the bitmap, and out of `wm` when its word is left empty
         *bp = FREE_BIN;

@@ -529,18 +529,31 @@ impl Interner {
         unsafe { &*(self.long as *const LongSlot).add(i & ((1 << self.lbits) - 1)) }
     }
 
-    /// Where the search for the ID whose 32 hex digits are at `p` starts (the prefix plays no part): a hash of
-    /// the digits as they are, so that `prefetch_long` need not check or convert them.
+    /// Where the search for the ID whose 32 hex digits spell the 16 bytes `lo`, `hi` (`hex32`) starts (the prefix
+    /// plays no part): one multiply, as the digits come out of a keyed bijection.
     #[inline(always)]
-    unsafe fn long_home(&self, p: *const u8) -> usize {
-        let w = |k: usize| (p.add(8 * k) as *const u64).read_unaligned();
-        (mix(w(0) ^ w(1).rotate_left(16) ^ w(2).rotate_left(32) ^ w(3).rotate_left(48)) >> (64 - self.lbits)) as usize
+    fn long_home(&self, lo: u64, hi: u64) -> usize {
+        (spread(lo ^ hi.rotate_left(32)) >> (64 - self.lbits)) as usize
     }
 
-    /// Asks for the slot where the search for the ID whose 32 hex digits are at `p` starts.
+    /// Asks for the slot where the search for the ID whose 32 hex digits are at `p` starts (nothing when they are
+    /// not 32 lowercase hex digits: `long` takes no such ID).
     #[inline(always)]
     unsafe fn prefetch_long(&self, p: *const u8) {
-        prefetch(self.slot(self.long_home(p)) as *const LongSlot);
+        if let Some((lo, hi)) = hex32(p) {
+            prefetch(self.slot(self.long_home(lo, hi)) as *const LongSlot);
+        }
+    }
+
+    /// The prefix of a long ID at `p`, `plen` (1..=8) bytes: `pack` >> 7 of them, 0 when they do not pack.
+    #[inline(always)]
+    unsafe fn long_prefix(p: *const u8, plen: usize) -> u64 {
+        if plen == 1 {
+            // one byte (every generated long ID): `pack` of a byte 1..=127 is that byte << 56
+            let b = *p as u64;
+            return if b.wrapping_sub(1) < 127 { b << 49 } else { 0 };
+        }
+        pack_at(p, plen) >> 7
     }
 
     /// The key of the `len` (33..=40) bytes at `p` from the long-ID table, when they are a prefix and 32 lowercase hex
@@ -548,12 +561,19 @@ impl Interner {
     #[inline(never)]
     unsafe fn long(&self, p: *const u8, len: usize) -> u64 {
         let plen = len - 32;
-        let pre = pack_at(p, plen) >> 7;
+        let pre = Self::long_prefix(p, plen);
         if pre == 0 {
             return 0;
         }
         let Some((lo, hi)) = hex32(p.add(plen)) else { return 0 };
-        let mut i = self.long_home(p.add(plen));
+        self.long_find(pre, lo, hi, self.long_home(lo, hi))
+    }
+
+    /// `long` of the ID of prefix `pre` (not 0) and digits `lo`, `hi`, whose search starts at slot `home`
+    /// (`long_home`).
+    #[inline(always)]
+    unsafe fn long_find(&self, pre: u64, lo: u64, hi: u64, home: usize) -> u64 {
+        let mut i = home;
         for _ in 0..LONG_PROBES {
             let s = self.slot(i);
             let mut m = s.meta.load(Acquire);

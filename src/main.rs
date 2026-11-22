@@ -254,6 +254,19 @@ const LONG: u64 = 1 << 62;
 /// its length byte, its bytes after that.
 const KEPT: u64 = 1 << 61;
 
+/// The three bits together: a click ID of a prefix of 1..=8 bytes that packs and 32 lowercase hex digits, kept as a
+/// 32-byte record (`Shard::click_key48`): the prefix's `pack` and the digits as `hex32` reads them; the low 48
+/// bits are the record's address.
+const KEPT_HEX: u64 = INTERNED | LONG | KEPT;
+
+/// The prefix's `pack` and the digits of a `KEPT_HEX` key.
+#[inline]
+fn kept_hex(key: u64) -> [u64; 3] {
+    // SAFETY: only `Shard::click_key48` makes such a key: the address of a record in the arena, which lives for the
+    // run, written before the parse ended (and fenced)
+    unsafe { *((key & ((1 << 48) - 1)) as *const [u64; 3]) }
+}
+
 /// The bytes of a `KEPT` key.
 #[inline]
 fn kept_bytes(key: u64) -> &'static [u8] {
@@ -604,6 +617,12 @@ impl Interner {
     /// Appends the ID of `key` to `out`.
     #[inline]
     fn bytes(&self, key: u64, out: &mut Vec<u8>) {
+        if key & KEPT_HEX == KEPT_HEX {
+            let mut buf = [0u8; 48];
+            let n = self.short_bytes(key, &mut buf);
+            out.extend_from_slice(&buf[..n]);
+            return;
+        }
         if key & (INTERNED | KEPT) == INTERNED | KEPT {
             out.extend_from_slice(kept_bytes(key));
             return;
@@ -636,7 +655,7 @@ impl Interner {
         }
     }
 
-    /// The ID of a packed or long-ID-table key into `out`, without the heap; its length.
+    /// The ID of a packed, long-ID-table or `KEPT_HEX` key into `out`, without the heap; its length.
     #[inline]
     fn short_bytes(&self, key: u64, out: &mut [u8; 48]) -> usize {
         let mut n = 0;
@@ -654,10 +673,15 @@ impl Interner {
             put(key);
             return n;
         }
-        let s = self.slot(key as usize);
-        put((s.meta.load(Acquire) & !(LONG_BUSY | LONG_READY)) << 7);
+        let [pre, lo, hi] = if key & KEPT_HEX == KEPT_HEX {
+            kept_hex(key)
+        } else {
+            let s = self.slot(key as usize);
+            [(s.meta.load(Acquire) & !(LONG_BUSY | LONG_READY)) << 7, s.lo.load(Relaxed), s.hi.load(Relaxed)]
+        };
+        put(pre);
         const HEX: &[u8; 16] = b"0123456789abcdef";
-        for w in [s.lo.load(Relaxed), s.hi.load(Relaxed)] {
+        for w in [lo, hi] {
             for k in 0..8 {
                 let b = (w >> (8 * k)) as u8;
                 out[n] = HEX[(b >> 4) as usize];
@@ -684,6 +708,10 @@ impl Interner {
     /// into `v`.
     #[inline]
     fn id_bytes<'a>(&self, key: u64, buf: &'a mut [u8; 48], v: &'a mut Vec<u8>) -> &'a [u8] {
+        if key & KEPT_HEX == KEPT_HEX {
+            let n = self.short_bytes(key, buf);
+            return &buf[..n];
+        }
         if key & (INTERNED | KEPT) == INTERNED | KEPT {
             return kept_bytes(key);
         }
@@ -3233,8 +3261,10 @@ impl Shard {
         self.keep_id(cx, p, len)
     }
 
-    /// `click_key` of an ID of at most 48 bytes with 48 readable from its start: one that does not pack is
-    /// copied as 48 bytes (two moves, no call), of which the arena keeps `len`.
+    /// `click_key` of an ID of at most 48 bytes with 48 readable from its start. One of a short prefix and 32
+    /// lowercase hex digits (the long IDs of v5) is kept as a `KEPT_HEX` record: 32 bytes in one non-temporal
+    /// store, a whole half line never read for ownership (the caller fences before others read); any other that
+    /// does not pack is copied as 48 bytes (two moves, no call), of which the arena keeps `len`.
     #[inline(always)]
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     unsafe fn click_key48(&mut self, cx: &Ctx, p: *const u8, len: usize) -> u64 {
@@ -3245,6 +3275,21 @@ impl Shard {
         }
         if len == 0 || len > 48 {
             return self.keep_id(cx, p, len);
+        }
+        if (33..=40).contains(&len) {
+            let pre = pack_at(p, len - 32);
+            if pre != 0 {
+                if let Some((lo, hi)) = hex32(p.add(len - 32)) {
+                    let mut at = (self.kb.0 + 31) & !31;
+                    if at + 32 > self.kb.1 {
+                        at = arena_chunk(Arena::STEP) as usize; // 2 MiB aligned
+                        self.kb.1 = at + Arena::STEP;
+                    }
+                    _mm256_stream_si256(at as *mut __m256i, _mm256_set_epi64x(0, hi as i64, lo as i64, pre as i64));
+                    self.kb.0 = at + 32;
+                    return KEPT_HEX | at as u64;
+                }
+            }
         }
         if self.kb.0 + 1 + 48 > self.kb.1 {
             let c = arena_chunk(Arena::STEP) as usize;

@@ -548,7 +548,16 @@ impl Interner {
     #[inline(never)]
     unsafe fn long(&self, p: *const u8, len: usize) -> u64 {
         let plen = len - 32;
-        let pre = pack_at(p, plen) >> 7;
+        // a 1-byte prefix (every generated ID): `pack_at` of one byte, 1..=127, is that byte << 56
+        let pre = if plen == 1 {
+            let b = *p as u64;
+            if b.wrapping_sub(1) >= 127 {
+                return 0;
+            }
+            b << 49
+        } else {
+            pack_at(p, plen) >> 7
+        };
         if pre == 0 {
             return 0;
         }

@@ -3188,6 +3188,31 @@ impl Shard {
         self.keep_id(cx, p, len)
     }
 
+    /// `click_key` of an ID of at most 48 bytes with 48 readable from its start: one that does not pack is
+    /// copied as 48 bytes (two moves, no call), of which the arena keeps `len`.
+    #[inline(always)]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe fn click_key48(&mut self, cx: &Ctx, p: *const u8, len: usize) -> u64 {
+        use std::arch::x86_64::*;
+        let k = pack_at(p, len);
+        if k != 0 {
+            return k;
+        }
+        if len == 0 || len > 48 {
+            return self.keep_id(cx, p, len);
+        }
+        if self.kb.0 + 1 + 48 > self.kb.1 {
+            let c = arena_chunk(Arena::STEP) as usize;
+            self.kb = (c, c + Arena::STEP);
+        }
+        let at = self.kb.0 as *mut u8;
+        *at = len as u8;
+        _mm256_storeu_si256(at.add(1) as *mut __m256i, _mm256_loadu_si256(p as *const __m256i));
+        _mm_storeu_si128(at.add(33) as *mut __m128i, _mm_loadu_si128(p.add(32) as *const __m128i));
+        self.kb.0 += 1 + len;
+        INTERNED | KEPT | at as u64
+    }
+
     /// `click_key` of an ID given as a slice.
     #[inline]
     fn click_key_of(&mut self, cx: &Ctx, b: &[u8]) -> u64 {

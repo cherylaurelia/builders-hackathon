@@ -5579,7 +5579,7 @@ const USER_COLS: [ColSpec; 6] = [
     ColSpec { delta: true, ..col("sessions", T_INT32, None) },
     ColSpec { delta: true, ..col("events", T_INT32, None) },
     ColSpec { delta: true, ..col("revenue_cents", T_INT64, None) },
-    ColSpec { optional: true, ..col("top_category", T_BYTES, Some(CT_UTF8)) },
+    ColSpec { optional: true, dict: true, ..col("top_category", T_BYTES, Some(CT_UTF8)) },
 ];
 
 const CAMP_COLS: [ColSpec; 7] = [
@@ -5940,17 +5940,10 @@ fn put_run(b: &mut Vec<u8>, run: usize, idx: u32, vb: usize) {
 fn write_users(path: &Path, rows: &Rows, people: &[(u64, u32)], cat_names: &[Bytes], names: &Interner) -> std::io::Result<()> {
     let mut tmp = Vec::with_capacity(64);
     let n = rows.len();
-    // the categories as PLAIN values (4-byte length, then the bytes) in 32 bytes each, at their number, with an
-    // empty one at 256 for NO_CAT (at most 256 categories): when every name fits in 28 bytes
-    let spelled: Option<Vec<([u8; 32], usize)>> = (cat_names.len() <= 256 && cat_names.iter().all(|c| c.len() <= 28)).then(|| {
-        let mut v = vec![([0u8; 32], 0usize); 257];
-        for (e, c) in v.iter_mut().zip(cat_names) {
-            e.0[..4].copy_from_slice(&(c.len() as u32).to_le_bytes());
-            e.0[4..4 + c.len()].copy_from_slice(c);
-            e.1 = 4 + c.len();
-        }
-        v
-    });
+    // top_category is dictionary encoded as well: every category, and per page the numbers of the rows with a
+    // purchase, bit-packed at the width of the largest number
+    let cat_width = (usize::BITS - (cat_names.len().max(2) - 1).leading_zeros()) as usize;
+    let mut cats: Vec<u16> = Vec::with_capacity(PAGE_ROWS);
     let mut run: Vec<u8> = Vec::new();
     // user_id is dictionary encoded: one entry per person (a person's days are consecutive rows), and the data
     // pages are runs of that entry's index. `at` = the person the next page starts in, and how many of its rows
@@ -5972,6 +5965,13 @@ fn write_users(path: &Path, rows: &Rows, people: &[(u64, u32)], cat_names: &[Byt
                 put_name(b, names, name, &mut tmp);
             }
             return entries;
+        }
+        if c == 5 && lo == DICT_PAGE {
+            for v in cat_names {
+                b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                b.extend_from_slice(v);
+            }
+            return cat_names.len();
         }
         match c {
             0 => {
@@ -6028,27 +6028,35 @@ fn write_users(path: &Path, rows: &Rows, people: &[(u64, u32)], cat_names: &[Byt
                 }
                 b.extend_from_slice(&((run.len()) as u32).to_le_bytes());
                 b.extend_from_slice(&run);
-                if let Some(spelled) = &spelled {
-                    // each value written whole as its 32 bytes, of which its length counts (none for NO_CAT)
-                    b.reserve(tops.len() * 32);
-                    // SAFETY: 32 bytes a row are reserved; an index is at most 256, the table's last entry
-                    unsafe {
-                        let mut p = b.as_mut_ptr().add(b.len());
-                        for &t in tops {
-                            let (v, len) = spelled.get_unchecked((t as usize).min(256));
-                            (p as *mut [u8; 32]).write_unaligned(*v);
-                            p = p.add(*len);
-                        }
-                        b.set_len(p as usize - b.as_ptr() as usize);
+                if hi > lo {
+                    // with rows the column is dictionary encoded (write_parquet): the bit width, then one
+                    // bit-packed run of the numbers of the rows with a purchase, in groups of 8 (the last padded)
+                    cats.clear();
+                    cats.extend(tops.iter().copied().filter(|&t| t != NO_CAT));
+                    b.push(cat_width as u8);
+                    let mut v = ((cats.len().div_ceil(8) as u64) << 1) | 1;
+                    while v >= 0x80 {
+                        b.push(v as u8 | 0x80);
+                        v >>= 7;
                     }
-                } else {
-                    for &t in tops {
-                        if t != NO_CAT {
-                            let v = cat_names[t as usize];
-                            b.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                            b.extend_from_slice(v);
+                    b.push(v as u8);
+                    let (mut acc, mut nb) = (0u64, 0usize);
+                    for &t in cats.iter() {
+                        acc |= (t as u64) << nb;
+                        nb += cat_width;
+                        while nb >= 8 {
+                            b.push(acc as u8);
+                            acc >>= 8;
+                            nb -= 8;
                         }
                     }
+                    // the padding values are zeros: up to 8 * cat_width bits a group
+                    let mut left = cats.len().div_ceil(8) * cat_width - cats.len() * cat_width / 8;
+                    if nb > 0 {
+                        b.push(acc as u8);
+                        left -= 1;
+                    }
+                    b.extend(std::iter::repeat_n(0u8, left));
                 }
             }
         }

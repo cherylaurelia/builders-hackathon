@@ -1115,11 +1115,13 @@ unsafe fn click_batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &
             (l.pc[j], l.pcl[j], l.pu[j], l.pul[j], l.ptx[j]) = (l.ac[i], l.cl[i], l.au[i], l.ul[i], l.tx[i]);
             l.pn += 1;
             // (a click ID is not looked up: `Shard::click_key`)
+            // a long user ID's slot asked for, without a branch on whether the user ID is the long one (else the
+            // first slot is asked for). SAFETY: the 32 bytes before a long ID's end are in the line, and 32 bytes
+            // from the start of any are readable (it starts within the line's first 120 bytes)
             let (s, n) = (l.au[i], l.ul[i]);
-            if (33..=40).contains(&n) {
-                // SAFETY: the 32 bytes before the ID's end are in the line
-                cx.names.prefetch_long(buf.add((s + n - 32) as usize));
-            }
+            let long = n.wrapping_sub(33) <= 7;
+            let h = cx.names.long_home(buf.add((s + if long { n - 32 } else { 0 }) as usize));
+            prefetch(cx.names.slot(h & (long as usize).wrapping_neg()) as *const LongSlot);
         }
     }
     // every other line as a whole; a date it brings is remembered for the lines to come

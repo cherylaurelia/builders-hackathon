@@ -3231,11 +3231,11 @@ fn main() {
     // keeps its person's number in the partition in 16 bits) stays above the cap.
     let pbits = (env_num("SESS_PBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000).min(9))).clamp(4, 12.min(id_bits - 4)).max((id_bits + 1).saturating_sub(16));
     let qbits = (env_num("SESS_QBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000).min(9))).clamp(4, 12);
-    // 128 KiB a read: the copy from the page cache passes the piece through the core's cache twice (as source and
-    // as copy), and a larger piece pushes the thread's open stream groups out of it (L2 is 1 MiB, and on the scorer
-    // two threads share it). tmpfs, 20M, 21 runs each, parse CPU: 512 KiB 1.66 s, 128 KiB 1.62 s, 64 KiB 1.60 s,
-    // 32 KiB 1.58 s; wall medians 0.340, 0.336, 0.333, 0.354 s
-    let chunk = env_num("SESS_CHUNK").filter(|&c| c >= 4096).unwrap_or(128 << 10);
+    // 512 KiB a piece. The pieces are parsed in place from a mapping of the page cache (no copy through the cache,
+    // which made 128 KiB the best size for a read), and pieces of 128 KiB put the eight threads' page faults on
+    // the mapping close together: they waited on the lock of one page table (box, v5 60M, 8 threads, min of 4:
+    // 128 KiB 0.780 s, 512 KiB 0.735 s, 2 MiB 0.745 s; 20M on tmpfs 0.231 -> 0.228 s)
+    let chunk = env_num("SESS_CHUNK").filter(|&c| c >= 4096).unwrap_or(512 << 10);
 
     // the parse queue: events first, then clicks
     let mut work = Vec::new();

@@ -3585,23 +3585,26 @@ fn main() {
                 let tx = tx.clone();
                 sc.spawn(move || {
                     let mut w = Work::new(cx, rows_cap, ev_cap, ck_cap);
+                    let mut uf = UserFile::new(cat_names);
+                    let user_err = |e: std::io::Error| die(&format!("write user_daily: {e}"));
                     loop {
                         let i = next.fetch_add(1, Relaxed);
                         if i >= order.len() {
                             break;
                         }
                         partition_work(cx, shards, order[i].1, &mut w);
+                        uf.pages(&mut w.rows, &w.people, cat_names, &cx.names).unwrap_or_else(user_err);
                     }
                     let cred: Vec<Cred> = w.cred.iter().zip(&w.buy).map(|(&c, b)| Cred { sessions: c, purchasing: b.purchasing }).collect();
                     let rev: Vec<i64> = w.buy.iter().map(|b| b.revenue).collect();
                     let assist: Vec<u32> = w.assist.iter().zip(&w.around).map(|(&a, &r)| a as u32 + (r << 16)).collect();
                     tx.send((cred, rev, assist)).unwrap_or_else(|_| die("campaign merger gone"));
                     // thread 0 writes even with no rows: the table needs at least one file
-                    if t == 0 || !w.rows.is_empty() {
-                        write_users(&ud.join(format!("part-{t}.parquet")), &w.rows, &w.people, cat_names, &cx.names)
-                            .unwrap_or_else(|e| die(&format!("write user_daily: {e}")));
+                    let rows = uf.done + w.rows.len();
+                    if t == 0 || rows > 0 {
+                        uf.finish(&ud.join(format!("part-{t}.parquet")), &w.rows, &w.people, cat_names, &cx.names).unwrap_or_else(user_err);
                     }
-                    n_rows.fetch_add(w.rows.len(), Relaxed);
+                    n_rows.fetch_add(rows, Relaxed);
                     w
                 })
             })
@@ -5585,15 +5588,13 @@ fn page_header(page: &mut [u8], dict: bool, nvals: usize, enc: i32) -> usize {
 /// A dictionary column (`dict`, when n > 0) first gets `fill(i, DICT_PAGE, 0, buf)`: the PLAIN dictionary page, whose
 /// number of entries `fill` returns.
 fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(usize, usize, usize, &mut Vec<u8>) -> usize) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(path)?;
     // the whole file is built in memory and written by one call: a write(2) per page cost 10 ms a file when eight
     // threads wrote at once (journal and page-cache locks), the one big call does not. The pages are made a row
     // range at a time, all columns of it before the next range, each column's into its own buffer: the rows of a
     // range are read from the cache by every column after the first, where a column at a time read all the rows
     // from memory once per column (the user rows are 24 bytes, a column's values 2 to 8).
     let mut bufs: Vec<Vec<u8>> = cols.iter().map(|_| Vec::new()).collect();
-    let mut dict_len = vec![None; cols.len()];
+    let mut dicts: Vec<Vec<u8>> = cols.iter().map(|_| Vec::new()).collect();
     let mut page = Vec::new();
     for (i, c) in cols.iter().enumerate() {
         if c.dict && n > 0 {
@@ -5602,8 +5603,7 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
             let entries = fill(i, DICT_PAGE, 0, &mut page);
             i32::try_from(page.len() - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
             let at = page_header(&mut page, true, entries, 0);
-            bufs[i].extend_from_slice(&page[at..]);
-            dict_len[i] = Some(page.len() - at);
+            dicts[i].extend_from_slice(&page[at..]);
         }
     }
     let mut lo = 0;
@@ -5614,7 +5614,7 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
             page.resize(HDR_ROOM, 0);
             fill(i, lo, hi, &mut page);
             i32::try_from(page.len() - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
-            let enc = if dict_len[i].is_some() { 8 } else if c.delta { 5 } else { 0 }; // RLE_DICTIONARY, DELTA_BINARY_PACKED, PLAIN
+            let enc = if !dicts[i].is_empty() { 8 } else if c.delta { 5 } else { 0 }; // RLE_DICTIONARY, DELTA_BINARY_PACKED, PLAIN
             let at = page_header(&mut page, false, hi - lo, enc);
             bufs[i].extend_from_slice(&page[at..]);
         }
@@ -5623,15 +5623,21 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
             break;
         }
     }
+    let chunks: Vec<(&[u8], &[u8])> = dicts.iter().zip(&bufs).map(|(d, b)| (&d[..], &b[..])).collect();
+    write_file(path, cols, n, &chunks)
+}
+
+/// Writes `path`: one row group of `n` rows, column i of `cols` made of `chunks[i]` = (its dictionary page, empty
+/// when it has none; its data pages), and the footer.
+fn write_file(path: &Path, cols: &[ColSpec], n: usize, col_chunks: &[(&[u8], &[u8])]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
     let mut off = 4i64;
     let mut chunks = Vec::with_capacity(cols.len()); // (offset, size, dictionary page offset, first data page offset)
-    for (b, d) in bufs.iter().zip(&dict_len) {
-        let (dict_off, data_off) = match d {
-            Some(len) => (Some(off), off + *len as i64),
-            None => (None, off),
-        };
-        chunks.push((off, b.len() as i64, dict_off, data_off));
-        off += b.len() as i64;
+    for &(d, b) in col_chunks {
+        let dict_off = (!d.is_empty()).then_some(off);
+        chunks.push((off, (d.len() + b.len()) as i64, dict_off, off + d.len() as i64));
+        off += (d.len() + b.len()) as i64;
     }
     let mut t = Thrift::new();
     t.begin();
@@ -5699,9 +5705,12 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
     let len = t.b.len() as u32;
     t.b.extend_from_slice(&len.to_le_bytes());
     t.b.extend_from_slice(b"PAR1");
-    let mut parts: Vec<std::io::IoSlice> = Vec::with_capacity(cols.len() + 2);
+    let mut parts: Vec<std::io::IoSlice> = Vec::with_capacity(2 * cols.len() + 2);
     parts.push(std::io::IoSlice::new(b"PAR1"));
-    parts.extend(bufs.iter().map(|b| std::io::IoSlice::new(b)));
+    for &(d, b) in col_chunks {
+        parts.push(std::io::IoSlice::new(d));
+        parts.push(std::io::IoSlice::new(b));
+    }
     parts.push(std::io::IoSlice::new(&t.b));
     let mut parts = &mut parts[..];
     std::io::IoSlice::advance_slices(&mut parts, 0); // drops empty slices
@@ -5909,124 +5918,221 @@ fn put_run(b: &mut Vec<u8>, run: usize, idx: u32, vb: usize) {
     b.extend_from_slice(&idx.to_le_bytes()[..vb]);
 }
 
-fn write_users(path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: &[Bytes], names: &Interner) -> std::io::Result<()> {
-    let mut tmp = Vec::with_capacity(64);
-    let n = rows.len();
-    let mut run: Vec<u8> = Vec::new();
+/// A thread's user_daily file, made as its rows come. After each partition (`pages`) the columns read from the
+/// rows get the pages of every whole page of rows the thread has, while those rows are still in the cache; the rows
+/// then leave `rows`, 8 pages at a time. Writing every column of every row at the end instead read each column's
+/// values out of all of a thread's rows (60M: ~20 MB a thread, eight threads at once) from memory once per column.
+/// The new people's names go into user_id's dictionary page then as well: the partitions are shared out to the
+/// threads as they come free, what a thread does at the end is not. `finish` makes the last page, the runs of
+/// user_id (their bit width is that of the number of people) and the file.
+struct UserFile {
+    bufs: [Vec<u8>; 6], // per column, its data pages so far (user_id's stays empty until `finish`)
+    pages: usize,
+    done: usize, // rows taken out of the front of `rows` (all in pages)
+    dict: Vec<u8>, // HDR_ROOM bytes, then the PLAIN names of the first `named` people
+    named: usize,
+    tmp: Vec<u8>,
+    made: usize, // and of the rows left there, how many are in pages
+    page: Vec<u8>,
     // a page's values of the column at hand, taken out of the rows first: the encoders then read an array (a
-    // delta encoder reading the 24-byte rows themselves took five times as long)
-    let mut vals: Vec<i64> = Vec::with_capacity(PAGE_ROWS);
-    let mut small: Vec<i32> = Vec::with_capacity(PAGE_ROWS);
-    let mut tops: Vec<u16> = Vec::with_capacity(PAGE_ROWS);
+    // delta encoder reading the 24-byte rows themselves took several times as long)
+    vals: Vec<i64>,
+    small: Vec<i32>,
+    tops: Vec<u16>,
+    run: Vec<u8>,
     // the categories as PLAIN values (4-byte length, then the bytes) in 32 bytes each, at their number, with an
     // empty one at 256 for NO_CAT (at most 256 categories): when every name fits in 28 bytes
-    let spelled: Option<Vec<([u8; 32], usize)>> = (cat_names.len() <= 256 && cat_names.iter().all(|c| c.len() <= 28)).then(|| {
-        let mut v = vec![([0u8; 32], 0usize); 257];
-        for (e, c) in v.iter_mut().zip(cat_names) {
-            e.0[..4].copy_from_slice(&(c.len() as u32).to_le_bytes());
-            e.0[4..4 + c.len()].copy_from_slice(c);
-            e.1 = 4 + c.len();
+    spelled: Option<Vec<([u8; 32], usize)>>,
+}
+
+impl UserFile {
+    fn new(cat_names: &[Bytes]) -> UserFile {
+        let spelled = (cat_names.len() <= 256 && cat_names.iter().all(|c| c.len() <= 28)).then(|| {
+            let mut v = vec![([0u8; 32], 0usize); 257];
+            for (e, c) in v.iter_mut().zip(cat_names) {
+                e.0[..4].copy_from_slice(&(c.len() as u32).to_le_bytes());
+                e.0[4..4 + c.len()].copy_from_slice(c);
+                e.1 = 4 + c.len();
+            }
+            v
+        });
+        UserFile {
+            bufs: Default::default(),
+            pages: 0,
+            done: 0,
+            dict: vec![0; HDR_ROOM],
+            named: 0,
+            tmp: Vec::with_capacity(64),
+            made: 0,
+            page: Vec::new(),
+            vals: Vec::with_capacity(PAGE_ROWS),
+            small: Vec::with_capacity(PAGE_ROWS),
+            tops: Vec::with_capacity(PAGE_ROWS),
+            run: Vec::new(),
+            spelled,
         }
-        v
-    });
-    // user_id is dictionary encoded: one entry per person (a person's days are consecutive rows), and the data
-    // pages are runs of that entry's index. `at` = the person the next page starts in, and how many of its rows
-    // the pages before took.
-    let entries = people.len();
-    let mut at = (0usize, 0usize);
-    // sessions and events stay far below 2^31: main() refuses inputs with that many events
-    write_parquet(path, &USER_COLS, n, |c, lo, hi, b| {
-        if c == 0 && lo == DICT_PAGE {
-            b.reserve(entries * 16);
-            for (i, &(name, _)) in people.iter().enumerate() {
-                // a long-ID-table name is read from its slot, a line of the table far from the last: asked for
-                // 48 names ahead (about six long ones)
-                if let Some(&(ahead, _)) = people.get(i + 48) {
-                    if ahead & (INTERNED | LONG) == INTERNED | LONG {
-                        prefetch(names.slot(ahead as usize));
+    }
+
+    /// The pages of the whole pages of `rows` not in pages yet, and the names of the people not named yet.
+    fn pages(&mut self, rows: &mut Vec<UserRow>, people: &[(u64, u32)], cat_names: &[Bytes], names: &Interner) -> std::io::Result<()> {
+        self.name(people, names);
+        while rows.len() - self.made >= PAGE_ROWS {
+            self.page_of(&rows[self.made..self.made + PAGE_ROWS], cat_names)?;
+            self.made += PAGE_ROWS;
+        }
+        if self.made >= 8 * PAGE_ROWS {
+            rows.drain(..self.made);
+            self.done += self.made;
+            self.made = 0;
+        }
+        Ok(())
+    }
+
+    /// The names of `people` not in the dictionary yet into it.
+    fn name(&mut self, people: &[(u64, u32)], names: &Interner) {
+        let b = &mut self.dict;
+        b.reserve((people.len() - self.named) * 16);
+        for i in self.named..people.len() {
+            // a long-ID-table name is read from its slot, a line of the table far from the last: asked for 48
+            // names ahead (about six long ones)
+            if let Some(&(ahead, _)) = people.get(i + 48) {
+                if ahead & (INTERNED | LONG) == INTERNED | LONG {
+                    prefetch(names.slot(ahead as usize));
+                }
+            }
+            put_name(b, names, people[i].0, &mut self.tmp);
+        }
+        self.named = people.len();
+    }
+
+    /// The page of rows `rs` of every column but user_id.
+    fn page_of(&mut self, rs: &[UserRow], cat_names: &[Bytes]) -> std::io::Result<()> {
+        // sessions and events stay far below 2^31: main() refuses inputs with that many events
+        for c in 1..6 {
+            let b = &mut self.page;
+            b.clear();
+            b.resize(HDR_ROOM, 0);
+            match c {
+                1..=3 => {
+                    let v = &mut self.small;
+                    v.clear();
+                    match c {
+                        1 => v.extend(rs.iter().map(|r| r.day)),
+                        2 => v.extend(rs.iter().map(|r| r.sessions as i32)),
+                        _ => v.extend(rs.iter().map(|r| r.events as i32)),
                     }
+                    // SAFETY: put_delta asks for indices below v.len()
+                    put_delta(b, v.len(), |i| *unsafe { v.get_unchecked(i) } as i64);
                 }
-                put_name(b, names, name, &mut tmp);
-            }
-            return entries;
-        }
-        let rs = &rows[lo..hi];
-        match c {
-            0 => {
-                let w = (usize::BITS - (entries.max(2) - 1).leading_zeros()) as usize;
-                b.push(w as u8);
-                let mut left = hi - lo;
-                while left > 0 {
-                    let (i, used) = at;
-                    let run = (people[i].1 as usize - used).min(left);
-                    put_run(b, run, i as u32, w.div_ceil(8));
-                    left -= run;
-                    at = if used + run == people[i].1 as usize { (i + 1, 0) } else { (i, used + run) };
+                4 => {
+                    let v = &mut self.vals;
+                    v.clear();
+                    v.extend(rs.iter().map(|r| r.revenue));
+                    // SAFETY: put_delta asks for indices below v.len()
+                    put_delta(b, v.len(), |i| *unsafe { v.get_unchecked(i) });
                 }
-            }
-            1..=3 => {
-                small.clear();
-                match c {
-                    1 => small.extend(rs.iter().map(|r| r.day)),
-                    2 => small.extend(rs.iter().map(|r| r.sessions as i32)),
-                    _ => small.extend(rs.iter().map(|r| r.events as i32)),
-                }
-                // SAFETY: put_delta asks for indices below small.len()
-                put_delta(b, small.len(), |i| *unsafe { small.get_unchecked(i) } as i64);
-            }
-            4 => {
-                vals.clear();
-                vals.extend(rs.iter().map(|r| r.revenue));
-                // SAFETY: put_delta asks for indices below vals.len()
-                put_delta(b, vals.len(), |i| *unsafe { vals.get_unchecked(i) });
-            }
-            _ => {
-                // definition levels: one bit-packed run of ceil(rows / 8) groups of 8 bits (1 = present)
-                let groups = (hi - lo).div_ceil(8);
-                run.clear();
-                let mut v = ((groups as u64) << 1) | 1;
-                while v >= 0x80 {
-                    run.push(v as u8 | 0x80);
-                    v >>= 7;
-                }
-                run.push(v as u8);
-                tops.clear();
-                tops.extend(rs.iter().map(|r| r.top));
-                let mut eight = tops.chunks_exact(8);
-                for t in &mut eight {
-                    run.push(t.iter().enumerate().fold(0u8, |a, (k, &t)| a | ((t != NO_CAT) as u8) << k));
-                }
-                if !eight.remainder().is_empty() {
-                    run.push(eight.remainder().iter().enumerate().fold(0u8, |a, (k, &t)| a | ((t != NO_CAT) as u8) << k));
-                }
-                b.extend_from_slice(&((run.len()) as u32).to_le_bytes());
-                b.extend_from_slice(&run);
-                if let Some(spelled) = &spelled {
-                    // each value written whole as its 32 bytes, of which its length counts (none for NO_CAT)
-                    b.reserve(tops.len() * 32);
-                    // SAFETY: 32 bytes a row are reserved; an index is at most 256, the table's last entry
-                    unsafe {
-                        let mut p = b.as_mut_ptr().add(b.len());
+                _ => {
+                    // definition levels: one bit-packed run of ceil(rows / 8) groups of 8 bits (1 = present)
+                    let (run, tops) = (&mut self.run, &mut self.tops);
+                    run.clear();
+                    let mut v = ((rs.len().div_ceil(8) as u64) << 1) | 1;
+                    while v >= 0x80 {
+                        run.push(v as u8 | 0x80);
+                        v >>= 7;
+                    }
+                    run.push(v as u8);
+                    tops.clear();
+                    tops.extend(rs.iter().map(|r| r.top));
+                    let mut eight = tops.chunks_exact(8);
+                    for t in &mut eight {
+                        run.push(t.iter().enumerate().fold(0u8, |a, (k, &t)| a | ((t != NO_CAT) as u8) << k));
+                    }
+                    if !eight.remainder().is_empty() {
+                        run.push(eight.remainder().iter().enumerate().fold(0u8, |a, (k, &t)| a | ((t != NO_CAT) as u8) << k));
+                    }
+                    b.extend_from_slice(&((run.len()) as u32).to_le_bytes());
+                    b.extend_from_slice(run);
+                    if let Some(spelled) = &self.spelled {
+                        // each value written whole as its 32 bytes, of which its length counts (none for NO_CAT)
+                        b.reserve(tops.len() * 32);
+                        // SAFETY: 32 bytes a row are reserved; an index is at most 256, the table's last entry
+                        unsafe {
+                            let mut p = b.as_mut_ptr().add(b.len());
+                            for &t in tops.iter() {
+                                let (v, len) = spelled.get_unchecked((t as usize).min(256));
+                                (p as *mut [u8; 32]).write_unaligned(*v);
+                                p = p.add(*len);
+                            }
+                            b.set_len(p as usize - b.as_ptr() as usize);
+                        }
+                    } else {
                         for &t in tops.iter() {
-                            let (v, len) = spelled.get_unchecked((t as usize).min(256));
-                            (p as *mut [u8; 32]).write_unaligned(*v);
-                            p = p.add(*len);
-                        }
-                        b.set_len(p as usize - b.as_ptr() as usize);
-                    }
-                } else {
-                    for &t in tops.iter() {
-                        if t != NO_CAT {
-                            let v = cat_names[t as usize];
-                            b.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                            b.extend_from_slice(v);
+                            if t != NO_CAT {
+                                let v = cat_names[t as usize];
+                                b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                                b.extend_from_slice(v);
+                            }
                         }
                     }
                 }
             }
+            i32::try_from(b.len() - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
+            let at = page_header(b, false, rs.len(), if USER_COLS[c].delta { 5 } else { 0 }); // DELTA_BINARY_PACKED, PLAIN
+            self.bufs[c].extend_from_slice(&b[at..]);
         }
-        0
-    })
+        self.pages += 1;
+        Ok(())
+    }
+
+    /// The last page (`rows` holds the rows not yet taken out, `people` all of the thread's), user_id, and the file.
+    fn finish(mut self, path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: &[Bytes], names: &Interner) -> std::io::Result<()> {
+        // the rows not in pages: under a page after `pages`; at least one page, empty when the thread has no rows
+        let mut lo = self.made;
+        while lo < rows.len() || self.pages == 0 {
+            let hi = (lo + PAGE_ROWS).min(rows.len());
+            self.page_of(&rows[lo..hi], cat_names)?;
+            lo = hi;
+        }
+        let n = self.done + rows.len();
+        // user_id is dictionary encoded (when there are rows): one entry per person (a person's days are
+        // consecutive rows), and the data pages are runs of that entry's index
+        let entries = people.len();
+        self.name(people, names);
+        let mut dict_at = self.dict.len(); // no dictionary page
+        if n > 0 {
+            i32::try_from(self.dict.len() - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
+            dict_at = page_header(&mut self.dict, true, entries, 0);
+        }
+        // the runs, in pages of the same rows as the other columns'. `at` = the person the next page starts in,
+        // and how many of its rows the pages before took.
+        let w = (usize::BITS - (entries.max(2) - 1).leading_zeros()) as usize;
+        let mut at = (0usize, 0usize);
+        let mut lo = 0;
+        loop {
+            let hi = (lo + PAGE_ROWS).min(n);
+            let b = &mut self.page;
+            b.clear();
+            b.resize(HDR_ROOM, 0);
+            b.push(w as u8);
+            let mut left = hi - lo;
+            while left > 0 {
+                let (i, used) = at;
+                let run = (people[i].1 as usize - used).min(left);
+                put_run(b, run, i as u32, w.div_ceil(8));
+                left -= run;
+                at = if used + run == people[i].1 as usize { (i + 1, 0) } else { (i, used + run) };
+            }
+            i32::try_from(b.len() - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
+            let at = page_header(b, false, hi - lo, if n > 0 { 8 } else { 0 }); // RLE_DICTIONARY; PLAIN when empty
+            self.bufs[0].extend_from_slice(&b[at..]);
+            lo = hi;
+            if lo >= n {
+                break;
+            }
+        }
+        let b = &self.bufs;
+        write_file(path, &USER_COLS, n, &[(&self.dict[dict_at..], &b[0]), (&[], &b[1]), (&[], &b[2]), (&[], &b[3]), (&[], &b[4]), (&[], &b[5])])
+    }
 }
 
 fn write_camps(path: &Path, rows: &[CampRow]) -> std::io::Result<()> {

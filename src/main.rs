@@ -25,7 +25,7 @@ use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -247,9 +247,137 @@ unsafe fn pack_at(p: *const u8, len: usize) -> u64 {
     }
 }
 
+/// Bit 62 of an interned key: the ID is one byte (1..=127) and 32 lowercase hex digits, and the low 32 bits are its
+/// slot in `Interner::hex`. Any other interned ID has bit 62 clear.
+const HEX: u64 = 1 << 62;
+
+/// A hex digit's value; 0xFF for any other byte.
+static HEXV: [u8; 256] = {
+    let mut t = [0xFFu8; 256];
+    let mut i = 0;
+    while i < 10 {
+        t[b'0' as usize + i] = i as u8;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 6 {
+        t[b'a' as usize + i] = 10 + i as u8;
+        i += 1;
+    }
+    t
+};
+
+/// The 32 lowercase hex digits at `p` as (first 16, last 16) numbers; None when a byte is not one.
+#[inline(always)]
+unsafe fn hex128(p: *const u8) -> Option<(u64, u64)> {
+    let (mut hi, mut lo, mut bad) = (0u64, 0u64, 0u8);
+    for i in 0..16 {
+        let v = *HEXV.get_unchecked(*p.add(i) as usize);
+        bad |= v;
+        hi = hi << 4 | (v & 15) as u64;
+    }
+    for i in 16..32 {
+        let v = *HEXV.get_unchecked(*p.add(i) as usize);
+        bad |= v;
+        lo = lo << 4 | (v & 15) as u64;
+    }
+    if bad & 0xF0 != 0 {
+        None
+    } else {
+        Some((hi, lo))
+    }
+}
+
+/// The IDs of a byte and 32 lowercase hex digits (one in eight of the generated ones): open addressing on the
+/// digits as two numbers, lock free, never resized. A slot is empty while its `lo` is 0; it is claimed by setting
+/// `lo`, and holds its ID once `hi` is set (after the first byte, in `tag`). An ID whose `lo` or `hi` is 0 is not
+/// put here (it goes to the locked shards).
+struct HexTable {
+    slots: &'static [[AtomicU64; 2]], // (lo, hi)
+    tag: &'static [AtomicU8],
+    bits: u32,
+}
+
+impl HexTable {
+    fn new(bits: u32) -> HexTable {
+        let n = 1usize << bits;
+        // SAFETY: zeroed memory is n empty slots and n zero tags
+        unsafe {
+            HexTable {
+                slots: std::slice::from_raw_parts(map_anon(n * 16) as *const [AtomicU64; 2], n),
+                tag: std::slice::from_raw_parts(map_anon(n) as *const AtomicU8, n),
+                bits,
+            }
+        }
+    }
+
+    /// Writes to every 2 MiB of the table on `threads` threads (see `IdTable::populate`).
+    fn populate(&self, threads: usize) {
+        const HUGE: usize = 2 << 20;
+        let bytes = self.slots.len() * 16;
+        let base = self.slots.as_ptr() as usize;
+        par(
+            threads,
+            bytes.div_ceil(HUGE),
+            || (),
+            |_, i| {
+                if !populate(base + i * HUGE, (bytes - i * HUGE).min(HUGE)) {
+                    self.slots[i * HUGE / 16][1].store(0, Relaxed);
+                }
+            },
+        );
+    }
+
+    /// The key of the ID `c` + the digits (hi, lo), both non-zero; added if new.
+    #[inline(always)]
+    fn key(&self, c: u8, hi: u64, lo: u64) -> u64 {
+        let mask = self.slots.len() - 1;
+        let mut i = (spread(lo ^ hi.rotate_left(32) ^ c as u64) >> (64 - self.bits)) as usize;
+        let mut probes = 0usize;
+        loop {
+            // SAFETY: i <= mask
+            let s = unsafe { self.slots.get_unchecked(i) };
+            let mut l = s[0].load(Acquire);
+            if l == 0 {
+                match s[0].compare_exchange(0, lo, Acquire, Acquire) {
+                    Ok(_) => {
+                        unsafe { self.tag.get_unchecked(i) }.store(c, Relaxed);
+                        s[1].store(hi, Release);
+                        return INTERNED | HEX | i as u64;
+                    }
+                    Err(now) => l = now,
+                }
+            }
+            if l == lo {
+                let mut h = s[1].load(Acquire);
+                while h == 0 {
+                    std::hint::spin_loop();
+                    h = s[1].load(Acquire);
+                }
+                if h == hi && unsafe { self.tag.get_unchecked(i) }.load(Relaxed) == c {
+                    return INTERNED | HEX | i as u64;
+                }
+            }
+            i = (i + 1) & mask;
+            probes += 1;
+            if probes == 4096 {
+                restart_with("SESS_HEX_BITS", self.bits + 1);
+            }
+        }
+    }
+
+    /// (first byte, hi, lo) of the ID in slot `i`.
+    #[inline]
+    fn get(&self, i: usize) -> (u8, u64, u64) {
+        (self.tag[i].load(Relaxed), self.slots[i][1].load(Acquire), self.slots[i][0].load(Relaxed))
+    }
+}
+
 /// The IDs that do not pack (longer than 9 bytes, or a byte that is NUL or not ASCII): each gets a number, exact on
-/// its bytes. Locked and slow; generated data never comes here.
+/// its bytes. A byte and 32 lowercase hex digits go to the lock-free `hex` table; any other such ID to the locked
+/// shards (slow; generated data only comes there with an upper-cased ID).
 struct Interner {
+    hex: HexTable,
     shards: Vec<Mutex<(HashMap<Box<[u8]>, u32, BuildHasherDefault<BytesHasher>>, Vec<Box<[u8]>>)>>,
 }
 
@@ -257,12 +385,25 @@ impl Interner {
     const SHARDS: usize = 64;
 
     fn new() -> Interner {
-        Interner { shards: (0..Self::SHARDS).map(|_| Mutex::new((HashMap::default(), Vec::new()))).collect() }
+        Self::with_hex(16)
+    }
+
+    /// An interner whose hex table has 2^bits slots.
+    fn with_hex(bits: u32) -> Interner {
+        Interner { hex: HexTable::new(bits), shards: (0..Self::SHARDS).map(|_| Mutex::new((HashMap::default(), Vec::new()))).collect() }
     }
 
     #[cold]
     #[inline(never)]
     fn intern(&self, b: &[u8]) -> u64 {
+        if b.len() == 33 && b[0] != 0 && b[0] < 128 {
+            // SAFETY: 33 bytes
+            if let Some((hi, lo)) = unsafe { hex128(b.as_ptr().add(1)) } {
+                if hi != 0 && lo != 0 {
+                    return self.hex.key(b[0], hi, lo);
+                }
+            }
+        }
         let s = (hash_bytes(b) >> 58) as usize;
         let mut g = self.shards[s].lock().unwrap_or_else(|_| die("interner poisoned"));
         let i = match g.0.get(b) {
@@ -293,24 +434,51 @@ impl Interner {
         if k != 0 {
             return k;
         }
+        if len == 33 && (*p).wrapping_sub(1) < 127 {
+            if let Some((hi, lo)) = hex128(p.add(1)) {
+                if hi != 0 && lo != 0 {
+                    return self.hex.key(*p, hi, lo);
+                }
+            }
+        }
         self.intern(std::slice::from_raw_parts(p, len))
+    }
+
+    /// The ID of a packed or hex key into `buf`, its length; None for any other key.
+    #[inline]
+    fn small(&self, key: u64, buf: &mut [u8; 40]) -> Option<usize> {
+        if key & INTERNED == 0 {
+            for i in 0..9 {
+                let d = (key >> (56 - 7 * i)) & 127;
+                if d == 0 {
+                    return Some(i);
+                }
+                buf[i] = d as u8;
+            }
+            return Some(9);
+        }
+        if key & HEX == 0 {
+            return None;
+        }
+        let (c, hi, lo) = self.hex.get(key as u32 as usize);
+        buf[0] = c;
+        for i in 0..16 {
+            buf[1 + i] = b"0123456789abcdef"[(hi >> (60 - 4 * i)) as usize & 15];
+            buf[17 + i] = b"0123456789abcdef"[(lo >> (60 - 4 * i)) as usize & 15];
+        }
+        Some(33)
     }
 
     /// Appends the ID of `key` to `out`.
     #[inline]
     fn bytes(&self, key: u64, out: &mut Vec<u8>) {
-        if key & INTERNED != 0 {
-            let g = self.shards[((key >> 32) as usize) & (Self::SHARDS - 1)].lock().unwrap_or_else(|_| die("interner poisoned"));
-            out.extend_from_slice(&g.1[key as u32 as usize]);
+        let mut buf = [0u8; 40];
+        if let Some(n) = self.small(key, &mut buf) {
+            out.extend_from_slice(&buf[..n]);
             return;
         }
-        for i in 0..9 {
-            let d = (key >> (56 - 7 * i)) & 127;
-            if d == 0 {
-                break;
-            }
-            out.push(d as u8);
-        }
+        let g = self.shards[((key >> 32) as usize) & (Self::SHARDS - 1)].lock().unwrap_or_else(|_| die("interner poisoned"));
+        out.extend_from_slice(&g.1[key as u32 as usize]);
     }
 
     /// Byte-wise `a < b` of the two IDs.
@@ -318,6 +486,15 @@ impl Interner {
     fn less(&self, a: u64, b: u64) -> bool {
         if (a | b) & INTERNED == 0 {
             return a < b;
+        }
+        if a & b & (INTERNED | HEX) == INTERNED | HEX {
+            // a first byte and 32 digits each: digits compare as their values do
+            let (x, y) = (self.hex.get(a as u32 as usize), self.hex.get(b as u32 as usize));
+            return x < y;
+        }
+        let (mut p, mut q) = ([0u8; 40], [0u8; 40]);
+        if let (Some(n), Some(m)) = (self.small(a, &mut p), self.small(b, &mut q)) {
+            return p[..n] < q[..m];
         }
         let (mut x, mut y) = (Vec::new(), Vec::new());
         self.bytes(a, &mut x);
@@ -1185,6 +1362,15 @@ impl IdTable {
 /// Replaces the process with itself and a 4x larger ID table (nothing has been written yet).
 #[cold]
 fn restart_bigger(bits: u32) -> ! {
+    if bits + 2 > 30 {
+        die("ID table would pass 2^28 lines");
+    }
+    restart_with("SESS_ID_BITS", bits + 2)
+}
+
+/// Replaces the process with itself, `var` set to `bits` (a larger table; nothing has been written yet).
+#[cold]
+fn restart_with(var: &str, bits: u32) -> ! {
     use std::os::unix::process::CommandExt;
     static ONCE: AtomicBool = AtomicBool::new(false);
     if ONCE.swap(true, Relaxed) {
@@ -1192,12 +1378,12 @@ fn restart_bigger(bits: u32) -> ! {
             std::thread::park(); // another thread is already restarting
         }
     }
-    if bits + 2 > 30 {
-        die("ID table would pass 2^28 lines");
+    if bits > 31 {
+        die("table would pass 2^31 slots");
     }
-    eprintln!("ID table of 2^{bits} slots filled up: restarting with 2^{}", bits + 2);
+    eprintln!("a table filled up: restarting with {var}={bits}");
     let exe = std::env::current_exe().unwrap_or_else(|e| die(&format!("current_exe: {e}")));
-    let err = std::process::Command::new(exe).args(std::env::args_os().skip(1)).env("SESS_ID_BITS", (bits + 2).to_string()).exec();
+    let err = std::process::Command::new(exe).args(std::env::args_os().skip(1)).env(var, bits.to_string()).exec();
     die(&format!("restart: {err}"))
 }
 
@@ -2755,11 +2941,16 @@ fn main() {
 
     // 1. links, on every thread; this one reads the small tables meanwhile
     let ids = IdTable::new(id_bits, pbits);
-    let names = Interner::new();
+    // one in eight distinct IDs is a byte and 32 hex digits (rules.md, v5): of ~1 event ID a line, ~1 click ID a
+    // line and the users; the table at about half full. A wrong guess costs speed, never rows (it restarts).
+    let hex_est = (ev_bytes / 72 + bytes(&ck_files) / 45 + id_est) / 8;
+    let hex_bits = env_num("SESS_HEX_BITS").map(|v| v as u32).unwrap_or(usize::BITS - (hex_est * 5 / 4).leading_zeros()).clamp(16, 31);
+    let names = Interner::with_hex(hex_bits);
     mark("files listed, ID table mapped");
     let (n_links, small) = std::thread::scope(|sc| {
         let links = sc.spawn(|| {
             ids.populate(threads);
+            names.hex.populate(threads);
             mark("ID table populated");
             build_links(&ids, &names, link_files, threads)
         });

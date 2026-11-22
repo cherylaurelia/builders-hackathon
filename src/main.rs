@@ -71,8 +71,54 @@ mod huge_alloc {
         a as *mut u8
     }
 
+    /// Pages already written and no longer read (`recycle`), as (address, bytes), 2 MiB aligned: blocks come from
+    /// here before new memory, so a later phase writes no page the run has not touched yet.
+    static POOL: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+    /// Hands `bytes` at `p` (2 MiB aligned, a multiple of 2 MiB, readable and writable, never read again by
+    /// their owner) to the allocator for its later blocks. Adjacent ranges merge.
+    pub fn recycle(ranges: impl IntoIterator<Item = (usize, usize)>) {
+        let Ok(mut pool) = POOL.lock() else { return };
+        pool.extend(ranges.into_iter().filter(|&(p, n)| p % HP == 0 && n % HP == 0 && n > 0));
+        pool.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(pool.len());
+        for &(p, n) in pool.iter() {
+            match merged.last_mut() {
+                Some(l) if l.0 + l.1 == p => l.1 += n,
+                _ => merged.push((p, n)),
+            }
+        }
+        *pool = merged;
+    }
+
+    /// `len` bytes (a multiple of HP) from the pool, or null: the smallest range that holds them.
+    fn take(len: usize) -> *mut u8 {
+        take_upto(len, len).0
+    }
+
+    /// From `min` up to `max` bytes (multiples of HP) from the pool, as (address, bytes); null when no range holds
+    /// `min`. The smallest range that holds `max`, else the largest one.
+    pub fn take_upto(min: usize, max: usize) -> (*mut u8, usize) {
+        let none = (std::ptr::null_mut(), 0);
+        let Ok(mut pool) = POOL.lock() else { return none };
+        let fit = (0..pool.len()).filter(|&i| pool[i].1 >= max).min_by_key(|&i| pool[i].1);
+        let Some(i) = fit.or_else(|| (0..pool.len()).filter(|&i| pool[i].1 >= min).max_by_key(|&i| pool[i].1)) else { return none };
+        let (p, n) = pool[i];
+        let len = n.min(max);
+        if n == len {
+            pool.swap_remove(i);
+        } else {
+            pool[i] = (p + len, n - len);
+        }
+        (p as *mut u8, len)
+    }
+
     unsafe fn map(size: usize) -> *mut u8 {
         let len = span(size);
+        let p = take(len);
+        if !p.is_null() {
+            return p;
+        }
         let p = reserve(len, libc::PROT_READ | libc::PROT_WRITE);
         if !p.is_null() {
             libc::madvise(p as *mut libc::c_void, len, libc::MADV_HUGEPAGE);
@@ -85,7 +131,15 @@ mod huge_alloc {
             if big(&l) { map(l.size()) } else { System.alloc(l) }
         }
         unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-            if big(&l) { map(l.size()) } else { System.alloc_zeroed(l) } // fresh mappings read as zeros
+            if !big(&l) {
+                return System.alloc_zeroed(l);
+            }
+            let p = take(span(l.size()));
+            if !p.is_null() {
+                std::ptr::write_bytes(p, 0, l.size()); // recycled pages hold old bytes
+                return p;
+            }
+            map(l.size()) // fresh mappings read as zeros
         }
         unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
             if big(&l) {
@@ -828,6 +882,19 @@ fn arena_chunk(bytes: usize) -> *mut u8 {
     p as *mut u8
 }
 
+/// From `min` up to `max` bytes of recycled memory (`Arena::recycle`), as (address, bytes); null when none.
+fn recycled(min: usize, max: usize) -> (*mut u8, usize) {
+    #[cfg(target_os = "linux")]
+    {
+        huge_alloc::take_upto(min, max)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (min, max);
+        (std::ptr::null_mut(), 0)
+    }
+}
+
 /// The address of an `ERec` in an arena as a number from 1 (0 = no record); `abase` = `arena_range().0`.
 #[inline(always)]
 fn loc_of(abase: usize, rec: *mut ERec) -> u32 {
@@ -845,6 +912,7 @@ struct Arena {
     cur: usize,
     end: usize,
     ready: usize, // the chunk's pages below this address have been asked for (`populate`)
+    chunks: Vec<(usize, usize)>, // (address, bytes) of every chunk taken, for `recycle`
 }
 
 impl Arena {
@@ -852,9 +920,40 @@ impl Arena {
     // ones there, or the tests together run out of the range
     const CHUNK: usize = if cfg!(test) { 1 << 18 } else { 32 << 20 };
     const STEP: usize = if cfg!(test) { 1 << 18 } else { 2 << 20 };
+    /// Bytes taken at a time from recycled memory.
+    const RECYCLED: usize = 2 * Self::STEP;
 
     fn new() -> Arena {
-        Arena { cur: 0, end: 0, ready: 0 }
+        Arena { cur: 0, end: 0, ready: 0, chunks: Vec::new() }
+    }
+
+    /// The whole 2 MiB pages of the current chunk past the last block, to the allocator for later blocks.
+    fn give_back(&mut self) {
+        let from = self.cur.next_multiple_of(Self::STEP);
+        if from < self.end {
+            #[cfg(target_os = "linux")]
+            huge_alloc::recycle([(from, self.end - from)]);
+            self.end = from.max(self.cur);
+        }
+    }
+
+    /// Leaves the rest of the current chunk unused: the next block comes from a recycled or a new chunk.
+    fn close(&mut self) {
+        self.end = self.cur;
+    }
+
+    /// Gives the arena's chunks to the allocator for later blocks: nothing in them is read again. Of the current
+    /// chunk only the 2 MiB pages written to go: the rest has no memory behind it yet.
+    fn recycle(&mut self) {
+        let mut chunks = std::mem::take(&mut self.chunks);
+        if let Some(last) = chunks.last_mut() {
+            last.1 = (self.cur.next_multiple_of(Self::STEP)).min(last.0 + last.1) - last.0;
+        }
+        #[cfg(target_os = "linux")]
+        huge_alloc::recycle(chunks);
+        #[cfg(not(target_os = "linux"))]
+        let _ = chunks;
+        (self.cur, self.end, self.ready) = (0, 0, 0);
     }
 
     #[inline]
@@ -862,8 +961,14 @@ impl Arena {
         debug_assert!(bytes % 64 == 0); // blocks stay 64-byte aligned (see `Stream`)
         if self.cur + bytes > self.end {
             let n = bytes.max(Self::CHUNK).next_multiple_of(Self::STEP);
-            self.cur = arena_chunk(n) as usize;
+            // recycled pages a few at a time: what this arena leaves unused is lost to the later phases
+            let (p, n) = match recycled(bytes.next_multiple_of(Self::STEP), bytes.max(Self::RECYCLED).next_multiple_of(Self::STEP)) {
+                (p, k) if !p.is_null() => (p, k),
+                _ => (arena_chunk(n), n),
+            };
+            self.cur = p as usize;
             self.end = self.cur + n;
+            self.chunks.push((self.cur, n));
             self.ready = self.cur;
         }
         let p = self.cur;
@@ -2790,6 +2895,30 @@ fn par<S: Send>(threads: usize, n: usize, init: impl Fn() -> S + Sync, work: imp
     })
 }
 
+/// `par` with the states given, one thread each.
+fn par_from<S: Send>(states: Vec<S>, n: usize, work: impl Fn(&mut S, usize) + Sync) -> Vec<S> {
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = states
+            .into_iter()
+            .map(|mut s| {
+                let (next, work) = (&next, &work);
+                sc.spawn(move || {
+                    loop {
+                        let i = next.fetch_add(1, Relaxed);
+                        if i >= n {
+                            break;
+                        }
+                        work(&mut s, i);
+                    }
+                    s
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
 /// Parses a small clean file (products.csv / campaigns.csv) into its 2-field rows.
 fn small_table(path: &Path) -> Vec<(Bytes, Bytes)> {
     let f = map_file(path);
@@ -3206,8 +3335,11 @@ impl Shard {
             return cx.names.intern(std::slice::from_raw_parts(p, len));
         }
         if self.kb.0 + 1 + len > self.kb.1 {
-            let c = arena_chunk(Arena::STEP) as usize;
-            self.kb = (c, c + Arena::STEP);
+            let (c, n) = match recycled(Arena::STEP, Arena::STEP) {
+                (c, n) if !c.is_null() => (c, n),
+                _ => (arena_chunk(Arena::STEP), Arena::STEP),
+            };
+            self.kb = (c as usize, c as usize + n);
         }
         let at = self.kb.0 as *mut u8;
         *at = len as u8;
@@ -3364,13 +3496,11 @@ fn main() {
     };
     lap(&format!("small tables, links joined: {n_links} lines; 2^{id_bits} id slots, 2^{pbits} person partitions, 2^{qbits} event buckets"));
 
-    // 2. events and clicks, from the one queue
+    // 2. events, then (after the duplicates, 3.) clicks: the clicks' records reuse the pages of the dedup records
+    // instead of new ones (`Arena::recycle`)
     let (np, nq) = (1usize << pbits, 1usize << qbits);
-    let mut shards = par(
-        threads,
-        work.len(),
-        || Shard::new(np, nq),
-        |st, i| {
+    let n_evw = work.iter().take_while(|w| w.0 == 0).count();
+    let parse = |st: &mut Shard, i: usize| {
             let (kind, fi, s, e) = work[i];
             let f = if kind == 0 { &ev_files[fi] } else { &ck_files[fi] };
             let mut buf = std::mem::take(&mut st.buf);
@@ -3386,17 +3516,15 @@ fn main() {
             }
             st.buf = buf;
             piece_done(f);
-        },
-    );
+    };
+    let mut shards = par(threads, n_evw, || Shard::new(np, nq), &parse);
     // the records of groups not yet full, written by this thread (each parse thread fenced its own before the join)
     for s in &mut shards {
         s.ev.iter_mut().for_each(Stream::finish);
-        s.ck.iter_mut().for_each(Stream::finish);
         s.lg.iter_mut().for_each(Log::finish);
     }
     let n_ev: usize = shards.iter().flat_map(|s| s.ev.iter()).map(|s| s.len(EV_BLOCK)).sum();
-    let n_ck: usize = shards.iter().flat_map(|s| s.ck.iter()).map(|s| s.len(CK_BLOCK)).sum();
-    lap(&format!("parsed: {n_ev} valid events, {n_ck} valid clicks"));
+    lap(&format!("parsed: {n_ev} valid events"));
     if n_ev >= i32::MAX as usize {
         die("too many events for 32-bit session and event counts"); // user_daily writes them as INT32
     }
@@ -3407,12 +3535,27 @@ fn main() {
         }
         for s in &mut shards {
             s.evh = Vec::new();
+            s.earena.recycle();
         }
     }
 
     // 3. duplicates
     let n_dups = mark_duplicates(&cx, &shards, nq, threads);
     lap(&format!("duplicates marked: {n_dups} candidates"));
+    // the dedup records are read for the last time: the sessions' blocks reuse their pages, already written,
+    // where new ones would each take a fault and a zeroed page
+    for s in &mut shards {
+        s.lg = Vec::new();
+        s.larena.recycle();
+        s.arena.close(); // the rest of the events' last chunk has no memory behind it yet
+    }
+    let mut shards = par_from(shards, work.len() - n_evw, |st, i| parse(st, n_evw + i));
+    for s in &mut shards {
+        s.ck.iter_mut().for_each(Stream::finish);
+        s.arena.give_back();
+    }
+    let n_ck: usize = shards.iter().flat_map(|s| s.ck.iter()).map(|s| s.len(CK_BLOCK)).sum();
+    lap(&format!("parsed: {n_ck} valid clicks"));
 
     // 4. per person partition, the largest first; each thread writes its rows when the queue is empty
     let ud = out.join("user_daily");

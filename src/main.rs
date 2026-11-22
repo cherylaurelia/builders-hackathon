@@ -3248,7 +3248,9 @@ fn main() {
     // limit of 2^23 slots (at link_bytes / 14 it was 2^24: twice the table to zero and to flatten, 4% of the run
     // on the box). A wrong guess costs speed, never rows: the ID table restarts the run when it fills up.
     let id_est = link_bytes / 18 + ev_bytes / 3000 + bytes(&ck_files) / 3000;
-    let id_bits = env_num("SESS_ID_BITS").map(|v| v as u32).unwrap_or(usize::BITS - (id_est * 7 / 5).leading_zeros()).clamp(16, 30);
+    // (x 5/4: v5 60M sets estimate 6.0M, right at 2^23 / 1.4, so x 7/5 gave 2^24 or 2^23 by chance; they hold some
+    // 4.45M IDs, 71% of the 2^23 table's limit. Intel 60M: 2^23 0.9% faster than 2^24)
+    let id_bits = env_num("SESS_ID_BITS").map(|v| v as u32).unwrap_or(usize::BITS - (id_est * 5 / 4).leading_zeros()).clamp(16, 30);
     // about 90,000 events per person partition and per event-key bucket: more of them slow the parse (one open
     // block each per thread), fewer leave the later phases with work that no longer fits a core's cache
     let ev_est = ev_bytes / 72;

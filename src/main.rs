@@ -3330,12 +3330,25 @@ impl Shard {
         const SSZ: usize = std::mem::size_of::<Stream<ERec, EV_LINES>>();
         const { assert!(SSZ == std::mem::size_of::<Stream<CRec, CK_LINES>>()) };
         const LSZ: usize = std::mem::size_of::<Log>();
-        let (mut soff, mut local, mut ing, mut loff) = ([0u32; BATCH], [0u32; BATCH], [0u32; BATCH], [0u32; BATCH]);
-        let (psh, lmask) = (_mm_cvtsi32_si128(cx.pshift as i32), _mm512_set1_epi32(((1u32 << cx.pshift) - 1) as i32));
+        let (mut soff, mut ing, mut loff, mut word) = ([0u32; BATCH], [0u32; BATCH], [0u32; BATCH], [0u64; BATCH]);
+        let psh = _mm_cvtsi32_si128(cx.pshift as i32);
         for c in 0..BATCH / 16 {
             let p = _mm512_loadu_si512(person.as_ptr().add(16 * c) as *const _);
             _mm512_storeu_si512(soff.as_mut_ptr().add(16 * c) as *mut _, _mm512_mullo_epi32(_mm512_srl_epi32(p, psh), _mm512_set1_epi32(SSZ as i32)));
-            _mm512_storeu_si512(local.as_mut_ptr().add(16 * c) as *mut _, _mm512_and_si512(p, lmask));
+        }
+        // the record's word: an `ERec` without HAS_PAY (ts | local << 32), or `CRec::w` (ts | campaign << 32 |
+        // local << 48)
+        let lmask = _mm512_set1_epi64(((1u64 << cx.pshift) - 1) as i64);
+        for c in 0..BATCH / 8 {
+            let l = _mm512_and_si512(_mm512_cvtepu32_epi64(_mm256_loadu_si256(person.as_ptr().add(8 * c) as *const _)), lmask);
+            let tx = _mm512_loadu_si512(bt.tx.as_ptr().add(8 * c) as *const _);
+            let w = if EVENTS {
+                _mm512_or_si512(_mm512_srli_epi64::<32>(tx), _mm512_slli_epi64::<32>(l))
+            } else {
+                let camp = _mm512_and_si512(tx, _mm512_set1_epi64(0xffff));
+                _mm512_or_si512(_mm512_or_si512(_mm512_srli_epi64::<32>(tx), _mm512_slli_epi64::<32>(camp)), _mm512_slli_epi64::<48>(l))
+            };
+            _mm512_storeu_si512(word.as_mut_ptr().add(8 * c) as *mut _, w);
         }
         if EVENTS {
             let (qsh, ilo, ihi) = (_mm_cvtsi64_si128(cx.qshift as i64), _mm512_set1_epi64(cx.ilo), _mm512_set1_epi64(cx.ihi));
@@ -3356,22 +3369,23 @@ impl Shard {
         let pay_bin = ids.bins() as u32;
         let (evp, ckp, lgp, abase) = (ev.as_mut_ptr() as *mut u8, ck.as_mut_ptr() as *mut u8, lg.as_mut_ptr() as *mut u8, cx.abase);
         for i in 0..n {
-            let (a, tx, l) = (*bt.a.get_unchecked(i), *bt.tx.get_unchecked(i), *local.get_unchecked(i));
+            let (a, w) = (*bt.a.get_unchecked(i), *word.get_unchecked(i));
             let so = *soff.get_unchecked(i) as usize;
             // SAFETY: the offsets are of a stream below the 2^pbits of `ev` and `ck` (a person's partition, as in
             // `drain`) and of a log below the 2^qbits of `lg`
             if EVENTS {
                 let s = &mut *(evp.add(so) as *mut Stream<ERec, EV_LINES>);
-                let (ts, pay) = ((tx >> 32) as u32, tx as u32);
+                let pay = *bt.tx.get_unchecked(i) as u32;
+                // an ERec is its word: ts in the low half (x86 is little-endian), lw in the high
                 let rec = if pay == 0 {
-                    s.push(arena, EV_BLOCK, ERec { ts, lw: l })
+                    s.push(arena, EV_BLOCK, std::mem::transmute::<u64, ERec>(w))
                 } else {
                     // the pay record and its event in one group, as in `drain`
                     if s.pos == EV_LINES * 64 - 8 {
                         s.push(arena, EV_BLOCK, ERec { ts: 0, lw: pay_bin });
                     }
                     s.push(arena, EV_BLOCK, ERec { ts: pay, lw: pay_bin });
-                    s.push(arena, EV_BLOCK, ERec { ts, lw: l | HAS_PAY })
+                    s.push(arena, EV_BLOCK, std::mem::transmute::<u64, ERec>(w | (HAS_PAY as u64) << 32))
                 };
                 let loc = loc_of(abase, rec);
                 let g = *ing.get_unchecked(i);
@@ -3380,7 +3394,7 @@ impl Shard {
                 }
                 (*(lgp.add(*loff.get_unchecked(i) as usize) as *mut Log)).push(larena, a, LRec::pay(g, loc));
             } else {
-                (*(ckp.add(so) as *mut Stream<CRec, CK_LINES>)).push(arena, CK_BLOCK, CRec::new(a, l, (tx >> 32) as u32, tx as u32));
+                (*(ckp.add(so) as *mut Stream<CRec, CK_LINES>)).push(arena, CK_BLOCK, CRec { cid: a, w });
             }
         }
     }

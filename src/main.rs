@@ -2456,6 +2456,53 @@ unsafe fn split_link(line: *const u8) -> Option<(Cut, usize)> {
     Some((Cut { s, e }, b1.trailing_zeros() as usize + 1))
 }
 
+/// `split::<N>` of the line at `line` from the masks of its first 192 bytes (all must be readable): each field as
+/// (start, length) with its quotes left out, and the line's length with its `\n`. None when the line does not end
+/// in those bytes or is malformed (the caller then takes it through `split`). For the lines `split_event` and
+/// `split_click` do not take: v5 IDs of 33 bytes push their fields past one window.
+#[inline(always)]
+unsafe fn split_wide<const N: usize>(line: *const u8) -> Option<([(usize, usize); N], usize)> {
+    let m = [masks64(line), masks64(line.add(64)), masks64(line.add(128))];
+    let q = [m[0][1], m[1][1], m[2][1]];
+    // the quotes in [s, e)
+    let quotes = |s: usize, e: usize| -> u32 {
+        let mut t = 0;
+        for (w, &qw) in q.iter().enumerate() {
+            let (a, b) = (s.max(w * 64), e.min(w * 64 + 64));
+            if a < b {
+                let width = b - a;
+                let mask = if width == 64 { !0 } else { (1u64 << width) - 1 };
+                t += (qw & (mask << (a - w * 64))).count_ones();
+            }
+        }
+        t
+    };
+    let mut f = [(0usize, 0usize); N];
+    let (mut k, mut s) = (0, 0);
+    for (w, &[c, _, n]) in m.iter().enumerate() {
+        let mut b = c | n;
+        while b != 0 {
+            let j = b.trailing_zeros() as usize;
+            let i = w * 64 + j;
+            if k == N {
+                return None;
+            }
+            f[k] = match quotes(s, i) {
+                0 => (s, i - s),
+                2 if i - s >= 2 && *line.add(s) == b'"' && *line.add(i - 1) == b'"' => (s + 1, i - s - 2),
+                _ => return None,
+            };
+            k += 1;
+            s = i + 1;
+            if (n >> j) & 1 != 0 {
+                return if k == N { Some((f, i + 1)) } else { None };
+            }
+            b &= b - 1;
+        }
+    }
+    None
+}
+
 /// (user + sys CPU seconds, instructions retired) of this process so far; instructions only on macOS
 fn usage() -> (f64, u64) {
     let mut u: libc::rusage = unsafe { std::mem::zeroed() };
@@ -3485,6 +3532,32 @@ unsafe fn fast_event(cx: &Ctx, line: *const u8, mut a: Cut, rest: *const u8, mut
     st.keep(cx, ekey, ingest, cx.names.key_at(line.add(us), ul), ts, pay);
 }
 
+/// `fast_event` for a line split by `split_wide`; line[..192] is readable.
+#[inline(always)]
+unsafe fn fast_event_at(cx: &Ctx, line: *const u8, f: [(usize, usize); 7], st: &mut Shard) {
+    let [(es, el), (us, ul), (ts, tl), (is, il), (ks, kl), (ps, pl), (cs, cl)] = f;
+    if el == 0 {
+        return;
+    }
+    let Some(ingest) = ts_memo(line.add(is), il, &mut st.days) else { return };
+    let ekey = cx.names.key_at(line.add(es), el);
+    let ts = match ts_memo(line.add(ts), tl, &mut st.days) {
+        Some(t) if ul != 0 && pl != 0 && t >= cx.ws && t < cx.we && ingest - t <= DAY => t,
+        _ => return st.log(cx, ekey, ingest, 0),
+    };
+    let w = (line.add(ks) as *const u64).read_unaligned();
+    let pay = match kl {
+        4 if w as u32 == u32::from_le_bytes(*b"view") || w as u32 == u32::from_le_bytes(*b"cart") => 0,
+        8 if w == u64::from_le_bytes(*b"purchase") => {
+            let Some(p) = parse_price(std::slice::from_raw_parts(line.add(cs), cl)) else { return st.log(cx, ekey, ingest, 0) };
+            let cat = cx.products.get_at(line.add(ps), pl).unwrap_or(cx.unknown_cat);
+            (cat as u32) << 24 | p
+        }
+        _ => return st.log(cx, ekey, ingest, 0),
+    };
+    st.keep(cx, ekey, ingest, cx.names.key_at(line.add(us), ul), ts, pay);
+}
+
 /// The event line at `buf + p` through the two-window parser (`split_event`, `fast_event`), or, when that does not
 /// take it, as a whole line through `split` and `event_fields`. Returns where the next line starts.
 #[inline(never)]
@@ -3493,6 +3566,13 @@ unsafe fn event_line(cx: &Ctx, buf: *const u8, p: usize, len: usize, st: &mut Sh
     if let Some((a, b, o, n)) = split_event(line) {
         fast_event(cx, line, a, line.add(o), b, st);
         return p + n;
+    }
+    // 192 bytes from the line are readable: 144 past len
+    if p + 48 <= len {
+        if let Some((f, n)) = split_wide::<7>(line) {
+            fast_event_at(cx, line, f, st);
+            return p + n;
+        }
     }
     let file = std::slice::from_raw_parts(buf, len);
     let e = memchr::memchr(b'\n', &file[p..]).map_or(len, |i| p + i);
@@ -3731,6 +3811,20 @@ unsafe fn click_line(cx: &Ctx, buf: *const u8, p: usize, len: usize, st: &mut Sh
     if let Some((f, n)) = split_click(line) {
         fast_click(cx, line, f, st);
         return p + n;
+    }
+    if p + 48 <= len {
+        if let Some(([(cs, cl), (us, ul), (ks, kl), (ts, tl)], n)) = split_wide::<4>(line) {
+            if cl != 0 && ul != 0 {
+                if let Some(t) = ts_memo(line.add(ts), tl, &mut st.days) {
+                    if t >= cx.base && t < cx.we {
+                        if let Some(camp) = cx.campaigns.get_short(line.add(ks), kl) {
+                            st.click(cx, cx.names.key_at(line.add(cs), cl), cx.names.key_at(line.add(us), ul), t, camp);
+                        }
+                    }
+                }
+            }
+            return p + n;
+        }
     }
     let file = std::slice::from_raw_parts(buf, len);
     let e = memchr::memchr(b'\n', &file[p..]).map_or(len, |i| p + i);

@@ -2552,6 +2552,47 @@ unsafe fn split_link(line: *const u8) -> Option<(Cut, usize)> {
     Some((Cut { s, e }, b1.trailing_zeros() as usize + 1))
 }
 
+/// `window` on 128 bytes.
+#[inline(always)]
+fn window128(b: u128, q: u128) -> (u128, u128, u128) {
+    let s = (b << 1) | 1;
+    let z = b >> 1;
+    let x = q & s;
+    let y = (q << 1) & b;
+    let bad = (q & !(s | z)) | (x & z) | (y.wrapping_sub(x) & b);
+    ((s ^ x) | (x << 1), (b & !y) | (y >> 1), bad)
+}
+
+/// `split::<N>` of the line at `line` as `split_click` does it, on 128 bytes (all must be readable): its fields
+/// as (start, length), and its length with its `\n`. None unless the whole line is in its first 128 bytes and
+/// well formed. For the lines with a 33-byte ID (v5).
+#[inline(always)]
+unsafe fn split128<const N: usize>(line: *const u8) -> Option<([(usize, usize); N], usize)> {
+    let ([c0, q0, n0], [c1, q1, n1]) = (masks64(line), masks64(line.add(64)));
+    let (c, q, n) = (c0 as u128 | (c1 as u128) << 64, q0 as u128 | (q1 as u128) << 64, n0 as u128 | (n1 as u128) << 64);
+    let b = c | n;
+    let mut x = b;
+    for _ in 1..N {
+        x &= x.wrapping_sub(1);
+    }
+    if x == 0 {
+        return None;
+    }
+    let m = x ^ x.wrapping_sub(1); // through the N-th boundary
+    let (mut s, mut e, bad) = window128(b & m, q & m);
+    // the first N - 1 boundaries are commas, the N-th the newline
+    if ((n & m) ^ (x & x.wrapping_neg())) | bad != 0 {
+        return None;
+    }
+    let mut f = [(0usize, 0usize); N];
+    for v in f.iter_mut() {
+        let (a, z) = (s.trailing_zeros() as usize, e.trailing_zeros() as usize);
+        (s, e) = (s & s.wrapping_sub(1), e & e.wrapping_sub(1));
+        *v = (a, z - a);
+    }
+    Some((f, x.trailing_zeros() as usize + 1))
+}
+
 /// `split::<N>` of the line at `line` from the masks of its first 192 bytes (all must be readable): each field as
 /// (start, length) with its quotes left out, and the line's length with its `\n`. None when the line does not end
 /// in those bytes or is malformed (the caller then takes it through `split`). For the lines `split_event` and
@@ -3859,6 +3900,10 @@ unsafe fn event_line(cx: &Ctx, buf: *const u8, p: usize, len: usize, st: &mut Sh
     }
     // 192 bytes from the line are readable: 144 past len
     if p + 48 <= len {
+        if let Some((f, n)) = split128::<7>(line) {
+            fast_event_at(cx, line, f, st);
+            return p + n;
+        }
         if let Some((f, n)) = split_wide::<7>(line) {
             fast_event_at(cx, line, f, st);
             return p + n;
@@ -4106,7 +4151,11 @@ unsafe fn click_line(cx: &Ctx, buf: *const u8, p: usize, len: usize, st: &mut Sh
         return p + n;
     }
     if p + 48 <= len {
-        if let Some(([(cs, cl), (us, ul), (ks, kl), (ts, tl)], n)) = split_wide::<4>(line) {
+        let sp = match split128::<4>(line) {
+            None => split_wide::<4>(line),
+            x => x,
+        };
+        if let Some(([(cs, cl), (us, ul), (ks, kl), (ts, tl)], n)) = sp {
             if cl != 0 && ul != 0 {
                 if let Some(t) = ts_memo(line.add(ts), tl, &mut st.days) {
                     if t >= cx.base && t < cx.we {
@@ -6039,9 +6088,21 @@ mod tests {
             let n = if round % 2 == 0 { 7 } else { 4 };
             let mut line = String::new();
             let usual = round % 3 == 0;
+            let mut long = false;
             if usual {
-                let ev = ["e4ajy5dva", "u24wwm60w", "2027-12-21T10:03:10-02:00", "2027-12-18T22:22:54Z", "purchase", "p38449", "41607"];
-                let ck = ["k9pbmgz1e", "u8nj7nrj5", "c_332", "2027-12-21T10:03:10-02:00"];
+                let mut ev = ["e4ajy5dva", "u24wwm60w", "2027-12-21T10:03:10-02:00", "2027-12-18T22:22:54Z", "purchase", "p38449", "41607"];
+                let mut ck = ["k9pbmgz1e", "u8nj7nrj5", "c_332", "2027-12-21T10:03:10-02:00"];
+                // v5: one ID in eight is a byte and 32 hex digits
+                if r.below(3) == 0 {
+                    long = true;
+                    ev[0] = "e1oqedh7t02423c3d84ab053af78764c";
+                    ck[0] = "k02423c3d84ab053af78764ce49f23b5c";
+                }
+                if r.below(3) == 0 {
+                    long = true;
+                    ev[1] = "u02423c3d84ab053af78764ce49f23b5c";
+                    ck[1] = "u02423c3d84ab053af78764ce49f23b5c";
+                }
                 let fields: Vec<String> = (0..n)
                     .map(|i| {
                         let v = if n == 7 { ev[i] } else { ck[i] };
@@ -6082,6 +6143,22 @@ mod tests {
                 let got = unsafe { split_click(buf.as_ptr()) }.map(|(mut f, n)| ((0..4).map(|_| f.next()).collect::<Vec<_>>(), n));
                 (got, split::<4>(text).map(|f| f.map(|x| x.to_vec()).to_vec()))
             };
+            // the wide splitters: exact on every line they take; split_wide takes every good line of < 192 bytes
+            let wide: [Option<(Vec<(usize, usize)>, usize)>; 2] = if n == 7 {
+                unsafe { [split128::<7>(buf.as_ptr()).map(|(f, n)| (f.to_vec(), n)), split_wide::<7>(buf.as_ptr()).map(|(f, n)| (f.to_vec(), n))] }
+            } else {
+                unsafe { [split128::<4>(buf.as_ptr()).map(|(f, n)| (f.to_vec(), n)), split_wide::<4>(buf.as_ptr()).map(|(f, n)| (f.to_vec(), n))] }
+            };
+            for (k, g) in wide.iter().enumerate() {
+                match g {
+                    Some((f, len)) => {
+                        assert_eq!(*len, first.len() + 1, "{k} line {line:?}");
+                        let f: Vec<Vec<u8>> = f.iter().map(|&(s, l)| buf[s..s + l].to_vec()).collect();
+                        assert_eq!(Some(f), want, "{k} line {line:?}");
+                    }
+                    None => assert!(want.is_none() || first.len() + 1 > [128, 192][k] || line.contains('\n'), "{k} line {line:?}"),
+                }
+            }
             if let Some((f, len)) = &got {
                 let len = *len;
                 assert_eq!(len, first.len() + 1, "line {line:?}");
@@ -6094,15 +6171,16 @@ mod tests {
                 }
             }
             if usual {
-                assert!(got.is_some() && want.is_some(), "line {line:?}");
-                if n == 7 {
+                assert!((long || got.is_some()) && want.is_some() && wide[1].is_some(), "line {line:?}");
+                if long {
+                } else if n == 7 {
                     usual7 += 1;
                 } else {
                     usual4 += 1;
                 }
             }
         }
-        assert!(usual7 > 90_000 && usual4 > 90_000 && took7 > usual7 + 10_000 && took4 > usual4 + 10_000, "{took7} {took4} {usual7} {usual4}");
+        assert!(usual7 > 40_000 && usual4 > 40_000 && took7 > usual7 + 10_000 && took4 > usual4 + 10_000, "{took7} {took4} {usual7} {usual4}");
     }
 
     #[test]

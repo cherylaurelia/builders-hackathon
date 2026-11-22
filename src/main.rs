@@ -7228,6 +7228,60 @@ mod tests {
         assert!(fresh > 3_000 && far > 50, "{fresh} {far}");
     }
 
+    /// `Shard::drain` with AVX-512 (`drain_wide`) writes what it writes without: the same events, pay records,
+    /// dedup records (ingest_ts at the edges of what an `LRec` holds, late and far ones), clicks and people, for
+    /// batches of every size, users new and seen, two shards fed alike.
+    #[test]
+    fn wide_drain_writes_what_drain_does() {
+        let (c1, mut c2) = (ctx(), ctx());
+        c2.ids.wide = false;
+        if !c1.ids.wide {
+            return; // this CPU has one way only
+        }
+        let (parts, buckets) = (1usize << (17 - c1.pshift), 1usize << (64 - c1.qshift));
+        let (mut s1, mut s2) = (Shard::new(parts, buckets), Shard::new(parts, buckets));
+        let mut r = Rng(11);
+        let c = &c1;
+        let edges = [c.ilo, c.ilo - 1, c.ilo + 1, c.ilo - 100 * DAY, c.ilo + ING_SPAN - 2, c.ilo + ING_SPAN - 1, c.ilo + ING_SPAN, c.ihi, c.ihi + 1, c.ihi + DAY, i64::MIN / 4, i64::MAX / 4];
+        let (mut events_seen, mut clicks_seen) = (0, 0);
+        for round in 0..600 {
+            let events = round % 3 != 0;
+            let n = 1 + r.below(BATCH - 1);
+            for _ in 0..n {
+                let ukey = c.names.key(format!("u{:07}", r.below(5000)).as_bytes());
+                let a = r.next();
+                let b = if r.below(3) == 0 { edges[r.below(edges.len())] } else { c.ws + r.below(14 * 86_400_000) as i64 };
+                let ts = c.base + r.below(1 << 31) as i64;
+                let x = if events { if r.below(4) == 0 { 1 + r.below(1 << 20) as u32 } else { 0 } } else { r.below(1 << 16) as u32 };
+                s1.wait(&c1, events, a, b, ukey, ts, x);
+                s2.wait(&c2, events, a, b, ukey, ts, x);
+            }
+            if events {
+                s1.drain::<true>(&c1);
+                s2.drain::<true>(&c2);
+                events_seen += n;
+            } else {
+                s1.drain::<false>(&c1);
+                s2.drain::<false>(&c2);
+                clicks_seen += n;
+            }
+        }
+        let clicks = |s: &mut Shard| {
+            s.ck.iter_mut().for_each(Stream::finish);
+            let mut v: Vec<(usize, u64, u64)> = s.ck.iter().enumerate().flat_map(|(p, st)| st.slices(CK_BLOCK).flatten().map(move |r| (p, r.cid, r.w)).collect::<Vec<_>>()).collect();
+            v.sort();
+            v
+        };
+        let (f1, f2) = (flat(&mut s1), flat(&mut s2));
+        assert_eq!(f1.0.len(), events_seen);
+        assert_eq!(f1.1.len(), events_seen);
+        assert!(!s1.far.is_empty());
+        assert!(f1 == f2, "events or dedup records differ");
+        let (k1, k2) = (clicks(&mut s1), clicks(&mut s2));
+        assert_eq!(k1.len(), clicks_seen);
+        assert!(k1 == k2, "clicks differ");
+    }
+
     /// `mark_duplicates` against the rule itself, per key: every copy with an event that is ingested after the
     /// earliest copy is dropped, and of the earliest copies (identical ones) exactly one stays. Keys with one copy
     /// and with thousands, short IDs, copies without an event, far and late ingest_ts, three shards, four buckets.

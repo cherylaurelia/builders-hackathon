@@ -1548,6 +1548,23 @@ impl IdTable {
         self.person_at(i & (BATCH - 1), key, home, person, late, ins)
     }
 
+    /// The person of `key` (entry `i` of a batch, its home line asked for) settled by its home line: added there
+    /// if new; 0 when the line is full of other keys: the entry joins `late` and `home` moves to the next line.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    #[cold]
+    #[inline(never)]
+    fn person_cold(&self, i: usize, key: u64, home: &mut u32, late: &mut Late, ins: &mut usize) -> u32 {
+        match self.slot_in_line(*home, key, ins) {
+            Some(t) => self.person(t),
+            None => {
+                *home = self.next_line(*home);
+                late.at[late.n & (BATCH - 1)] = i as u8; // n < BATCH: at most one entry per ID of the batch
+                late.n += 1;
+                0
+            }
+        }
+    }
+
     /// The first pass of `people` with one 512-bit compare a line: the line's eight words against the ID, of which
     /// the first five are its keys. An ID found with its person written down is settled here; any other goes
     /// through `person_rare`.
@@ -3191,6 +3208,11 @@ impl Shard {
     /// stay in the L2 (Intel 20M: asking cost 1.4% wall).
     #[inline(never)]
     fn drain<const EVENTS: bool>(&mut self, cx: &Ctx) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+        if cx.ids.wide {
+            // SAFETY: `wide` says the CPU has AVX-512 F and VL
+            return unsafe { self.drain_wide::<EVENTS>(cx) };
+        }
         let Shard { arena, larena, ev, ck, lg, far, ins, bt, .. } = self;
         let n = bt.n.min(BATCH);
         bt.n = 0;
@@ -3229,6 +3251,106 @@ impl Shard {
                 } else {
                     (*ckp.add(part)).push(arena, CK_BLOCK, CRec::new(a, person & ((1 << pshift) - 1), (tx >> 32) as u32, tx as u32));
                 }
+            }
+        }
+    }
+
+    /// `drain` with AVX-512: the people of the batch in one tight loop (one 512-bit compare a table line; an ID
+    /// that is not in its home line with its person written down goes through `IdTable::person_cold` and, when
+    /// its home line is full of other keys, waits in `late` with the next line asked for), then per eight records
+    /// in registers what the stores need: the byte offset of the stream, the person's number in its partition,
+    /// and for events `LRec::ing` and the byte offset of the dedup log. The last loop only appends.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    #[target_feature(enable = "avx512f,avx512vl,avx512dq,avx2,bmi1,bmi2")]
+    #[inline(never)]
+    unsafe fn drain_wide<const EVENTS: bool>(&mut self, cx: &Ctx) {
+        use std::arch::x86_64::*;
+        let Shard { arena, larena, ev, ck, lg, far, ins, bt, .. } = self;
+        let n = bt.n.min(BATCH);
+        bt.n = 0;
+        let ids = &cx.ids;
+        let base = ids.slots.as_ptr();
+        let mut late = Late { n: 0, at: [0; BATCH] };
+        // the table lines of the whole batch are read before any record is written (one pass that also writes
+        // the records keeps fewer lines in flight and ran slower)
+        let mut person = [0u32; BATCH];
+        for i in 0..n {
+            // SAFETY: as in `IdTable::look`: a home is the first quarter of a line, 64 readable bytes; a word of
+            // the line is read whole
+            let home = bt.home.get_unchecked_mut(i);
+            let key = *bt.ukey.get_unchecked(i);
+            let l = base.add(*home as usize);
+            let eq = _mm512_mask_cmpeq_epi64_mask(0x1f, _mm512_loadu_si512(l as *const _), _mm512_set1_epi64(key as i64)) as u32;
+            let mut p = 0;
+            if eq != 0 {
+                p = (*(l as *const Line)).up.get_unchecked(eq.trailing_zeros() as usize).load(Relaxed);
+            }
+            if p == 0 {
+                p = ids.person_cold(i, key, home, &mut late, ins);
+            }
+            *person.get_unchecked_mut(i) = p;
+        }
+        for &i in &late.at[..late.n.min(BATCH)] {
+            let i = i as usize & (BATCH - 1);
+            *person.get_unchecked_mut(i) = ids.person(ids.slot_scan(*bt.home.get_unchecked(i) * 2, *bt.ukey.get_unchecked(i), ins));
+        }
+        // per record: the stream's byte offset in `ev` or `ck` (the two kinds of stream are the same size), the
+        // person's number in its partition, and for events `LRec::ing` (ING_FAR where it goes in `far`) and the
+        // log's byte offset in `lg`. Lanes past n hold what an earlier batch left: computed, never used
+        const SSZ: usize = std::mem::size_of::<Stream<ERec, EV_LINES>>();
+        const { assert!(SSZ == std::mem::size_of::<Stream<CRec, CK_LINES>>()) };
+        const LSZ: usize = std::mem::size_of::<Log>();
+        let (mut soff, mut local, mut ing, mut loff) = ([0u32; BATCH], [0u32; BATCH], [0u32; BATCH], [0u32; BATCH]);
+        let (psh, lmask) = (_mm_cvtsi32_si128(cx.pshift as i32), _mm512_set1_epi32(((1u32 << cx.pshift) - 1) as i32));
+        for c in 0..BATCH / 16 {
+            let p = _mm512_loadu_si512(person.as_ptr().add(16 * c) as *const _);
+            _mm512_storeu_si512(soff.as_mut_ptr().add(16 * c) as *mut _, _mm512_mullo_epi32(_mm512_srl_epi32(p, psh), _mm512_set1_epi32(SSZ as i32)));
+            _mm512_storeu_si512(local.as_mut_ptr().add(16 * c) as *mut _, _mm512_and_si512(p, lmask));
+        }
+        if EVENTS {
+            let (qsh, ilo, ihi) = (_mm_cvtsi64_si128(cx.qshift as i64), _mm512_set1_epi64(cx.ilo), _mm512_set1_epi64(cx.ihi));
+            let (one, span) = (_mm512_set1_epi64(1), _mm512_set1_epi64(ING_SPAN));
+            for c in 0..BATCH / 8 {
+                let a = _mm512_loadu_si512(bt.a.as_ptr().add(8 * c) as *const _);
+                let q = _mm512_srl_epi64(_mm512_mullo_epi64(a, _mm512_set1_epi64(0x9E37_79B9_7F4A_7C15u64 as i64)), qsh);
+                _mm256_storeu_si256(loff.as_mut_ptr().add(8 * c) as *mut _, _mm512_cvtepi64_epi32(_mm512_mullo_epi64(q, _mm512_set1_epi64(LSZ as i64))));
+                // as `Ctx::ing`: ms above ilo + 1 when below ING_SPAN (unsigned), ING_LATE above ihi, else ING_FAR
+                let b = _mm512_loadu_si512(bt.b.as_ptr().add(8 * c) as *const _);
+                let d = _mm512_sub_epi64(b, ilo);
+                let near = _mm512_cmplt_epu64_mask(d, span);
+                let v = _mm512_mask_blend_epi64(_mm512_cmpgt_epi64_mask(b, ihi), _mm512_set1_epi64(ING_FAR as i64), _mm512_set1_epi64(ING_LATE as i64));
+                let v = _mm512_mask_add_epi64(v, near, d, one);
+                _mm256_storeu_si256(ing.as_mut_ptr().add(8 * c) as *mut _, _mm512_cvtepi64_epi32(v));
+            }
+        }
+        let pay_bin = ids.bins() as u32;
+        let (evp, ckp, lgp, abase) = (ev.as_mut_ptr() as *mut u8, ck.as_mut_ptr() as *mut u8, lg.as_mut_ptr() as *mut u8, cx.abase);
+        for i in 0..n {
+            let (a, tx, l) = (*bt.a.get_unchecked(i), *bt.tx.get_unchecked(i), *local.get_unchecked(i));
+            let so = *soff.get_unchecked(i) as usize;
+            // SAFETY: the offsets are of a stream below the 2^pbits of `ev` and `ck` (a person's partition, as in
+            // `drain`) and of a log below the 2^qbits of `lg`
+            if EVENTS {
+                let s = &mut *(evp.add(so) as *mut Stream<ERec, EV_LINES>);
+                let (ts, pay) = ((tx >> 32) as u32, tx as u32);
+                let rec = if pay == 0 {
+                    s.push(arena, EV_BLOCK, ERec { ts, lw: l })
+                } else {
+                    // the pay record and its event in one group, as in `drain`
+                    if s.pos == EV_LINES * 64 - 8 {
+                        s.push(arena, EV_BLOCK, ERec { ts: 0, lw: pay_bin });
+                    }
+                    s.push(arena, EV_BLOCK, ERec { ts: pay, lw: pay_bin });
+                    s.push(arena, EV_BLOCK, ERec { ts, lw: l | HAS_PAY })
+                };
+                let loc = loc_of(abase, rec);
+                let g = *ing.get_unchecked(i);
+                if g == ING_FAR {
+                    far.push((a, loc, *bt.b.get_unchecked(i)));
+                }
+                (*(lgp.add(*loff.get_unchecked(i) as usize) as *mut Log)).push(larena, a, LRec::pay(g, loc));
+            } else {
+                (*(ckp.add(so) as *mut Stream<CRec, CK_LINES>)).push(arena, CK_BLOCK, CRec::new(a, l, (tx >> 32) as u32, tx as u32));
             }
         }
     }

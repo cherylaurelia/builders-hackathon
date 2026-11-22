@@ -2968,7 +2968,10 @@ impl CRec {
     }
 }
 
-const EV_BLOCK: usize = 768; // records: 6144 bytes
+// records: 12 KiB. Intel v5 60M (2^10 person partitions, ~8 blocks per thread and partition at 768): wall min
+// -0.8% and -1.1% in two interleaved runs against 768 (mostly the sessions phase, which walks fewer block ends),
+// 20M even; 3072 alike
+const EV_BLOCK: usize = 1536;
 /// Cache lines a stream of each kind writes at a time (`Stream`); a block is a whole number of them. One line:
 /// the stages are what a parse thread keeps in its half of the L2 (Intel VM, 60M: 1, 2 and 4 lines parse alike).
 const CK_BLOCK: usize = 192; // records: 3072 bytes

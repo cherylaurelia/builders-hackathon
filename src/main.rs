@@ -2973,8 +2973,10 @@ const EV_BLOCK: usize = 768; // records: 6144 bytes
 /// the stages are what a parse thread keeps in its half of the L2 (Intel VM, 60M: 1, 2 and 4 lines parse alike).
 const CK_BLOCK: usize = 192; // records: 3072 bytes
 
-/// Events or clicks whose user IDs are on their way from memory at a time (`Batch`).
-const BATCH: usize = 64;
+/// Events or clicks whose user IDs are on their way from memory at a time (`Batch`). 128: at 60M (an ID table
+/// of 2^23 lines, twice the 20M one) the lookups of a batch of 64 still waited on some of their lines. Intel, v5,
+/// interleaved: 60M parse -6..-8 ms in three runs of 3-5 rounds against 64, 20M even; 32 was +16 ms at 60M.
+const BATCH: usize = 128;
 
 /// The valid events (or clicks) of the last few lines, each waiting for its user ID's line of the ID table
 /// (`IdTable::aim`). When BATCH of them wait they are looked up and written out in one loop (`Shard::drain`): by

@@ -5637,36 +5637,42 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
     use std::io::Write;
     let mut f = std::fs::File::create(path)?;
     // the whole file is built in memory and written by one call: a write(2) per page cost 10 ms a file when eight
-    // threads wrote at once (journal and page-cache locks), the one big call does not
+    // threads wrote at once (journal and page-cache locks), the one big call does not. Each page is made where it
+    // stays, after HDR_ROOM bytes for its header, written last against it: the file is the pieces `spans` of
+    // `out`, the gaps before the headers left out by the writev.
     let mut out: Vec<u8> = huge_vec(n * 12 + (1 << 20));
     out.extend_from_slice(b"PAR1");
+    let mut spans: Vec<(usize, usize)> = vec![(0, 4)];
     let mut off = 4i64;
-    let mut page = Vec::new();
+    // the page `fill` appends to `out` after the room for its header: (start of its header, its end)
+    let mut page = |out: &mut Vec<u8>, at0: usize, dict: bool, nvals: usize, enc: i32| -> std::io::Result<(usize, usize)> {
+        i32::try_from(out.len() - at0 - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
+        let at = at0 + page_header(&mut out[at0..], dict, nvals, enc);
+        Ok((at, out.len()))
+    };
     let mut chunks = Vec::with_capacity(cols.len()); // (offset, size, dictionary page offset, first data page offset)
     for (i, c) in cols.iter().enumerate() {
         let (start, use_dict) = (off, c.dict && n > 0);
         let (mut dict_off, mut data_off) = (None, off);
         if use_dict {
-            page.clear();
-            page.resize(HDR_ROOM, 0);
-            let entries = fill(i, DICT_PAGE, 0, &mut page);
-            i32::try_from(page.len() - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
-            let at = page_header(&mut page, true, entries, 0);
-            out.extend_from_slice(&page[at..]);
+            let at0 = out.len();
+            out.resize(at0 + HDR_ROOM, 0);
+            let entries = fill(i, DICT_PAGE, 0, &mut out);
+            let (a, b) = page(&mut out, at0, true, entries, 0)?;
+            spans.push((a, b));
             dict_off = Some(off);
-            off += (page.len() - at) as i64;
+            off += (b - a) as i64;
             data_off = off;
         }
         let mut lo = 0;
         loop {
             let hi = (lo + PAGE_ROWS).min(n);
-            page.clear();
-            page.resize(HDR_ROOM, 0);
-            fill(i, lo, hi, &mut page);
-            i32::try_from(page.len() - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
-            let at = page_header(&mut page, false, hi - lo, if use_dict { 8 } else if c.delta { 5 } else { 0 }); // RLE_DICTIONARY, DELTA_BINARY_PACKED, PLAIN
-            out.extend_from_slice(&page[at..]);
-            off += (page.len() - at) as i64;
+            let at0 = out.len();
+            out.resize(at0 + HDR_ROOM, 0);
+            fill(i, lo, hi, &mut out);
+            let (a, b) = page(&mut out, at0, false, hi - lo, if use_dict { 8 } else if c.delta { 5 } else { 0 })?; // RLE_DICTIONARY, DELTA_BINARY_PACKED, PLAIN
+            spans.push((a, b));
+            off += (b - a) as i64;
             lo = hi;
             if lo >= n {
                 break;
@@ -5740,8 +5746,20 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
     let len = t.b.len() as u32;
     t.b.extend_from_slice(&len.to_le_bytes());
     t.b.extend_from_slice(b"PAR1");
-    out.extend_from_slice(&t.b);
-    f.write_all(&out)
+    let mut parts: Vec<std::io::IoSlice> = spans.iter().map(|&(a, b)| std::io::IoSlice::new(&out[a..b])).collect();
+    parts.push(std::io::IoSlice::new(&t.b));
+    // writev takes up to IOV_MAX (1024 on Linux) pieces a call
+    let mut parts = &mut parts[..];
+    while !parts.is_empty() {
+        let k = parts.len().min(1024);
+        match f.write_vectored(&parts[..k]) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write the file")),
+            Ok(w) => std::io::IoSlice::advance_slices(&mut parts, w),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 fn plain_bytes<'a>(buf: &mut Vec<u8>, vals: impl Iterator<Item = &'a [u8]>) {

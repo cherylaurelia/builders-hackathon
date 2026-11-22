@@ -5645,7 +5645,7 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
     let mut spans: Vec<(usize, usize)> = vec![(0, 4)];
     let mut off = 4i64;
     // the page `fill` appends to `out` after the room for its header: (start of its header, its end)
-    let mut page = |out: &mut Vec<u8>, at0: usize, dict: bool, nvals: usize, enc: i32| -> std::io::Result<(usize, usize)> {
+    let page = |out: &mut Vec<u8>, at0: usize, dict: bool, nvals: usize, enc: i32| -> std::io::Result<(usize, usize)> {
         i32::try_from(out.len() - at0 - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
         let at = at0 + page_header(&mut out[at0..], dict, nvals, enc);
         Ok((at, out.len()))

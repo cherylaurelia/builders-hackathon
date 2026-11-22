@@ -250,6 +250,19 @@ unsafe fn pack_at(p: *const u8, len: usize) -> u64 {
 /// Bit 62 of an `INTERNED` key: the rest is the ID's slot in the long-ID table (`Interner::long`).
 const LONG: u64 = 1 << 62;
 
+/// Bit 61 of an `INTERNED` key: a click ID kept as it is (`Shard::click_key`); the low 48 bits are the address of
+/// its length byte, its bytes after that.
+const KEPT: u64 = 1 << 61;
+
+/// The bytes of a `KEPT` key.
+#[inline]
+fn kept_bytes(key: u64) -> &'static [u8] {
+    let p = (key & ((1 << 48) - 1)) as *const u8;
+    // SAFETY: only `Shard::keep_id` makes such a key: the address of a length byte and as many bytes after it, in
+    // the arena, which lives for the run
+    unsafe { std::slice::from_raw_parts(p.add(1), *p as usize) }
+}
+
 /// A slot of the long-ID table: an ID of a short prefix (1..=8 bytes, each 1..=127) and 32 lowercase hex digits,
 /// as `meta` = LONG_READY | the prefix's `pack` >> 7 (0: free; LONG_BUSY while its finder writes the digits) and
 /// the 16 bytes the digits spell.
@@ -462,6 +475,10 @@ impl Interner {
     /// Appends the ID of `key` to `out`.
     #[inline]
     fn bytes(&self, key: u64, out: &mut Vec<u8>) {
+        if key & (INTERNED | KEPT) == INTERNED | KEPT {
+            out.extend_from_slice(kept_bytes(key));
+            return;
+        }
         if key & (INTERNED | LONG) == INTERNED | LONG {
             let s = self.slot(key as usize);
             let pre = s.meta.load(Acquire) & !(LONG_BUSY | LONG_READY);
@@ -528,17 +545,25 @@ impl Interner {
         if (a | b) & INTERNED == 0 {
             return a < b;
         }
-        // packed or in the long-ID table: compared on the stack
-        let heap = |k: u64| k & (INTERNED | LONG) == INTERNED;
-        if !heap(a) && !heap(b) {
-            let (mut x, mut y) = ([0u8; 48], [0u8; 48]);
-            let (nx, ny) = (self.short_bytes(a, &mut x), self.short_bytes(b, &mut y));
-            return x[..nx] < y[..ny];
+        // packed, in the long-ID table or kept: compared on the stack
+        let (mut x, mut y) = ([0u8; 48], [0u8; 48]);
+        let (mut vx, mut vy) = (Vec::new(), Vec::new());
+        self.id_bytes(a, &mut x, &mut vx) < self.id_bytes(b, &mut y, &mut vy)
+    }
+
+    /// The ID of `key`: kept bytes where they are, a packed or long-ID-table key spelled into `buf`, any other
+    /// into `v`.
+    #[inline]
+    fn id_bytes<'a>(&self, key: u64, buf: &'a mut [u8; 48], v: &'a mut Vec<u8>) -> &'a [u8] {
+        if key & (INTERNED | KEPT) == INTERNED | KEPT {
+            return kept_bytes(key);
         }
-        let (mut x, mut y) = (Vec::new(), Vec::new());
-        self.bytes(a, &mut x);
-        self.bytes(b, &mut y);
-        x < y
+        if key & (INTERNED | LONG) != INTERNED {
+            let n = self.short_bytes(key, buf);
+            return &buf[..n];
+        }
+        self.bytes(key, v);
+        v
     }
 }
 
@@ -2754,6 +2779,8 @@ struct Shard {
     pn: usize,
     #[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
     ph: usize,
+    // where the next kept click ID goes, and the end of its chunk (`Shard::keep_id`)
+    kb: (usize, usize),
 }
 /// Lines `Shard::pend` holds.
 const PEND: usize = 8;
@@ -2855,6 +2882,7 @@ impl Shard {
             pend: [0; PEND],
             pn: 0,
             ph: 0,
+            kb: (0, 0),
         }
     }
 
@@ -2946,6 +2974,47 @@ impl Shard {
     #[inline(always)]
     fn keep(&mut self, cx: &Ctx, ekey: u64, ingest: i64, ukey: u64, ts: i64, pay: u32) {
         self.wait(cx, true, ekey, ingest, ukey, ts, pay);
+    }
+
+    /// The key of the click ID of `len` bytes at `p` (9 bytes readable): packed when it packs, else its bytes kept
+    /// in this thread's arena (`KEPT`). A click ID is only compared, never looked up: it breaks a tie in ts by its
+    /// bytes (rules.md "Clicks" 4), and copies of a click are identical, so two keys of one ID never decide a tie
+    /// differently. No table, then: no lock, no shared cache line, no cache miss.
+    #[inline(always)]
+    unsafe fn click_key(&mut self, cx: &Ctx, p: *const u8, len: usize) -> u64 {
+        let k = pack_at(p, len);
+        if k != 0 {
+            return k;
+        }
+        self.keep_id(cx, p, len)
+    }
+
+    /// `click_key` of an ID given as a slice.
+    #[inline]
+    fn click_key_of(&mut self, cx: &Ctx, b: &[u8]) -> u64 {
+        let k = pack(b);
+        if k != 0 {
+            return k;
+        }
+        // SAFETY: the slice's bytes
+        unsafe { self.keep_id(cx, b.as_ptr(), b.len()) }
+    }
+
+    /// The `KEPT` key of the `len` bytes at `p`, copied to this thread's arena; one over 255 bytes is interned.
+    #[inline(never)]
+    unsafe fn keep_id(&mut self, cx: &Ctx, p: *const u8, len: usize) -> u64 {
+        if len > 255 {
+            return cx.names.intern(std::slice::from_raw_parts(p, len));
+        }
+        if self.kb.0 + 1 + len > self.kb.1 {
+            let c = arena_chunk(Arena::STEP) as usize;
+            self.kb = (c, c + Arena::STEP);
+        }
+        let at = self.kb.0 as *mut u8;
+        *at = len as u8;
+        std::ptr::copy_nonoverlapping(p, at.add(1), len);
+        self.kb.0 += 1 + len;
+        INTERNED | KEPT | at as u64
     }
 
     /// A valid click, into its person's partition once its user ID is at hand.
@@ -3829,7 +3898,8 @@ fn click_fields(cx: &Ctx, [cid, uid, camp, ts]: [Bytes; 4], st: &mut Shard) {
         return;
     }
     let Some(camp) = cx.campaigns.get(camp) else { return };
-    st.click(cx, cx.names.key(cid), cx.names.key(uid), t, camp);
+    let ck = st.click_key_of(cx, cid);
+    st.click(cx, ck, cx.names.key(uid), t, camp);
 }
 
 #[inline(always)]
@@ -3846,7 +3916,8 @@ unsafe fn fast_click(cx: &Ctx, line: *const u8, mut f: Cut, st: &mut Shard) {
         _ => return,
     };
     let Some(camp) = cx.campaigns.get_short(line.add(ks), kl) else { return };
-    st.click(cx, cx.names.key_at(line.add(cs), cl), cx.names.key_at(line.add(us), ul), t, camp);
+    let ck = st.click_key(cx, line.add(cs), cl);
+    st.click(cx, ck, cx.names.key_at(line.add(us), ul), t, camp);
 }
 
 /// `fast_click` for the line at `line` with its fields `f` (`split_n`).
@@ -3861,7 +3932,8 @@ unsafe fn fast_click_n(cx: &Ctx, line: *const u8, f: [(usize, usize); 4], st: &m
         _ => return,
     };
     let Some(camp) = cx.campaigns.get_short(line.add(ks), kl) else { return };
-    st.click(cx, cx.names.key_at(line.add(cs), cl), cx.names.key_at(line.add(us), ul), t, camp);
+    let ck = st.click_key(cx, line.add(cs), cl);
+    st.click(cx, ck, cx.names.key_at(line.add(us), ul), t, camp);
 }
 
 /// The click line at `buf + p` through `split_click` and `fast_click` or `split_n` and `fast_click_n`, or, when
@@ -5688,9 +5760,15 @@ mod tests {
     }
 
     /// The clicks of a shard as (click key, the rest of the record), sorted.
-    fn click_list(st: &mut Shard) -> Vec<(u64, u64)> {
+    /// The clicks as (click_id, the rest): a click ID's key is not the same in every run (`Shard::click_key`)
+    fn click_list(st: &mut Shard, names: &Interner) -> Vec<(Vec<u8>, u64)> {
         st.ck.iter_mut().for_each(Stream::finish);
-        let mut v: Vec<_> = st.ck.iter().flat_map(|s| s.slices(CK_BLOCK)).flatten().map(|r| (r.cid, r.w)).collect();
+        let id = |k: u64| {
+            let mut v = Vec::new();
+            names.bytes(k, &mut v);
+            v
+        };
+        let mut v: Vec<_> = st.ck.iter().flat_map(|s| s.slices(CK_BLOCK)).flatten().map(|r| (id(r.cid), r.w)).collect();
         v.sort();
         v
     }
@@ -6051,11 +6129,11 @@ mod tests {
                             unsafe { parse(&c, padded.as_ptr(), w[0], w[1], len, &mut a2) };
                             for_records::<4>(file, w[0], w[1], |f| click_fields(&c, f, &mut b2));
                             b2.drain::<false>(&c);
-                            assert!(click_list(&mut a2) == click_list(&mut b2), "round {round}: {name} differs\n{}", String::from_utf8_lossy(file));
+                            assert!(click_list(&mut a2, &c.names) == click_list(&mut b2, &c.names), "round {round}: {name} differs\n{}", String::from_utf8_lossy(file));
                         }
                     }
                 }
-                let (ca, cb) = (click_list(&mut a), click_list(&mut b));
+                let (ca, cb) = (click_list(&mut a, &c.names), click_list(&mut b, &c.names));
                 let (fa, fb) = (flat(&mut a), flat(&mut b));
                 kept += fb.0.len();
                 clicks += cb.len();
@@ -6314,14 +6392,14 @@ mod tests {
                 for_records::<4>(file, w[0], w[1], |f| click_fields(&c, f, &mut b));
                 b.drain::<false>(&c);
             }
-            let cb = click_list(&mut b);
+            let cb = click_list(&mut b, &c.names);
             kept += cb.len();
             for (name, parse) in click_parsers() {
                 let mut a = Shard::new(16, 16);
                 for w in cuts.windows(2) {
                     unsafe { parse(&c, padded.as_ptr(), w[0], w[1], len, &mut a) };
                 }
-                let ca = click_list(&mut a);
+                let ca = click_list(&mut a, &c.names);
                 if ca != cb {
                     let (sa, sb): (std::collections::BTreeSet<_>, std::collections::BTreeSet<_>) = (ca.iter().collect(), cb.iter().collect());
                     panic!(

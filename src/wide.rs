@@ -750,7 +750,8 @@ unsafe fn defer<const EVENTS: bool>(cx: &Ctx, buf: *const u8, p: usize, len: usi
     if c != 0 {
         let p1 = c.trailing_zeros() as usize;
         let q = (*line == b'"') as usize;
-        if p1 == 33 + 2 * q {
+        // (a click ID is not looked up: `Shard::click_key`)
+        if EVENTS && p1 == 33 + 2 * q {
             cx.names.prefetch_long(line.add(q + 1));
         }
         let c2 = c & (c - 1);
@@ -889,7 +890,7 @@ unsafe fn click_late(cx: &Ctx, buf: *const u8, st: &mut Shard, l: &mut ClickLane
         let j = l.ph % LATE;
         (l.ph, l.pn) = (j + 1, l.pn - 1);
         // SAFETY: an ID of the line, which is in the buffer: 9 bytes readable from its start (PAD)
-        let ck = cx.names.key_at(buf.add(l.pc[j] as usize), l.pcl[j] as usize);
+        let ck = st.click_key(cx, buf.add(l.pc[j] as usize), l.pcl[j] as usize);
         let uk = cx.names.key_at(buf.add(l.pu[j] as usize), l.pul[j] as usize);
         let n = st.bt.n;
         // SAFETY: n < BATCH between calls: a full batch is drained at once
@@ -911,7 +912,7 @@ unsafe fn click_late(cx: &Ctx, buf: *const u8, st: &mut Shard, l: &mut ClickLane
 /// quoted whole or not at all, and no other quote; IDs of 1 to 48 bytes; campaign_id at most 7 bytes; ts is F1 or
 /// F2 of a date seen before, or 13 digits, and valid. For such a line this does what `click_fields` does. IDs of 8
 /// or 9 bytes are packed here; a kept click with any other ID (a long one) waits in `l` for the next batch, its
-/// slot of the long-ID table asked for, and gets its keys from `Interner::key_at`.
+/// slot of the long-ID table asked for, and gets its keys then (`Shard::click_key`, `Interner::key_at`).
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,avx2,bmi1,bmi2,popcnt")]
 #[allow(unused_assignments)] // the third `comma!` clears a bit no one reads
@@ -1072,11 +1073,11 @@ unsafe fn click_batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &
             let j = (l.ph + l.pn) % LATE; // pn < LATE: at most LATE - 16 wait before a batch, and it adds 8 at most
             (l.pc[j], l.pcl[j], l.pu[j], l.pul[j], l.ptx[j]) = (l.ac[i], l.cl[i], l.au[i], l.ul[i], l.tx[i]);
             l.pn += 1;
-            for (s, n) in [(l.ac[i], l.cl[i]), (l.au[i], l.ul[i])] {
-                if (33..=40).contains(&n) {
-                    // SAFETY: the 32 bytes before the ID's end are in the line
-                    cx.names.prefetch_long(buf.add((s + n - 32) as usize));
-                }
+            // (a click ID is not looked up: `Shard::click_key`)
+            let (s, n) = (l.au[i], l.ul[i]);
+            if (33..=40).contains(&n) {
+                // SAFETY: the 32 bytes before the ID's end are in the line
+                cx.names.prefetch_long(buf.add((s + n - 32) as usize));
             }
         }
     }

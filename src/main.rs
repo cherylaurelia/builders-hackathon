@@ -727,6 +727,9 @@ impl Interner {
 
 // ---------------------------------------------------------------- memory
 
+/// Set when the parse is done: the input toucher (in `main`) stops.
+static TOUCH_STOP: AtomicBool = AtomicBool::new(false);
+
 /// Every region `map_anon` has handed out, as (address, bytes): what `release_regions` gives back.
 static REGIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
@@ -3436,6 +3439,31 @@ fn main() {
     let mut work = Vec::new();
     chunks_of(0, ev_files, chunk, &mut work);
     chunks_of(1, ck_files, chunk, &mut work);
+    // the mapped inputs' page tables filled by a thread of their own, in the order the parse reads them: a fault
+    // maps 64 KiB, and one thread faulting in order costs the kernel less than eight parse threads each faulting
+    // its own place. The mappings stay until `release_regions`; this thread is stopped and joined as soon as the
+    // parse is done, long before that.
+    let toucher = if env_num("SESS_TOUCH") != Some(0) {
+        let all: Vec<(usize, usize)> = ev_files.iter().chain(ck_files.iter()).filter(|f| f.map != 0).map(|f| (f.map, f.len)).collect();
+        // a thread that cannot be started leaves the faults to the parse (speed only)
+        std::thread::Builder::new()
+            .spawn(move || {
+                for (map, len) in all {
+                    let mut o = 0;
+                    while o < len {
+                        if TOUCH_STOP.load(Relaxed) {
+                            return;
+                        }
+                        // SAFETY: inside a mapping, which stays until `release_regions`, after this thread is joined
+                        unsafe { std::ptr::read_volatile((map + o) as *const u8) };
+                        o += 64 << 10;
+                    }
+                }
+            })
+            .ok()
+    } else {
+        None
+    };
     read_ahead(
         link_files
             .iter()
@@ -3514,6 +3542,12 @@ fn main() {
             st.buf = buf;
         },
     );
+    TOUCH_STOP.store(true, Relaxed);
+    if let Some(t) = toucher {
+        if t.join().is_err() {
+            die("input toucher panicked");
+        }
+    }
     // the records of groups not yet full, written by this thread (each parse thread fenced its own before the join)
     for s in &mut shards {
         s.ev.finish();

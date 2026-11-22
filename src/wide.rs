@@ -97,12 +97,6 @@ macro_rules! sv {
         _mm512_store_si512($a.as_mut_ptr() as *mut _, $v)
     };
 }
-/// The 64 bytes at `64 * i` of a field of copies.
-macro_rules! z {
-    ($a:expr, $i:expr) => {
-        _mm512_load_si512($a.as_ptr().add(64 * $i) as *const _)
-    };
-}
 /// A number in every lane.
 macro_rules! k {
     ($v:expr) => {
@@ -132,18 +126,7 @@ macro_rules! misquoted {
         _mm512_or_si512(_mm512_andnot_si512(_mm512_xor_si512(s, z), $q), _mm512_and_si512(_mm512_sub_epi64(_mm512_slli_epi64::<1>(yz), x), $b))
     }};
 }
-/// The copy of a field: 16 or 32 bytes from where the i-th start of `$a` says (read back from memory: taken out
-/// of the register it would cost the two ports that the 512-bit instructions have).
-macro_rules! copy16 {
-    ($to:expr, $buf:expr, $a:expr, $i:expr) => {
-        _mm_storeu_si128($to.as_mut_ptr().add(16 * $i) as *mut _, _mm_loadu_si128($buf.add(std::ptr::read_volatile($a.as_ptr().add($i)) as usize) as *const _))
-    };
-}
-macro_rules! copy32 {
-    ($to:expr, $buf:expr, $a:expr, $i:expr) => {
-        _mm256_storeu_si256($to.as_mut_ptr().add(32 * $i) as *mut _, _mm256_loadu_si256($buf.add(std::ptr::read_volatile($a.as_ptr().add($i)) as usize) as *const _))
-    };
-}
+
 
 /// Where eight walks over the lines that start in [start, end) of the `len` bytes at `buf` start, and where the
 /// part of each ends; None when no line starts there.
@@ -286,7 +269,7 @@ unsafe fn homes(cx: &Ctx, ukey: __m512i) -> __m512i {
     _mm512_and_si512(_mm512_srl_epi64(_mm512_mullo_epi64(ukey, k!(0x9E37_79B9_7F4A_7C15u64)), _mm_cvtsi64_si128(60 - cx.ids.bits as i64)), k!(!63u64))
 }
 
-/// The permutes that take word i of every line out of the copies of a field: 16 bytes a line (two registers,
+/// The permutes that take word i of every line out of a field's bytes: 16 bytes a line (two registers,
 /// `EVEN` its first word, `ODD` its second), or 32 bytes a line (four registers: `IX_A` of two gives words 0
 /// and 1 of four lines, `IX_B` words 2 and 3; `IX_LO`/`IX_HI` of two such put one word of all eight together).
 const EVEN: [i64; 8] = [0, 2, 4, 6, 8, 10, 12, 14];
@@ -300,25 +283,6 @@ macro_rules! ix {
         _mm512_loadu_si512($a.as_ptr() as *const _)
     };
 }
-/// Words 0..4 of eight 32-byte copies.
-macro_rules! words4 {
-    ($a:expr) => {{
-        let (a01, a23) = (_mm512_permutex2var_epi64(z!($a, 0), ix!(IX_A), z!($a, 1)), _mm512_permutex2var_epi64(z!($a, 2), ix!(IX_A), z!($a, 3)));
-        let (b01, b23) = (_mm512_permutex2var_epi64(z!($a, 0), ix!(IX_B), z!($a, 1)), _mm512_permutex2var_epi64(z!($a, 2), ix!(IX_B), z!($a, 3)));
-        (
-            _mm512_permutex2var_epi64(a01, ix!(IX_LO), a23),
-            _mm512_permutex2var_epi64(a01, ix!(IX_HI), a23),
-            _mm512_permutex2var_epi64(b01, ix!(IX_LO), b23),
-            _mm512_permutex2var_epi64(b01, ix!(IX_HI), b23),
-        )
-    }};
-}
-/// Words 0 and 1 of eight 16-byte copies.
-macro_rules! words2 {
-    ($a:expr) => {
-        (_mm512_permutex2var_epi64(z!($a, 0), ix!(EVEN), z!($a, 1)), _mm512_permutex2var_epi64(z!($a, 0), ix!(ODD), z!($a, 1)))
-    };
-}
 
 /// The 16 bytes at the starts `$a` (buffer offsets, a register just stored to `$a`) of four lines, from `$i` on,
 /// as one register: loaded straight into it (no copy through memory: a register read back from four stores
@@ -330,14 +294,14 @@ macro_rules! lanes16 {
         _mm512_inserti64x2::<3>(_mm512_inserti64x2::<2>(x, _mm_loadu_si128(p(2))), _mm_loadu_si128(p(3)))
     }};
 }
-/// Words 0 and 1 of the 16 bytes at the eight starts `$a`, as `words2!` of their copies.
+/// Words 0 and 1 of the 16 bytes at the eight starts `$a` (`EVEN`, `ODD`).
 macro_rules! words2at {
     ($buf:expr, $a:expr) => {{
         let (z0, z1) = (lanes16!($buf, $a, 0), lanes16!($buf, $a, 4));
         (_mm512_permutex2var_epi64(z0, ix!(EVEN), z1), _mm512_permutex2var_epi64(z0, ix!(ODD), z1))
     }};
 }
-/// Words 0..4 of the 32 bytes at the eight starts `$a`, as `words4!` of their copies.
+/// Words 0..4 of the 32 bytes at the eight starts `$a` (`IX_A`/`IX_B`, then `IX_LO`/`IX_HI`).
 macro_rules! words4at {
     ($buf:expr, $a:expr) => {{
         let p = |j: usize| $buf.add(std::ptr::read_volatile($a.as_ptr().add(j)) as usize) as *const __m256i;
@@ -383,11 +347,6 @@ struct Lanes {
     pl: [u64; 8],
     cs: [u64; 8],
     cl: [u64; 8],
-    // C: the fields' bytes, line after line
-    se: [u8; 128], // event_id: 16 bytes a line
-    su: [u8; 128], // user_id
-    st: [u8; 256], // ts: 32 bytes a line
-    si: [u8; 256], // ingest_ts, and behind it the first 8 bytes of event_type
     // D: what the lines give
     ek: [u64; 8],
     uk: [u64; 8],
@@ -610,16 +569,15 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
     sv!(l.at, _mm512_mask_add_epi64(pv, k_pos, pv, _mm512_add_epi64(tp, sh2)));
     sv!(l.ai, _mm512_mask_add_epi64(pv, k_pos, pv, _mm512_add_epi64(ip, sh2)));
 
-    // ---- C: the fields' bytes to their fixed places
+    // ---- C: the fields' bytes, a word of every line to a register (loaded straight in: a 64-byte load of four
+    // 16-byte copies waits for the copies to be written)
     // SAFETY: a start is at most 66 + 48 bytes into its line and 32 bytes are read: within the PAD readable ones
-    for i in 0..8 {
-        copy16!(l.se, buf, l.ae, i);
-        copy16!(l.su, buf, l.au, i);
-        copy32!(l.st, buf, l.at, i);
-        copy32!(l.si, buf, l.ai, i);
-    }
+    let (elo, ehi) = words2at!(buf, l.ae);
+    let (ulo, uhi) = words2at!(buf, l.au);
+    let (w0, w1, w2, w3) = words4at!(buf, l.at);
+    let (i0, i1, i2, i3) = words4at!(buf, l.ai);
 
-    // ---- B, second part (it does not wait for the copies): the quotes, the other three boundaries
+    // ---- B, second part (it does not wait for those loads): the quotes, the other three boundaries
     let ma = _mm512_xor_si512(t2, t2m); // through the third comma
     let bad1 = misquoted!(_mm512_and_si512(c0, ma), _mm512_and_si512(q0, ma));
     let x1 = _mm512_and_si512(b2, b2m);
@@ -648,13 +606,9 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
     sv!(l.cs, _mm512_add_epi64(_mm512_add_epi64(_mm512_add_epi64(o, s6), qc), sh2));
     sv!(l.cl, _mm512_sub_epi64(_mm512_sub_epi64(r4, s6), _mm512_add_epi64(qc, qc)));
 
-    // ---- D: the copies, a word of every line to a register
-    let (elo, ehi) = words2!(l.se);
-    let (ulo, uhi) = words2!(l.su);
+    // ---- D
     let ekey = pack8(elo, ehi, _mm512_cmpeq_epi64_mask(el, k!(9)));
     let ukey = pack8(ulo, uhi, _mm512_cmpeq_epi64_mask(ul, k!(9)));
-    let (w0, w1, w2, w3) = words4!(l.st);
-    let (i0, i1, i2, i3) = words4!(l.si);
     let dv: *const DayV = &(*st).dv;
     let (kts, trel, kdate) = stamp(dv, cx.ws, w0, w1, w2, w3, kf1, kf2, kf3);
 

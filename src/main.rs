@@ -512,7 +512,8 @@ impl Interner {
     #[inline(always)]
     unsafe fn long_home(&self, p: *const u8) -> usize {
         let w = |k: usize| (p.add(8 * k) as *const u64).read_unaligned();
-        (mix(w(0) ^ w(1).rotate_left(16) ^ w(2).rotate_left(32) ^ w(3).rotate_left(48)) >> (64 - self.lbits)) as usize
+        // the digits come out of a keyed bijection: half of them, multiplied, spread well enough
+        ((w(1) ^ w(3)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - self.lbits)) as usize
     }
 
     /// Asks for the slot where the search for the ID whose 32 hex digits are at `p` starts.

@@ -332,7 +332,7 @@ unsafe fn ev_hash(p: *const u8) -> Option<(u64, [u64; 2])> {
 /// one record in six (copies of an event, and slots shared by chance) is copied and looked up.
 fn event_ids_distinct(shards: &mut [Shard], threads: usize) -> bool {
     for s in shards.iter_mut() {
-        s.evh.iter_mut().for_each(Stream::finish);
+        s.evh.finish();
     }
     let shards = &*shards;
     let clash = AtomicBool::new(false);
@@ -343,7 +343,7 @@ fn event_ids_distinct(shards: &mut [Shard], threads: usize) -> bool {
         EVH_BUCKETS,
         || (Vec::<u64>::new(), Vec::<[u64; 2]>::new(), Vec::<u32>::new()),
         |(seen, v, t), b| {
-            let n: usize = shards.iter().map(|s| s.evh[b].len(EVH_BLOCK)).sum();
+            let n: usize = shards.iter().map(|s| s.evh.len(b, EVH_BLOCK)).sum();
             if n == 0 {
                 return;
             }
@@ -354,7 +354,7 @@ fn event_ids_distinct(shards: &mut [Shard], threads: usize) -> bool {
             let s0 = 64 - sbits;
             let sp = seen.as_mut_ptr();
             for s in shards {
-                for blk in s.evh[b].slices(EVH_BLOCK) {
+                for blk in s.evh.slices(b, EVH_BLOCK) {
                     for r in blk {
                         let x = spread(r[0] >> 3) >> s0;
                         // SAFETY: x < 2^sbits, so x >> 5 is a word of `seen`
@@ -368,7 +368,7 @@ fn event_ids_distinct(shards: &mut [Shard], threads: usize) -> bool {
             }
             v.clear();
             for s in shards {
-                for blk in s.evh[b].slices(EVH_BLOCK) {
+                for blk in s.evh.slices(b, EVH_BLOCK) {
                     for r in blk {
                         let x = spread(r[0] >> 3) >> s0;
                         if (seen[(x >> 5) as usize] >> 32 >> (x & 31)) & 1 != 0 {
@@ -909,198 +909,230 @@ impl Arena {
     }
 }
 
-/// An append-only list of `T` in blocks of `per` records; a record never moves.
+/// One cache line of staged records.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Cl([u64; 8]);
+
+/// A set of append-only lists of `T`, each in blocks of `per` records; a record never moves.
 ///
-/// Records reach memory a group at a time: a thread appends to a thousand streams and more at once, and a record
-/// stored directly first reads its cache line from memory (read for ownership) and crowds the cache. A stream
-/// keeps the records of its current group (L cache lines, at a block offset that is a multiple of GROUP: blocks
-/// are 64-byte aligned, whole groups long) and writes the full group with non-temporal stores, whole lines that
-/// are never read. A record's address is known when it is pushed; until its group is full and the next record
-/// comes, or `finish` runs, its bytes are only in the stage. The caller fences (`sfence`) before others read,
-/// and calls `finish` once the pushing is over.
-struct Stream<T, const L: usize> {
-    grp: *mut u8,            // where the staged group belongs in the current block; null before the first push
-    end: *mut u8,            // the end of the current block
-    pos: usize,              // bytes staged; GROUP = the group is full (or there is no block yet): `next` first
-    stage: [[u64; 8]; L],    // 8-byte aligned, as every record here
-    blocks: Vec<*mut T>,
+/// Records reach memory a cache line at a time: a thread appends to a thousand lists and more at once, and a
+/// record stored directly first reads its cache line from memory (read for ownership) and crowds the cache. A
+/// list keeps the records of its current line in its stage (blocks are 64-byte aligned, whole lines long) and
+/// writes the full line with non-temporal stores, a whole line that is never read. A record's address is known
+/// when it is pushed; until its line is full and the next record comes, or `finish` runs, its bytes are only in
+/// the stage. The caller fences (`sfence`) before others read, and calls `finish` once the pushing is over.
+///
+/// The fields are arrays by list: a push reads only its list's cursor, from an array small enough to stay in
+/// the L1 (2^9 lists: 4 KiB), and stores into its stage line. With the cursor next to its stage, as one struct
+/// a list, the push first waited for that struct's line (Intel 20M: the cursor loads were a fifth of `drain`).
+struct Stream<T> {
+    cur: Vec<*mut u8>,  // where the next record goes; null before the first push. Its offset in the line = bytes
+    //                     staged, and 0 with a full stage (or none yet): `next` first
+    end: Vec<*mut u8>,  // the end of the current block
+    stage: Vec<Cl>,
+    blocks: Vec<Vec<*mut T>>,
+    _t: std::marker::PhantomData<T>,
 }
 
-impl<T, const L: usize> Stream<T, L> {
+impl<T> Stream<T> {
     const SIZE: usize = std::mem::size_of::<T>();
-    /// Bytes written at a time: L cache lines.
-    const GROUP: usize = L * 64;
 
-    fn new() -> Stream<T, L> {
-        const { assert!(L > 0 && (L * 64) % std::mem::size_of::<T>() == 0 && std::mem::align_of::<T>() <= 8 && !std::mem::needs_drop::<T>()) };
-        Stream { grp: std::ptr::null_mut(), end: std::ptr::null_mut(), pos: Self::GROUP, stage: [[0; 8]; L], blocks: Vec::new() }
-    }
-
-    #[inline(always)]
-    fn push(&mut self, arena: &mut Arena, per: usize, v: T) -> *mut T {
-        if self.pos == Self::GROUP {
-            self.next(arena, per);
-        }
-        let pos = self.pos;
-        self.pos = pos + Self::SIZE;
-        // SAFETY: pos + SIZE <= GROUP, the size of the stage; [grp, grp + GROUP) is inside the block `grow` took
-        unsafe {
-            ((self.stage.as_mut_ptr() as *mut u8).add(pos) as *mut T).write(v);
-            self.grp.add(pos) as *mut T
+    fn new(n: usize) -> Stream<T> {
+        const { assert!(64 % std::mem::size_of::<T>() == 0 && std::mem::align_of::<T>() <= 8 && !std::mem::needs_drop::<T>()) };
+        Stream {
+            cur: vec![std::ptr::null_mut(); n],
+            end: vec![std::ptr::null_mut(); n],
+            stage: vec![Cl([0; 8]); n],
+            blocks: (0..n).map(|_| Vec::new()).collect(),
+            _t: std::marker::PhantomData,
         }
     }
 
-    /// The staged group is full: it goes to memory and the group after it is staged, in a new block when this
-    /// one is full (or there is none yet).
+    /// Bytes staged in list `i`'s line (0 with a full line).
     #[inline(always)]
-    fn next(&mut self, arena: &mut Arena, per: usize) {
-        if !self.grp.is_null() {
-            // SAFETY: GROUP bytes at a 64-byte aligned address of the block
-            unsafe {
-                stream_group(self.grp, self.stage.as_ptr() as *const u8, Self::GROUP);
-                self.grp = self.grp.add(Self::GROUP);
-            }
+    unsafe fn pos(&self, i: usize) -> usize {
+        *self.cur.get_unchecked(i) as usize & 63
+    }
+
+    /// Appends `v` to list `i` (below `n`); its address.
+    #[inline(always)]
+    unsafe fn push(&mut self, i: usize, arena: &mut Arena, per: usize, v: T) -> *mut T {
+        let mut c = *self.cur.get_unchecked(i);
+        if c as usize & 63 == 0 {
+            c = self.next(i, arena, per);
         }
-        if self.grp == self.end {
-            self.grow(arena, per);
+        *self.cur.get_unchecked_mut(i) = c.add(Self::SIZE);
+        ((self.stage.as_mut_ptr().add(i) as *mut u8).add(c as usize & 63) as *mut T).write(v);
+        c as *mut T
+    }
+
+    /// List `i`'s staged line is full (or there is none yet): it goes to memory, and the next line is in a new
+    /// block when this one is full (or there is none yet). The cursor after.
+    #[inline(always)]
+    unsafe fn next(&mut self, i: usize, arena: &mut Arena, per: usize) -> *mut u8 {
+        let c = *self.cur.get_unchecked(i);
+        if !c.is_null() {
+            // SAFETY: the 64 bytes before the cursor, a 64-byte aligned line of the block
+            stream_group(c.sub(64), self.stage.as_ptr().add(i) as *const u8, 64);
         }
-        self.pos = 0;
+        if c == *self.end.get_unchecked(i) { self.grow(i, arena, per) } else { c }
     }
 
     #[cold]
     #[inline(never)]
-    fn grow(&mut self, arena: &mut Arena, per: usize) {
-        debug_assert!(per * Self::SIZE % Self::GROUP == 0);
+    fn grow(&mut self, i: usize, arena: &mut Arena, per: usize) -> *mut u8 {
+        debug_assert!(per * Self::SIZE % 64 == 0);
         let p = arena.alloc(per * Self::SIZE);
         debug_assert!(p as usize % 64 == 0);
-        self.blocks.push(p as *mut T);
-        self.grp = p;
-        self.end = unsafe { p.add(per * Self::SIZE) };
+        self.blocks[i].push(p as *mut T);
+        self.cur[i] = p;
+        self.end[i] = unsafe { p.add(per * Self::SIZE) };
+        p
     }
 
     /// Writes the records still staged to memory with plain stores.
     fn finish(&mut self) {
-        if !self.grp.is_null() {
-            // SAFETY: the staged bytes belong at [grp, grp + pos), inside the block
-            unsafe { std::ptr::copy_nonoverlapping(self.stage.as_ptr() as *const u8, self.grp, self.pos) };
+        for (i, &c) in self.cur.iter().enumerate() {
+            if !c.is_null() {
+                // SAFETY: the staged bytes belong from the start of the cursor's line (the line before, when the
+                // stage is full) to the cursor, inside the block
+                unsafe {
+                    let g = (c as usize - 1) & !63;
+                    std::ptr::copy_nonoverlapping(self.stage.as_ptr().add(i) as *const u8, g as *mut u8, c as usize - g);
+                }
+            }
         }
     }
 
-    /// Records in the last block (there is one).
-    fn tail(&self, b: *mut T) -> usize {
-        (self.grp as usize + self.pos - b as usize) / Self::SIZE
+    /// Records in list `i`'s last block `b`.
+    fn tail(&self, i: usize, b: *mut T) -> usize {
+        (self.cur[i] as usize - b as usize) / Self::SIZE
     }
 
-    fn len(&self, per: usize) -> usize {
-        match self.blocks.last() {
+    fn len(&self, i: usize, per: usize) -> usize {
+        match self.blocks[i].last() {
             None => 0,
-            Some(&b) => (self.blocks.len() - 1) * per + self.tail(b),
+            Some(&b) => (self.blocks[i].len() - 1) * per + self.tail(i, b),
         }
     }
 
-    fn slices(&self, per: usize) -> impl Iterator<Item = &[T]> {
-        let n = self.blocks.len();
-        self.blocks.iter().enumerate().map(move |(i, &b)| {
-            let len = if i + 1 == n { self.tail(b) } else { per };
+    fn slices(&self, i: usize, per: usize) -> impl Iterator<Item = &[T]> {
+        let n = self.blocks[i].len();
+        self.blocks[i].iter().enumerate().map(move |(j, &b)| {
+            let len = if j + 1 == n { self.tail(i, b) } else { per };
             unsafe { std::slice::from_raw_parts(b, len) }
         })
+    }
+
+    /// Every record of every list.
+    #[cfg(test)]
+    fn all(&self, per: usize) -> impl Iterator<Item = &T> {
+        (0..self.cur.len()).flat_map(move |i| self.slices(i, per)).flatten()
     }
 }
 
 /// Records in a block of a `Log`: 4 KiB of keys, then 4 KiB of payloads.
 const LG_BLOCK: usize = 512;
 
-/// The dedup records of one event-key bucket from one thread: per record a key and a payload of 8 bytes each,
+/// The dedup records of each event-key bucket from one thread: per record a key and a payload of 8 bytes each,
 /// append-only, in blocks of LG_BLOCK records whose keys fill one page and whose payloads fill the next. The
 /// passes that only look at keys (`mark_duplicates`) then read half the bytes, a page at a time (a hardware
 /// prefetcher stops at the end of a page, so it does not fetch the payloads behind the keys).
 ///
 /// Like a `Stream`, eight records at a time reach memory: their keys as one cache line and their payloads as
-/// another, with non-temporal stores. The caller fences (`sfence`) before others read, and calls `finish` once
-/// the pushing is over.
+/// another, with non-temporal stores, and the fields are arrays by bucket. The caller fences (`sfence`) before
+/// others read, and calls `finish` once the pushing is over.
 struct Log {
-    kp: *mut u64,      // where the staged keys belong, in the key page of the current block; null before the first push
-    end: *mut u64,     // the end of that key page
-    pos: usize,        // records staged; 8 = the group is full (or there is no block yet): `next` first
-    stage: [u64; 16],  // 8 keys, then their 8 payloads
-    blocks: Vec<*mut u64>,
+    kp: Vec<*mut u64>,  // where the next key goes, in the key page of the current block; null before the first
+    //                     push. Its offset in the line / 8 = records staged, 0 with a full stage: `next` first
+    end: Vec<*mut u64>, // the end of that key page
+    stage: Vec<[Cl; 2]>, // 8 keys, then their 8 payloads
+    blocks: Vec<Vec<*mut u64>>,
 }
 
 impl Log {
-    fn new() -> Log {
-        Log { kp: std::ptr::null_mut(), end: std::ptr::null_mut(), pos: 8, stage: [0; 16], blocks: Vec::new() }
-    }
-
-    /// `arena` must hand out nothing but this type's blocks: they are 8 KiB each, so every block starts on a page.
-    #[inline(always)]
-    fn push(&mut self, arena: &mut Arena, key: u64, pay: u64) {
-        if self.pos == 8 {
-            self.next(arena);
-        }
-        let pos = self.pos;
-        self.pos = pos + 1;
-        // SAFETY: pos < 8
-        unsafe {
-            *self.stage.get_unchecked_mut(pos) = key;
-            *self.stage.get_unchecked_mut(8 + pos) = pay;
+    fn new(n: usize) -> Log {
+        Log {
+            kp: vec![std::ptr::null_mut(); n],
+            end: vec![std::ptr::null_mut(); n],
+            stage: vec![[Cl([0; 8]); 2]; n],
+            blocks: (0..n).map(|_| Vec::new()).collect(),
         }
     }
 
+    /// Appends a record to bucket `i` (below `n`). `arena` must hand out nothing but this type's blocks: they are
+    /// 8 KiB each, so every block starts on a page.
     #[inline(always)]
-    fn next(&mut self, arena: &mut Arena) {
-        if !self.kp.is_null() {
+    unsafe fn push(&mut self, i: usize, arena: &mut Arena, key: u64, pay: u64) {
+        let mut c = *self.kp.get_unchecked(i);
+        if c as usize & 63 == 0 {
+            c = self.next(i, arena);
+        }
+        *self.kp.get_unchecked_mut(i) = c.add(1);
+        let pos = (c as usize & 63) / 8;
+        let st = self.stage.get_unchecked_mut(i);
+        *st[0].0.get_unchecked_mut(pos) = key;
+        *st[1].0.get_unchecked_mut(pos) = pay;
+    }
+
+    #[inline(always)]
+    unsafe fn next(&mut self, i: usize, arena: &mut Arena) -> *mut u64 {
+        let c = *self.kp.get_unchecked(i);
+        if !c.is_null() {
             // SAFETY: a cache line of the key page and the one as far into the payload page, 64-byte aligned
-            unsafe {
-                let st = self.stage.as_ptr() as *const u8;
-                stream_group(self.kp as *mut u8, st, 64);
-                stream_group(self.kp.add(LG_BLOCK) as *mut u8, st.add(64), 64);
-                self.kp = self.kp.add(8);
-            }
+            let st = self.stage.as_ptr().add(i) as *const u8;
+            stream_group(c.sub(8) as *mut u8, st, 64);
+            stream_group(c.sub(8).add(LG_BLOCK) as *mut u8, st.add(64), 64);
         }
-        if self.kp == self.end {
-            self.grow(arena);
-        }
-        self.pos = 0;
+        if c == *self.end.get_unchecked(i) { self.grow(i, arena) } else { c }
     }
 
     #[cold]
     #[inline(never)]
-    fn grow(&mut self, arena: &mut Arena) {
+    fn grow(&mut self, i: usize, arena: &mut Arena) -> *mut u64 {
         let p = arena.alloc(LG_BLOCK * 16) as *mut u64;
         debug_assert!(p as usize % 4096 == 0);
-        self.blocks.push(p);
-        self.kp = p;
-        self.end = unsafe { p.add(LG_BLOCK) };
+        self.blocks[i].push(p);
+        self.kp[i] = p;
+        self.end[i] = unsafe { p.add(LG_BLOCK) };
+        p
     }
 
     /// Writes the records still staged to memory with plain stores.
     fn finish(&mut self) {
-        if !self.kp.is_null() {
-            // SAFETY: the staged records belong at kp and LG_BLOCK entries on, inside the block
-            unsafe {
-                std::ptr::copy_nonoverlapping(self.stage.as_ptr(), self.kp, self.pos);
-                std::ptr::copy_nonoverlapping(self.stage.as_ptr().add(8), self.kp.add(LG_BLOCK), self.pos);
+        for (i, &c) in self.kp.iter().enumerate() {
+            if !c.is_null() {
+                // SAFETY: the staged records belong from the start of the cursor's line (the line before, when
+                // the stage is full) to the cursor, and LG_BLOCK entries on, inside the block
+                unsafe {
+                    let g = ((c as usize - 1) & !63) as *mut u64;
+                    let n = c.offset_from(g) as usize;
+                    let st = self.stage.as_ptr().add(i) as *const u64;
+                    std::ptr::copy_nonoverlapping(st, g, n);
+                    std::ptr::copy_nonoverlapping(st.add(8), g.add(LG_BLOCK), n);
+                }
             }
         }
     }
 
-    /// Records in the last block `b`.
-    fn tail(&self, b: *mut u64) -> usize {
-        (self.kp as usize - b as usize) / 8 + self.pos
+    /// Records in bucket `i`'s last block `b`.
+    fn tail(&self, i: usize, b: *mut u64) -> usize {
+        (self.kp[i] as usize - b as usize) / 8
     }
 
-    fn len(&self) -> usize {
-        match self.blocks.last() {
+    fn len(&self, i: usize) -> usize {
+        match self.blocks[i].last() {
             None => 0,
-            Some(&b) => (self.blocks.len() - 1) * LG_BLOCK + self.tail(b),
+            Some(&b) => (self.blocks[i].len() - 1) * LG_BLOCK + self.tail(i, b),
         }
     }
 
-    /// Per block, its keys and their payloads.
-    fn blocks(&self) -> impl Iterator<Item = (&[u64], &[u64])> {
-        let n = self.blocks.len();
-        self.blocks.iter().enumerate().map(move |(i, &b)| {
-            let len = if i + 1 == n { self.tail(b) } else { LG_BLOCK };
+    /// Per block of bucket `i`, its keys and their payloads.
+    fn blocks(&self, i: usize) -> impl Iterator<Item = (&[u64], &[u64])> {
+        let n = self.blocks[i].len();
+        self.blocks[i].iter().enumerate().map(move |(j, &b)| {
+            let len = if j + 1 == n { self.tail(i, b) } else { LG_BLOCK };
             unsafe { (std::slice::from_raw_parts(b as *const u64, len), std::slice::from_raw_parts(b.add(LG_BLOCK) as *const u64, len)) }
         })
     }
@@ -2920,8 +2952,6 @@ impl CRec {
 const EV_BLOCK: usize = 768; // records: 6144 bytes
 /// Cache lines a stream of each kind writes at a time (`Stream`); a block is a whole number of them. One line:
 /// the stages are what a parse thread keeps in its half of the L2 (Intel VM, 60M: 1, 2 and 4 lines parse alike).
-const EV_LINES: usize = 1;
-const CK_LINES: usize = 1;
 const CK_BLOCK: usize = 192; // records: 3072 bytes
 
 /// Events or clicks whose user IDs are on their way from memory at a time (`Batch`).
@@ -2942,9 +2972,9 @@ struct Batch {
 /// One parse thread's output.
 struct Shard {
     arena: Arena,
-    ev: Vec<Stream<ERec, EV_LINES>>,
-    ck: Vec<Stream<CRec, CK_LINES>>,
-    lg: Vec<Log>,
+    ev: Stream<ERec>,
+    ck: Stream<CRec>,
+    lg: Log,
     larena: Arena, // the blocks of `lg`, and nothing else (`Log::push`)
     far: Vec<(u64, u32, i64)>, // (event key, loc, ingest_ts) of the records whose `ing` is ING_FAR
     buf: Vec<u8>,
@@ -2974,7 +3004,7 @@ struct Shard {
     // where the next kept click ID goes, and the end of its chunk (`Shard::keep_id`)
     kb: (usize, usize),
     // the digits of the event_ids keyed by `ev_hash`, by bucket (`event_ids_distinct`), and their blocks
-    evh: Vec<Stream<[u64; 2], 1>>,
+    evh: Stream<[u64; 2]>,
     earena: Arena,
 }
 /// Lines `Shard::pend` holds.
@@ -3061,9 +3091,9 @@ impl Shard {
         Shard {
             arena: Arena::new(),
             larena: Arena::new(),
-            ev: (0..parts).map(|_| Stream::new()).collect(),
-            ck: (0..parts).map(|_| Stream::new()).collect(),
-            lg: (0..buckets).map(|_| Log::new()).collect(),
+            ev: Stream::new(parts),
+            ck: Stream::new(parts),
+            lg: Log::new(buckets),
             far: Vec::new(),
             buf: Vec::new(),
             ins: 0,
@@ -3079,7 +3109,7 @@ impl Shard {
             pn: 0,
             ph: 0,
             kb: (0, 0),
-            evh: (0..EVH_BUCKETS).map(|_| Stream::new()).collect(),
+            evh: Stream::new(EVH_BUCKETS),
             earena: Arena::new(),
         }
     }
@@ -3098,37 +3128,35 @@ impl Shard {
         // what the loops need, in locals: nothing is read again through `cx` or `self` per record
         let (ids, pshift, qshift, abase) = (&cx.ids, cx.pshift, cx.qshift, cx.abase);
         let (lmask, pay_bin) = ((1u32 << pshift) - 1, ids.bins() as u32);
-        let (evp, ckp, lgp) = (ev.as_mut_ptr(), ck.as_mut_ptr(), lg.as_mut_ptr());
         let mut person = [0u32; BATCH];
         ids.people(&bt.ukey, &mut bt.home, n, &mut person, ins);
         for i in 0..n {
             let (a, tx, person) = (bt.a[i], bt.tx[i], person[i]);
             let part = (person >> pshift) as usize;
-            // SAFETY: a person's partition (`IdTable::own`) is below the 2^pbits streams of `ev` and `ck`;
-            // the shift of the event key leaves qbits bits, a bucket below the 2^qbits streams of `lg`
+            // SAFETY: a person's partition (`IdTable::own`) is below the 2^pbits lists of `ev` and `ck`;
+            // the shift of the event key leaves qbits bits, a bucket below the 2^qbits lists of `lg`
             unsafe {
                 if EVENTS {
-                    let s = &mut *evp.add(part);
                     let (ts, pay, l) = ((tx >> 32) as u32, tx as u32, person & lmask);
                     let rec = if pay == 0 {
-                        s.push(arena, EV_BLOCK, ERec { ts, lw: l })
+                        ev.push(part, arena, EV_BLOCK, ERec { ts, lw: l })
                     } else {
-                        // the pay record and its event in one group, so next to each other in memory: when one
-                        // place is left in the group it goes to a pay record of nothing
-                        if s.pos == EV_LINES * 64 - 8 {
-                            s.push(arena, EV_BLOCK, ERec { ts: 0, lw: pay_bin });
+                        // the pay record and its event in one line, so next to each other in memory: when one
+                        // place is left in the line it goes to a pay record of nothing
+                        if ev.pos(part) == 64 - 8 {
+                            ev.push(part, arena, EV_BLOCK, ERec { ts: 0, lw: pay_bin });
                         }
-                        s.push(arena, EV_BLOCK, ERec { ts: pay, lw: pay_bin });
-                        s.push(arena, EV_BLOCK, ERec { ts, lw: l | HAS_PAY })
+                        ev.push(part, arena, EV_BLOCK, ERec { ts: pay, lw: pay_bin });
+                        ev.push(part, arena, EV_BLOCK, ERec { ts, lw: l | HAS_PAY })
                     };
                     let loc = loc_of(abase, rec);
                     let ing = cx.ing(bt.b[i]).unwrap_or_else(|| {
                         far.push((a, loc, bt.b[i]));
                         ING_FAR
                     });
-                    (*lgp.add((spread(a) >> qshift) as usize)).push(larena, a, LRec::pay(ing, loc));
+                    lg.push((spread(a) >> qshift) as usize, larena, a, LRec::pay(ing, loc));
                 } else {
-                    (*ckp.add(part)).push(arena, CK_BLOCK, CRec::new(a, person & ((1 << pshift) - 1), (tx >> 32) as u32, tx as u32));
+                    ck.push(part, arena, CK_BLOCK, CRec::new(a, person & ((1 << pshift) - 1), (tx >> 32) as u32, tx as u32));
                 }
             }
         }
@@ -3184,7 +3212,7 @@ impl Shard {
     #[inline(always)]
     fn evh_push(&mut self, k: u64, r: [u64; 2]) {
         // SAFETY: six bits, below EVH_BUCKETS
-        unsafe { self.evh.get_unchecked_mut(((k >> 55) & 63) as usize) }.push(&mut self.earena, EVH_BLOCK, r);
+        unsafe { self.evh.push(((k >> 55) & 63) as usize, &mut self.earena, EVH_BLOCK, r) };
     }
 
     /// Any parsed event: its dedup record. `loc` = 0 for an invalid or late one.
@@ -3196,7 +3224,7 @@ impl Shard {
             ING_FAR
         });
         // SAFETY: q is below the 2^qbits streams of `lg`: the shift leaves qbits bits
-        unsafe { self.lg.get_unchecked_mut(q) }.push(&mut self.larena, ekey, LRec::pay(ing, loc));
+        unsafe { self.lg.push(q, &mut self.larena, ekey, LRec::pay(ing, loc)) };
     }
 
     /// A valid, non-late event: into its person's partition, plus its dedup record, once its user ID is at hand.
@@ -3421,12 +3449,12 @@ fn main() {
     );
     // the records of groups not yet full, written by this thread (each parse thread fenced its own before the join)
     for s in &mut shards {
-        s.ev.iter_mut().for_each(Stream::finish);
-        s.ck.iter_mut().for_each(Stream::finish);
-        s.lg.iter_mut().for_each(Log::finish);
+        s.ev.finish();
+        s.ck.finish();
+        s.lg.finish();
     }
-    let n_ev: usize = shards.iter().flat_map(|s| s.ev.iter()).map(|s| s.len(EV_BLOCK)).sum();
-    let n_ck: usize = shards.iter().flat_map(|s| s.ck.iter()).map(|s| s.len(CK_BLOCK)).sum();
+    let n_ev: usize = shards.iter().flat_map(|s| (0..np).map(|p| s.ev.len(p, EV_BLOCK))).sum();
+    let n_ck: usize = shards.iter().flat_map(|s| (0..np).map(|p| s.ck.len(p, CK_BLOCK))).sum();
     lap(&format!("parsed: {n_ev} valid events, {n_ck} valid clicks"));
     if n_ev >= i32::MAX as usize {
         die("too many events for 32-bit session and event counts"); // user_daily writes them as INT32
@@ -3437,7 +3465,7 @@ fn main() {
             restart_without_evhash();
         }
         for s in &mut shards {
-            s.evh = Vec::new();
+            s.evh = Stream::new(0);
         }
     }
 
@@ -3451,14 +3479,14 @@ fn main() {
     for d in [&ud, &cd] {
         std::fs::create_dir_all(d).unwrap_or_else(|e| die(&format!("mkdir {}: {e}", d.display())));
     }
-    let mut order: Vec<(usize, usize)> = (0..np).map(|p| (shards.iter().map(|s| s.ev[p].len(EV_BLOCK)).sum(), p)).collect();
+    let mut order: Vec<(usize, usize)> = (0..np).map(|p| (shards.iter().map(|s| s.ev.len(p, EV_BLOCK)).sum(), p)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let width = ndays;
     // a thread's rows: about one per 9 events, and room for twice its share (more only grows the vector)
     let rows_cap = n_ev / threads / 4 + 1024;
     // the counting sorts' buffers: room for the largest partition at once, in huge pages
     let ev_cap = order.first().map_or(0, |x| x.0);
-    let ck_cap = (0..np).map(|p| shards.iter().map(|s| s.ck[p].len(CK_BLOCK)).sum::<usize>()).max().unwrap_or(0);
+    let ck_cap = (0..np).map(|p| shards.iter().map(|s| s.ck.len(p, CK_BLOCK)).sum::<usize>()).max().unwrap_or(0);
     let next = AtomicUsize::new(0);
     let n_rows = AtomicUsize::new(0);
     // A thread that has emptied the queue hands its campaign cells to this thread, then writes its user file; this
@@ -4371,7 +4399,7 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
         buckets,
         || (Vec::<u64>::new(), Vec::<(u64, usize)>::new(), Vec::<LRec>::new(), 0usize),
         |(seen, cand, table, total), b| {
-            let n: usize = shards.iter().map(|s| s.lg[b].len()).sum();
+            let n: usize = shards.iter().map(|s| s.lg.len(b)).sum();
             if n == 0 {
                 return;
             }
@@ -4396,7 +4424,7 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
                 *w = v | t | (v & t) << 32;
             };
             for s in shards {
-                for (keys, _) in s.lg[b].blocks() {
+                for (keys, _) in s.lg.blocks(b) {
                     let mut four = keys.chunks_exact(4);
                     for p in &mut four {
                         first(p[0]);
@@ -4419,7 +4447,7 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
                 c += (((*wb.wrapping_add((x >> 5) as usize) >> 32) as u32 >> (x as u32 & 31)) & 1) as usize;
             };
             for s in shards {
-                for (keys, pays) in s.lg[b].blocks() {
+                for (keys, pays) in s.lg.blocks(b) {
                     let pp = pays.as_ptr();
                     let mut i = 0;
                     while i + 4 <= keys.len() {
@@ -4801,7 +4829,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
         let ev_bin = |r: &ERec| r.lw as usize & lm;
         std::ptr::write_bytes(st, 0, local + 3);
         for s in shards {
-            for blk in s.ev[p].slices(EV_BLOCK) {
+            for blk in s.ev.slices(p, EV_BLOCK) {
                 // four records a step: the loop's own instructions are a third of one record's
                 let mut four = blk.chunks_exact(4);
                 for r in &mut four {
@@ -4838,7 +4866,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
             }
         };
         for s in shards {
-            for blk in s.ev[p].slices(EV_BLOCK) {
+            for blk in s.ev.slices(p, EV_BLOCK) {
                 let mut four = blk.chunks_exact(4);
                 for r in &mut four {
                     place(&r[0]);
@@ -4873,7 +4901,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
         let ck_bin = |r: &CRec| r.local() as usize & lm; // masked: the index is unchecked
         std::ptr::write_bytes(ct, 0, local + 3);
         for s in shards {
-            for blk in s.ck[p].slices(CK_BLOCK) {
+            for blk in s.ck.slices(p, CK_BLOCK) {
                 for r in blk {
                     *ct.add(ck_bin(r) + 2) += 1;
                 }
@@ -4885,7 +4913,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
         }
         let ckp = w.ck.as_mut_ptr();
         for s in shards {
-            for blk in s.ck[p].slices(CK_BLOCK) {
+            for blk in s.ck.slices(p, CK_BLOCK) {
                 for r in blk {
                     let f = ct.add(ck_bin(r) + 1);
                     *ckp.add(*f as usize) = *r;
@@ -6086,13 +6114,13 @@ mod tests {
     /// The clicks of a shard as (click key, the rest of the record), sorted.
     /// The clicks as (click_id, the rest): a click ID's key is not the same in every run (`Shard::click_key`)
     fn click_list(st: &mut Shard, names: &Interner) -> Vec<(Vec<u8>, u64)> {
-        st.ck.iter_mut().for_each(Stream::finish);
+        st.ck.finish();
         let id = |k: u64| {
             let mut v = Vec::new();
             names.bytes(k, &mut v);
             v
         };
-        let mut v: Vec<_> = st.ck.iter().flat_map(|s| s.slices(CK_BLOCK)).flatten().map(|r| (id(r.cid), r.w)).collect();
+        let mut v: Vec<_> = st.ck.all(CK_BLOCK).map(|r| (id(r.cid), r.w)).collect();
         v.sort();
         v
     }
@@ -6100,13 +6128,13 @@ mod tests {
     /// (events as (person, ts, pay), dedup records as (key, ingest, has a record)), each sorted
     type Flat = (Vec<(u32, u32, u32)>, Vec<(u64, i64, bool)>);
     fn flat(st: &mut Shard) -> Flat {
-        st.ev.iter_mut().for_each(Stream::finish);
-        st.lg.iter_mut().for_each(Log::finish);
+        st.ev.finish();
+        st.lg.finish();
         // an event as (partition << 17 | number in it, ts, pay): a purchase's pay is the record before it; the pay
         // records themselves (the one before a purchase, and the fillers with ts 0) are left out
         let mut ev = Vec::new();
-        for (p, s) in st.ev.iter().enumerate() {
-            let recs: Vec<ERec> = s.slices(EV_BLOCK).flatten().copied().collect();
+        for p in 0..st.ev.cur.len() {
+            let recs: Vec<ERec> = st.ev.slices(p, EV_BLOCK).flatten().copied().collect();
             for (i, r) in recs.iter().enumerate() {
                 let pays_next = recs.get(i + 1).is_some_and(|n| n.lw & HAS_PAY != 0);
                 if r.ts != 0 && !pays_next {
@@ -6116,7 +6144,7 @@ mod tests {
             }
         }
         // the ingest_ts as the record holds it; a far one as its exact value, from the shard's far list
-        let recs: Vec<LRec> = st.lg.iter().flat_map(|s| s.blocks()).flat_map(|(k, p)| k.iter().zip(p).map(|(&k, &p)| LRec::of(k, p))).collect();
+        let recs: Vec<LRec> = (0..st.lg.kp.len()).flat_map(|b| st.lg.blocks(b)).flat_map(|(k, p)| k.iter().zip(p).map(|(&k, &p)| LRec::of(k, p))).collect();
         let mut lg: Vec<_> = recs.iter().filter(|r| r.ing != ING_FAR).map(|r| (r.key, r.ing as i64, r.loc != 0)).collect();
         lg.extend(st.far.iter().map(|&(key, loc, ingest)| (key, ingest, loc != 0)));
         assert_eq!(st.far.len(), recs.iter().filter(|r| r.ing == ING_FAR).count());
@@ -6254,9 +6282,9 @@ mod tests {
     fn streams_keep_every_record_where_push_said() {
         let mut r = Rng(17);
         let mut arena = Arena::new();
-        let mut s12: Vec<Stream<ERec, EV_LINES>> = (0..23).map(|_| Stream::new()).collect();
+        let mut s12: Stream<ERec> = Stream::new(23);
         let mut larena = Arena::new();
-        let mut s24: Vec<Log> = (0..23).map(|_| Log::new()).collect();
+        let mut s24 = Log::new(23);
         let mut want12: Vec<Vec<(u32, u32)>> = vec![Vec::new(); 23];
         let mut want24: Vec<Vec<(u64, u32, u32)>> = vec![Vec::new(); 23];
         let mut at: Vec<(*mut ERec, u32)> = Vec::new();
@@ -6264,23 +6292,23 @@ mod tests {
             let b = r.below(23);
             if r.below(2) == 0 {
                 let rec = ERec { ts: r.next() as u32, lw: i };
-                at.push((s12[b].push(&mut arena, EV_BLOCK, rec), i));
+                at.push((unsafe { s12.push(b, &mut arena, EV_BLOCK, rec) }, i));
                 want12[b].push((rec.lw, rec.ts));
             } else {
                 let rec = LRec { key: r.next(), ing: i, loc: b as u32 };
-                s24[b].push(&mut larena, rec.key, LRec::pay(rec.ing, rec.loc));
+                unsafe { s24.push(b, &mut larena, rec.key, LRec::pay(rec.ing, rec.loc)) };
                 want24[b].push((rec.key, rec.ing, rec.loc));
             }
         }
         sfence();
-        s12.iter_mut().for_each(Stream::finish);
-        s24.iter_mut().for_each(Log::finish);
+        s12.finish();
+        s24.finish();
         for b in 0..23 {
-            let got: Vec<_> = s12[b].slices(EV_BLOCK).flatten().map(|r| (r.lw, r.ts)).collect();
+            let got: Vec<_> = s12.slices(b, EV_BLOCK).flatten().map(|r| (r.lw, r.ts)).collect();
             assert_eq!(got, want12[b]);
-            assert_eq!(s12[b].len(EV_BLOCK), want12[b].len());
-            let got: Vec<_> = s24[b].blocks().flat_map(|(k, p)| k.iter().zip(p).map(|(&k, &p)| LRec::of(k, p))).map(|r| (r.key, r.ing, r.loc)).collect();
-            assert_eq!(s24[b].len(), want24[b].len());
+            assert_eq!(s12.len(b, EV_BLOCK), want12[b].len());
+            let got: Vec<_> = s24.blocks(b).flat_map(|(k, p)| k.iter().zip(p).map(|(&k, &p)| LRec::of(k, p))).map(|r| (r.key, r.ing, r.loc)).collect();
+            assert_eq!(s24.len(b), want24[b].len());
             assert_eq!(got, want24[b]);
         }
         assert!(at.iter().all(|&(p, i)| unsafe { (*p).lw } == i));
@@ -7035,7 +7063,7 @@ mod tests {
                     valid = r.below(10) != 0 && ingest <= c.ihi;
                 }
                 let Shard { arena, ev, .. } = &mut shards[r.below(3)];
-                let rec = if valid { ev[r.below(parts)].push(arena, EV_BLOCK, ERec { ts: 5, lw: 7 }) } else { std::ptr::null_mut() };
+                let rec = if valid { unsafe { ev.push(r.below(parts), arena, EV_BLOCK, ERec { ts: 5, lw: 7 }) } } else { std::ptr::null_mut() };
                 let loc = if valid { loc_of(c.abase, rec) } else { 0 };
                 shards[r.below(3)].log(&c, key, ingest, loc);
                 copies.entry(key).or_default().push((ingest, rec));
@@ -7043,10 +7071,10 @@ mod tests {
             }
         }
         for s in &mut shards {
-            s.ev.iter_mut().for_each(Stream::finish);
-            s.lg.iter_mut().for_each(Log::finish);
+            s.ev.finish();
+            s.lg.finish();
         }
-        assert!(n > 100_000 && shards.iter().all(|s| s.lg.iter().all(|l| l.len() > 4 * LG_BLOCK)));
+        assert!(n > 100_000 && shards.iter().all(|s| (0..buckets).all(|b| s.lg.len(b) > 4 * LG_BLOCK)));
         let cands = mark_duplicates(&c, &shards, buckets, 3);
         assert!(cands > n / 4 && cands <= n, "{cands} of {n}");
         // a dropped event has its ts zeroed (`mark_duplicates`)

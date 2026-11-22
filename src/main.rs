@@ -4600,6 +4600,7 @@ struct Work {
     // the sessions of the person at hand
     ses: Vec<Ses>,
     dcats: Vec<(u32, u16, i64)>, // (row, category, price sum)
+    dix: Vec<u32>,               // per row and category (row * 256 + category): its entry of `dcats` + 1, or 0
     best: Vec<i64>,              // price sum of a row's top category
     eq: [u64; 64],               // per click of the person at hand, the clicks of the same campaign
     // people with more than 64 clicks
@@ -4644,6 +4645,9 @@ impl Work {
             bits: vec![0; nbins / 64 + 1],
             ses: vec![Ses { start: 0, d: 0, row: 0, rev: 0 }; nbins + 1],
             dcats: Vec::new(),
+            // a row is a day of the window; a category is 8 bits of a pay. An odd window too long for the table
+            // gets none (the entries are then searched)
+            dix: if cx.ndays <= 1 << 12 { vec![0; cx.ndays << 8] } else { Vec::new() },
             best: vec![0; nbins + 1],
             eq: [0; 64],
             sessions: Vec::new(),
@@ -5057,7 +5061,7 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u32], pa: usize, np: usize, ca: usize
 
     // purchases: into their session and row; then each row's top category
     if np != 0 {
-        let Work { rows, pls, bins, ses, dcats, best, .. } = w;
+        let Work { rows, pls, bins, ses, dcats, dix, best, .. } = w;
         let rows = &mut rows[row0..];
         dcats.clear();
         for &(ts, pay) in &pls[pa..pa + np] {
@@ -5067,9 +5071,22 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u32], pa: usize, np: usize, ca: usize
             s.rev += price;
             let g = s.row;
             rows[g as usize].revenue += price;
-            match dcats.iter_mut().find(|c| c.0 == g && c.1 == cat) {
-                Some(c) => c.2 += price,
-                None => dcats.push((g, cat, price)),
+            // g < rows of the person <= ndays (one row a day), cat < 256
+            match dix.get_mut((g as usize) << 8 | cat as usize) {
+                Some(x) if *x != 0 => dcats[*x as usize - 1].2 += price,
+                Some(x) => {
+                    dcats.push((g, cat, price));
+                    *x = dcats.len() as u32;
+                }
+                None => match dcats.iter_mut().find(|c| c.0 == g && c.1 == cat) {
+                    Some(c) => c.2 += price,
+                    None => dcats.push((g, cat, price)),
+                },
+            }
+        }
+        if !dix.is_empty() {
+            for &(g, cat, _) in dcats.iter() {
+                dix[(g as usize) << 8 | cat as usize] = 0;
             }
         }
         // the highest sum; a tie goes to the category that sorts first

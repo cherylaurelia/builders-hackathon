@@ -465,9 +465,7 @@ unsafe fn long_lane(cx: &Ctx, l: &mut Lanes, j: usize, line: *const u8) {
     *l.e2.get_unchecked_mut(j) = tz((vn >> 64) as u64) as u64;
     *l.sh1.get_unchecked_mut(j) = d1 as u64;
     *l.sh2.get_unchecked_mut(j) = d2 as u64;
-    if l0 {
-        cx.names.prefetch_long(line.add(qe as usize + 1));
-    }
+    // (an event ID is not looked up: `LONG_EV`)
     if l1 {
         cx.names.prefetch_long(line.add((s1 + qu) as usize + 1));
     }
@@ -628,7 +626,7 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
         while m != 0 {
             let i = m.trailing_zeros() as usize;
             m &= m - 1;
-            match cx.names.long(buf.add(l.ae[i] as usize), 33) {
+            match long_ev_key(buf.add(l.ae[i] as usize)) {
                 0 => usual &= !(1 << i),
                 k => l.ek[i] = k,
             }
@@ -755,11 +753,7 @@ unsafe fn defer<const EVENTS: bool>(cx: &Ctx, buf: *const u8, p: usize, len: usi
     let c = c0 as u128 | (c1 as u128) << 64;
     if c != 0 {
         let p1 = c.trailing_zeros() as usize;
-        let q = (*line == b'"') as usize;
-        // (a click ID is not looked up: `Shard::click_key`)
-        if EVENTS && p1 == 33 + 2 * q {
-            cx.names.prefetch_long(line.add(q + 1));
-        }
+        // (an event or click ID is not looked up: `LONG_EV`, `Shard::click_key`)
         let c2 = c & (c - 1);
         if c2 != 0 {
             let (s, p2) = (p1 + 1, c2.trailing_zeros() as usize);

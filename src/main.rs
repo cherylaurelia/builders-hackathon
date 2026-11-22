@@ -254,6 +254,55 @@ const LONG: u64 = 1 << 62;
 /// its length byte, its bytes after that.
 const KEPT: u64 = 1 << 61;
 
+/// Bit 60 of an `INTERNED` key, with 61 and 62 clear: an event ID of one byte (1..=127) and 32 lowercase hex
+/// digits (v5: one in eight), the low 48 bits the address of its 33 bytes in the piece being parsed. Such a key
+/// lives only until its event's dedup record is written (`Shard::log`, `Shard::drain`, both before the parse leaves
+/// the piece), and that record is made from the ID's bytes, all of them (`Shard::lx`): event IDs never go into the
+/// long-ID table.
+const LONG_EV: u64 = INTERNED | 1 << 60;
+const LONG_EV_MASK: u64 = INTERNED | LONG | KEPT | 1 << 60;
+
+/// (first byte, hi, lo) of the event ID of 33 bytes at `p` when it is a byte 1..=127 and 32 lowercase hex digits.
+#[inline(always)]
+unsafe fn long_ev(p: *const u8) -> Option<(u8, u64, u64)> {
+    if (*p).wrapping_sub(1) < 127 {
+        if let Some((lo, hi)) = hex32(p.add(1)) {
+            return Some((*p, hi, lo));
+        }
+    }
+    None
+}
+
+/// The `LONG_EV` key of the 33 bytes at `p` when `long_ev` takes them, else 0.
+#[inline(always)]
+unsafe fn long_ev_key(p: *const u8) -> u64 {
+    debug_assert!((p as u64) < 1 << 48);
+    if long_ev(p).is_some() {
+        LONG_EV | p as u64
+    } else {
+        0
+    }
+}
+
+/// The key of the event ID of `len` bytes at `p` (in the piece being parsed; 9 bytes readable): `LONG_EV` for a
+/// byte and 32 hex digits, else `Interner::key_at`.
+#[inline(always)]
+unsafe fn event_key_at(cx: &Ctx, p: *const u8, len: usize) -> u64 {
+    if len == 33 {
+        let k = long_ev_key(p);
+        if k != 0 {
+            return k;
+        }
+    }
+    cx.names.key_at(p, len)
+}
+
+/// `spread` of an event ID of the byte `c` and the hex digits (hi, lo): its event-key bucket is the top bits.
+#[inline(always)]
+fn long_hash(c: u8, hi: u64, lo: u64) -> u64 {
+    spread(lo ^ hi.rotate_left(29) ^ c as u64)
+}
+
 /// The bytes of a `KEPT` key.
 #[inline]
 fn kept_bytes(key: u64) -> &'static [u8] {
@@ -2801,6 +2850,10 @@ struct Shard {
     ev: Vec<Stream<ERec, EV_LINES>>,
     ck: Vec<Stream<CRec, CK_LINES>>,
     lg: Vec<Log>,
+    // the events whose ID has a `LONG_EV` key: per event-key bucket, two records each, (lo, `LRec::pay`) then
+    // (hi, first byte); in `larena`
+    lx: Vec<Log>,
+    farx: Vec<((u8, u64, u64), u32, i64)>, // `far` of those
     larena: Arena, // the blocks of `lg`, and nothing else (`Log::push`)
     far: Vec<(u64, u32, i64)>, // (event key, loc, ingest_ts) of the records whose `ing` is ING_FAR
     buf: Vec<u8>,
@@ -2916,6 +2969,8 @@ impl Shard {
             ev: (0..parts).map(|_| Stream::new()).collect(),
             ck: (0..parts).map(|_| Stream::new()).collect(),
             lg: (0..buckets).map(|_| Log::new()).collect(),
+            lx: (0..buckets).map(|_| Log::new()).collect(),
+            farx: Vec::new(),
             far: Vec::new(),
             buf: Vec::new(),
             ins: 0,
@@ -2942,7 +2997,7 @@ impl Shard {
     /// stay in the L2 (Intel 20M: asking cost 1.4% wall).
     #[inline(never)]
     fn drain<const EVENTS: bool>(&mut self, cx: &Ctx) {
-        let Shard { arena, larena, ev, ck, lg, far, ins, bt, .. } = self;
+        let Shard { arena, larena, ev, ck, lg, far, ins, bt, lx, farx, .. } = self;
         let n = bt.n.min(BATCH);
         bt.n = 0;
         // what the loops need, in locals: nothing is read again through `cx` or `self` per record
@@ -2972,6 +3027,18 @@ impl Shard {
                         s.push(arena, EV_BLOCK, ERec { ts, lw: l | HAS_PAY })
                     };
                     let loc = loc_of(abase, rec);
+                    if a & LONG_EV_MASK == LONG_EV {
+                        // the ID's bytes are in the piece still being parsed (`LONG_EV`)
+                        let Some((c, hi, lo)) = long_ev((a & ((1 << 48) - 1)) as *const u8) else { unreachable!() };
+                        let ing = cx.ing(bt.b[i]).unwrap_or_else(|| {
+                            farx.push(((c, hi, lo), loc, bt.b[i]));
+                            ING_FAR
+                        });
+                        let l = &mut *lx.as_mut_ptr().add((long_hash(c, hi, lo) >> qshift) as usize);
+                        l.push(larena, lo, LRec::pay(ing, loc));
+                        l.push(larena, hi, c as u64);
+                        continue;
+                    }
                     let ing = cx.ing(bt.b[i]).unwrap_or_else(|| {
                         far.push((a, loc, bt.b[i]));
                         ING_FAR
@@ -3009,6 +3076,9 @@ impl Shard {
     /// Any parsed event: its dedup record. `loc` = 0 for an invalid or late one.
     #[inline(always)]
     fn log(&mut self, cx: &Ctx, ekey: u64, ingest: i64, loc: u32) {
+        if ekey & LONG_EV_MASK == LONG_EV {
+            return self.log_long(cx, ekey, ingest, loc);
+        }
         let q = (spread(ekey) >> cx.qshift) as usize;
         let ing = cx.ing(ingest).unwrap_or_else(|| {
             self.far.push((ekey, loc, ingest));
@@ -3016,6 +3086,20 @@ impl Shard {
         });
         // SAFETY: q is below the 2^qbits streams of `lg`: the shift leaves qbits bits
         unsafe { self.lg.get_unchecked_mut(q) }.push(&mut self.larena, ekey, LRec::pay(ing, loc));
+    }
+
+    /// `log` of an event whose ID has a `LONG_EV` key.
+    #[inline(never)]
+    fn log_long(&mut self, cx: &Ctx, ekey: u64, ingest: i64, loc: u32) {
+        // SAFETY: the ID's bytes are in the piece still being parsed (`LONG_EV`)
+        let Some((c, hi, lo)) = (unsafe { long_ev((ekey & ((1 << 48) - 1)) as *const u8) }) else { unreachable!() };
+        let ing = cx.ing(ingest).unwrap_or_else(|| {
+            self.farx.push(((c, hi, lo), loc, ingest));
+            ING_FAR
+        });
+        let l = &mut self.lx[(long_hash(c, hi, lo) >> cx.qshift) as usize];
+        l.push(&mut self.larena, lo, LRec::pay(ing, loc));
+        l.push(&mut self.larena, hi, c as u64);
     }
 
     /// A valid, non-late event: into its person's partition, plus its dedup record, once its user ID is at hand.
@@ -3167,9 +3251,9 @@ fn main() {
 
     // 1. links, on every thread; this one reads the small tables meanwhile
     let ids = IdTable::new(id_bits, pbits);
-    // the long-ID table: one ID in eight is long in generated data, some 600 input bytes a distinct one; about
-    // half full
-    let lbits = env_num("SESS_LONG_BITS").map(|v| v as u32).unwrap_or(usize::BITS - ((ev_bytes + bytes(&ck_files)) / 400).leading_zeros()).clamp(12, 28);
+    // the long-ID table: user IDs only (an event ID is a `LONG_EV` key, a click ID a `KEPT` one), one in eight of
+    // them long in generated data; about a quarter full
+    let lbits = env_num("SESS_LONG_BITS").map(|v| v as u32).unwrap_or(usize::BITS - (id_est / 4).max(1).leading_zeros()).clamp(12, 28);
     let names = Interner::sized(lbits, threads);
     mark("files listed, ID table mapped");
     let (n_links, small) = std::thread::scope(|sc| {
@@ -3235,6 +3319,7 @@ fn main() {
         s.ev.iter_mut().for_each(Stream::finish);
         s.ck.iter_mut().for_each(Stream::finish);
         s.lg.iter_mut().for_each(Log::finish);
+        s.lx.iter_mut().for_each(Log::finish);
     }
     let n_ev: usize = shards.iter().flat_map(|s| s.ev.iter()).map(|s| s.len(EV_BLOCK)).sum();
     let n_ck: usize = shards.iter().flat_map(|s| s.ck.iter()).map(|s| s.len(CK_BLOCK)).sum();
@@ -3656,7 +3741,8 @@ fn event_fields(cx: &Ctx, [eid, uid, ts, ingest, etype, pid, price]: [Bytes; 7],
         return;
     }
     let Some(ingest) = parse_ts(ingest) else { return }; // always valid F1 per rules.md
-    let ekey = cx.names.key(eid);
+    // SAFETY: the field is in the piece being parsed, its 33 bytes when it has 33
+    let ekey = if eid.len() == 33 { unsafe { event_key_at(cx, eid.as_ptr(), 33) } } else { cx.names.key(eid) };
     let valid = || -> Option<(i64, u32)> {
         if uid.is_empty() || pid.is_empty() {
             return None;
@@ -3688,7 +3774,7 @@ unsafe fn fast_event(cx: &Ctx, line: *const u8, mut a: Cut, rest: *const u8, mut
     }
     let (is, il) = b.next();
     let Some(ingest) = ts_memo(rest.add(is), il, &mut st.days) else { return };
-    let ekey = cx.names.key_at(line.add(es), el);
+    let ekey = event_key_at(cx, line.add(es), el);
     let (us, ul) = a.next();
     let (ts, tl) = a.next();
     let (ks, kl) = b.next();
@@ -3719,7 +3805,7 @@ unsafe fn fast_event_n(cx: &Ctx, line: *const u8, f: [(usize, usize); 7], st: &m
         return;
     }
     let Some(ingest) = ts_memo(line.add(is), il, &mut st.days) else { return };
-    let ekey = cx.names.key_at(line.add(es), el);
+    let ekey = event_key_at(cx, line.add(es), el);
     let ts = match ts_memo(line.add(ts), tl, &mut st.days) {
         Some(t) if ul != 0 && pl != 0 && t >= cx.ws && t < cx.we && ingest - t <= DAY => t,
         _ => return st.log(cx, ekey, ingest, 0),
@@ -4134,15 +4220,81 @@ unsafe fn parse_clicks_v3(cx: &Ctx, buf: *const u8, start: usize, end: usize, le
 /// "seen", and "again" when it already was; the second keeps the records whose slot says "again" - every copy of a
 /// repeated key, plus the few other keys that share a slot with another. Only those go through an exact table on
 /// the key, where the copy with the smaller ingest_ts stays and the other is dropped.
+/// A record of `Shard::lx` in `long_duplicates`'s table: c = 0 is a free slot.
+#[derive(Clone, Copy)]
+struct XRec {
+    lo: u64,
+    hi: u64,
+    c: u8,
+    ing: u32,
+    loc: u32,
+}
+
+/// `mark_duplicates` of bucket `b`'s events whose ID has a `LONG_EV` key (`Shard::lx`): all of an ID in one table,
+/// the copy with the smallest ingest_ts kept. Returns how many records there were.
+fn long_duplicates(cx: &Ctx, shards: &[Shard], b: usize, farx: &HashMap<((u8, u64, u64), u32), i64>, xt: &mut Vec<XRec>) -> usize {
+    let n: usize = shards.iter().map(|s| s.lx[b].len() / 2).sum();
+    if n == 0 {
+        return 0;
+    }
+    let slots = (n + n / 2 + 1).next_power_of_two().max(16);
+    let tshift = 64 - slots.trailing_zeros();
+    xt.clear();
+    xt.resize(slots, XRec { lo: 0, hi: 0, c: 0, ing: 0, loc: 0 });
+    let ingest = |x: &XRec| -> i64 {
+        match x.ing {
+            ING_FAR => farx[&((x.c, x.hi, x.lo), x.loc)],
+            ING_LATE => i64::MAX,
+            v => cx.ilo + (v as i64 - 1),
+        }
+    };
+    for s in shards {
+        for (keys, pays) in s.lx[b].blocks() {
+            // two records an event, never split across blocks (both are pushed together, LG_BLOCK and the
+            // staging groups are even)
+            debug_assert!(keys.len() % 2 == 0);
+            for (k, p) in keys.chunks_exact(2).zip(pays.chunks_exact(2)) {
+                let r = LRec::of(0, p[0]);
+                let x = XRec { lo: k[0], hi: k[1], c: p[1] as u8, ing: r.ing, loc: r.loc };
+                let mut h = ((x.lo ^ x.hi.rotate_left(32) ^ x.c as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93) >> tshift) as usize;
+                let best = loop {
+                    let e = &mut xt[h];
+                    if e.c == 0 {
+                        *e = x;
+                        break None;
+                    }
+                    if e.lo == x.lo && e.hi == x.hi && e.c == x.c {
+                        break Some(e);
+                    }
+                    h = (h + 1) & (slots - 1);
+                };
+                if let Some(best) = best {
+                    let lost = if ingest(&x) < ingest(best) { std::mem::replace(best, x) } else { x };
+                    if lost.loc != 0 {
+                        // SAFETY: as in `mark_duplicates`
+                        unsafe { (*rec_at(cx.abase, lost.loc)).ts = 0 };
+                    }
+                }
+            }
+        }
+    }
+    n
+}
+
 fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -> usize {
     let far = far_map(shards); // empty unless an ingest_ts is far from the window
-    let (far, abase) = (&far, cx.abase);
+    let mut farx: HashMap<((u8, u64, u64), u32), i64> = HashMap::new();
+    for &(id, loc, ingest) in shards.iter().flat_map(|s| s.farx.iter()) {
+        farx.entry((id, loc)).and_modify(|v| *v = (*v).min(ingest)).or_insert(ingest);
+    }
+    let (far, farx, abase) = (&far, &farx, cx.abase);
     let qb = buckets.trailing_zeros();
     par(
         threads,
         buckets,
-        || (Vec::<u64>::new(), Vec::<(u64, usize)>::new(), Vec::<LRec>::new(), 0usize),
-        |(seen, cand, table, total), b| {
+        || (Vec::<u64>::new(), Vec::<(u64, usize)>::new(), Vec::<LRec>::new(), 0usize, Vec::<XRec>::new()),
+        |(seen, cand, table, total, xt), b| {
+            *total += long_duplicates(cx, shards, b, farx, xt);
             let n: usize = shards.iter().map(|s| s.lg[b].len()).sum();
             if n == 0 {
                 return;
@@ -6715,6 +6867,7 @@ mod tests {
         for s in &mut shards {
             s.ev.iter_mut().for_each(Stream::finish);
             s.lg.iter_mut().for_each(Log::finish);
+            s.lx.iter_mut().for_each(Log::finish);
         }
         assert!(n > 100_000 && shards.iter().all(|s| s.lg.iter().all(|l| l.len() > 4 * LG_BLOCK)));
         let cands = mark_duplicates(&c, &shards, buckets, 3);

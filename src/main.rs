@@ -5604,6 +5604,33 @@ fn put_name(b: &mut Vec<u8>, names: &Interner, k: u64, tmp: &mut Vec<u8>) {
             return;
         }
     }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    if k & (INTERNED | LONG) == INTERNED | LONG {
+        // a long-ID-table name (one in eight on v5): the prefix as a packed ID, the 16 bytes as 32 hex digits,
+        // written whole (`Interner::bytes` pushes them one at a time)
+        let s = names.slot(k as usize);
+        let pre = (s.meta.load(Acquire) & !(LONG_BUSY | LONG_READY)) << 7;
+        let (lo, hi) = (s.lo.load(Relaxed), s.hi.load(Relaxed));
+        let plen = 9 - (pre.trailing_zeros() / 7) as usize; // 1..=8: the prefix is never empty
+        b.reserve(64);
+        // SAFETY: 64 bytes are reserved past the length; 4 + 13 and 4 + plen + 32 <= 44 are written
+        unsafe {
+            use std::arch::x86_64::*;
+            let p = b.as_mut_ptr().add(b.len());
+            (p as *mut u32).write_unaligned(((plen + 32) as u32).to_le());
+            *p.add(4) = (pre >> 56) as u8 & 127;
+            (p.add(5) as *mut u64).write_unaligned(_pdep_u64(pre, 0x7f7f_7f7f_7f7f_7f7f).to_be());
+            // each byte as its high nibble's digit, then its low one's
+            let x = _mm_set_epi64x(hi as i64, lo as i64);
+            let m = _mm_set1_epi8(0x0f);
+            let (hn, ln) = (_mm_and_si128(_mm_srli_epi16::<4>(x), m), _mm_and_si128(x, m));
+            let t = _mm_loadu_si128(b"0123456789abcdef".as_ptr() as *const _);
+            _mm_storeu_si128(p.add(4 + plen) as *mut _, _mm_shuffle_epi8(t, _mm_unpacklo_epi8(hn, ln)));
+            _mm_storeu_si128(p.add(20 + plen) as *mut _, _mm_shuffle_epi8(t, _mm_unpackhi_epi8(hn, ln)));
+            b.set_len(b.len() + 4 + plen + 32);
+        }
+        return;
+    }
     tmp.clear();
     names.bytes(k, tmp);
     b.extend_from_slice(&(tmp.len() as u32).to_le_bytes());
@@ -6670,6 +6697,26 @@ mod tests {
             let took = wide::USUAL.load(Relaxed) - usual0;
             eprintln!("the eight-line parser took {took} of {lines} click lines itself; {kept} clicks kept");
             assert!(took * 5 > lines, "the eight-line parser took {took} of {lines} click lines itself");
+        }
+    }
+
+    #[test]
+    fn put_name_matches_bytes() {
+        let names = Interner::new();
+        let mut r = Rng(0x5eed_1234_abcd_0001);
+        let (mut out, mut tmp) = (Vec::new(), Vec::new());
+        for i in 0..20_000 {
+            let pre: String = (0..1 + r.below(8)).map(|_| (b'!' + r.below(90) as u8) as char).collect();
+            let id = match i % 4 {
+                0 => format!("u{}", r.below(1_000_000_000)),
+                _ => format!("{pre}{:016x}{:016x}", r.next(), r.next()),
+            };
+            let k = names.key(id.as_bytes());
+            out.clear();
+            put_name(&mut out, &names, k, &mut tmp);
+            let mut want = (id.len() as u32).to_le_bytes().to_vec();
+            want.extend_from_slice(id.as_bytes());
+            assert_eq!(out, want, "{id}");
         }
     }
 

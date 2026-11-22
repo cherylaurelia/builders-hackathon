@@ -4585,6 +4585,7 @@ struct Work {
     seen: Vec<u32>,
     sctr: u32,
     touched: Vec<usize>,
+    blks: Vec<(usize, usize)>, // the blocks of the partition at hand: address, records
 }
 
 impl Work {
@@ -4628,6 +4629,7 @@ impl Work {
             seen: filled(cx.ncamp + 1, 0),
             sctr: 0,
             touched: Vec::new(),
+            blks: Vec::new(),
         }
     }
 }
@@ -4803,8 +4805,21 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     unsafe {
         let ev_bin = |r: &ERec| r.lw as usize & lm;
         std::ptr::write_bytes(st, 0, local + 3);
+        // the partition's blocks, each one's first lines asked for while the one before is counted (a hardware
+        // prefetcher stops at a block's end, and blocks are not adjacent)
+        let blks = &mut w.blks;
+        blks.clear();
         for s in shards {
-            for blk in s.ev[p].slices(EV_BLOCK) {
+            blks.extend(s.ev[p].slices(EV_BLOCK).map(|b| (b.as_ptr() as usize, b.len())));
+        }
+        for (bi, &(bp0, bl)) in blks.iter().enumerate() {
+            if let Some(&(nx, _)) = blks.get(bi + 1) {
+                for k in 0..4 {
+                    prefetch((nx as *const u8).wrapping_add(64 * k));
+                }
+            }
+            {
+                let blk = std::slice::from_raw_parts(bp0 as *const ERec, bl);
                 // four records a step: the loop's own instructions are a third of one record's
                 let mut four = blk.chunks_exact(4);
                 for r in &mut four {
@@ -4840,8 +4855,9 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
                 pl.push([l as u32, r.ts, (*(r as *const ERec).sub(1)).ts]);
             }
         };
-        for s in shards {
-            for blk in s.ev[p].slices(EV_BLOCK) {
+        for &(bp0, bl) in w.blks.iter() {
+            {
+                let blk = std::slice::from_raw_parts(bp0 as *const ERec, bl);
                 let mut four = blk.chunks_exact(4);
                 for r in &mut four {
                     place(&r[0]);

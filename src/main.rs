@@ -317,12 +317,37 @@ impl Interner {
 
     #[cfg(test)]
     fn new() -> Interner {
-        Interner::sized(12)
+        Interner::sized(12, 1)
     }
 
-    /// With a long-ID table of 2^lbits slots.
-    fn sized(lbits: u32) -> Interner {
-        let long = map_anon(std::mem::size_of::<LongSlot>() << lbits) as usize;
+    /// With a long-ID table of 2^lbits slots, its pages written on `threads` threads.
+    ///
+    /// A slot is read before it is written, and a page read first maps the shared zero page, which the write then
+    /// replaces with a 4 KiB page: no huge pages, a fault per 4 KiB (v5 20M: ~36K faults). So every 2 MiB gets one
+    /// write first, while nothing reads the table (or every page, where there are no huge pages: `populate`).
+    fn sized(lbits: u32, threads: usize) -> Interner {
+        const HP: usize = 2 << 20;
+        let bytes = std::mem::size_of::<LongSlot>() << lbits;
+        let long = map_anon(bytes) as usize;
+        if !populate(long, bytes) {
+            let pages = bytes.div_ceil(HP);
+            let next = AtomicUsize::new(0);
+            let work = || loop {
+                let i = next.fetch_add(1, Relaxed);
+                if i >= pages {
+                    break;
+                }
+                // SAFETY: a byte of the fresh mapping (a free slot's meta, already 0), which nothing reads yet
+                unsafe { std::ptr::write_volatile((long + i * HP) as *mut u8, 0) };
+            };
+            std::thread::scope(|sc| {
+                for _ in 1..threads.min(pages) {
+                    // a thread that cannot start leaves its pages to the others
+                    let _ = std::thread::Builder::new().spawn_scoped(sc, &work);
+                }
+                work();
+            });
+        }
         Interner { shards: (0..Self::SHARDS).map(|_| Mutex::new((HashMap::default(), Vec::new()))).collect(), long, lbits }
     }
 
@@ -485,10 +510,25 @@ static REGIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 /// `bytes` of zeroed anonymous memory, never unmapped; huge pages where the kernel offers them.
 fn map_anon(bytes: usize) -> *mut u8 {
-    let p = unsafe { libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
-    if p == libc::MAP_FAILED {
+    // at a multiple of 2 MiB, so that every 2 MiB of it can be a huge page: the kernel may place a mapping anywhere
+    // (v5 20M: the long-ID table on 4 KiB pages took ~65K faults)
+    const HP: usize = 2 << 20;
+    let raw = unsafe { libc::mmap(std::ptr::null_mut(), bytes + HP, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+    if raw == libc::MAP_FAILED {
         die(&format!("mmap of {bytes} bytes: {}", std::io::Error::last_os_error()));
     }
+    let (r, a) = (raw as usize, (raw as usize + HP - 1) & !(HP - 1));
+    // SAFETY: the parts before the aligned start and after its `bytes` are this mapping's own, unused
+    unsafe {
+        if a > r {
+            libc::munmap(raw, a - r);
+        }
+        let end = (a + bytes + 4095) & !4095;
+        if r + bytes + HP > end {
+            libc::munmap(end as *mut libc::c_void, r + bytes + HP - end);
+        }
+    }
+    let p = a as *mut libc::c_void;
     #[cfg(target_os = "linux")]
     unsafe {
         libc::madvise(p, bytes, libc::MADV_HUGEPAGE); // a hint: fine if refused
@@ -2965,7 +3005,7 @@ fn main() {
     // the long-ID table: one ID in eight is long in generated data, some 600 input bytes a distinct one; about
     // half full
     let lbits = env_num("SESS_LONG_BITS").map(|v| v as u32).unwrap_or(usize::BITS - ((ev_bytes + bytes(&ck_files)) / 400).leading_zeros()).clamp(12, 28);
-    let names = Interner::sized(lbits);
+    let names = Interner::sized(lbits, threads);
     mark("files listed, ID table mapped");
     let (n_links, small) = std::thread::scope(|sc| {
         let links = sc.spawn(|| {
@@ -6376,7 +6416,7 @@ mod tests {
             assert_eq!(back, odd);
         }
         // a full table sends the rest to the locked maps, and the keys stay exact
-        let small = Interner::sized(4);
+        let small = Interner::sized(4, 2);
         let ks: Vec<u64> = (0..100).map(|i| small.key(hex(i).as_bytes())).collect();
         assert_eq!(ks.iter().filter(|&&k| k & LONG != 0).count(), 16);
         for (i, &k) in ks.iter().enumerate() {

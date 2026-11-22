@@ -848,8 +848,13 @@ struct ClickLanes {
     q0: [u64; 8], // quotes
     c1: [u64; 8], // commas of its bytes 64..128
     q1: [u64; 8], // quotes
-    e: [u64; 8],  // where its newline is, when that is in its first 128 bytes and no byte before it is below 0x20 or above 0x7F; else 128
-    n: [u64; 8],  // its commas | its quotes << 8
+    o0: [u64; 8], // bytes of its first 64 below 0x20 or above 0x7F
+    o1: [u64; 8], // of its bytes 64..128
+    n0: [u64; 8], // newlines of its first 64 bytes
+    n1: [u64; 8], // of its bytes 64..128
+    // B: where its newline is, when that is in its first 128 bytes and no byte before it is below 0x20 or above
+    // 0x7F; else 128
+    e: [u64; 8],
     // B: where to copy from (buffer offsets)
     ac: [u64; 8],
     au: [u64; 8],
@@ -896,23 +901,16 @@ pub unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
                 prefetch(line.wrapping_add(pf));
                 let v0 = _mm512_loadu_si512(line as *const _);
                 let v1 = _mm512_loadu_si512(line.add(64) as *const _);
-                // the first byte below 0x20 or above 0x7F (as signed bytes, those are below 0x20 too) must be the
-                // line's newline: both IDs are then bytes that pack. (No newline and no such byte in the 128: both
-                // places are 128, and that is no place)
-                let odd = _mm512_cmplt_epi8_mask(v0, lowest) as u128 | (_mm512_cmplt_epi8_mask(v1, lowest) as u128) << 64;
-                let nl = _mm512_cmpeq_epi8_mask(v0, nv) as u128 | (_mm512_cmpeq_epi8_mask(v1, nv) as u128) << 64;
-                let (o, w) = (odd.trailing_zeros(), nl.trailing_zeros());
-                let e = if o == w { w } else { 128 };
-                // the commas and quotes before the newline (bzhi keeps all of a word for a count of 64 and more)
-                let (n0, n1) = (e.min(64), e.saturating_sub(64));
-                let (c0, c1) = (_bzhi_u64(_mm512_cmpeq_epi8_mask(v0, cm), n0), _bzhi_u64(_mm512_cmpeq_epi8_mask(v1, cm), n1));
-                let (q0, q1) = (_bzhi_u64(_mm512_cmpeq_epi8_mask(v0, qt), n0), _bzhi_u64(_mm512_cmpeq_epi8_mask(v1, qt), n1));
-                *l.c0.get_unchecked_mut($j) = c0;
-                *l.c1.get_unchecked_mut($j) = c1;
-                *l.q0.get_unchecked_mut($j) = q0;
-                *l.q1.get_unchecked_mut($j) = q1;
-                *l.e.get_unchecked_mut($j) = e as u64;
-                *l.n.get_unchecked_mut($j) = (c0.count_ones() + c1.count_ones()) as u64 | ((q0.count_ones() + q1.count_ones()) as u64) << 8;
+                // the masks as they are; `click_batch` finds the newline and cuts the masks there for all eight
+                // (as signed bytes, those above 0x7F are below 0x20 too)
+                *l.c0.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v0, cm);
+                *l.c1.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v1, cm);
+                *l.q0.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v0, qt);
+                *l.q1.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v1, qt);
+                *l.o0.get_unchecked_mut($j) = _mm512_cmplt_epi8_mask(v0, lowest);
+                *l.o1.get_unchecked_mut($j) = _mm512_cmplt_epi8_mask(v1, lowest);
+                *l.n0.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v0, nv);
+                *l.n1.get_unchecked_mut($j) = _mm512_cmpeq_epi8_mask(v1, nv);
             }};
         }
         loop {
@@ -985,14 +983,39 @@ unsafe fn click_batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &
     }
 
     // ---- B: where the fields are
-    let (e, pv) = (ld!(l.e), ld!(l.cur));
+    let pv = ld!(l.cur);
     let live = _mm512_cmplt_epu64_mask(pv, ld!(l.lim));
     if live == 0 {
         return false;
     }
+    // the first byte below 0x20 or above 0x7F must be the line's newline: both IDs are then bytes that pack. (No
+    // newline and no such byte in the 128: both places are 128, and that is no place)
+    macro_rules! tz128 {
+        ($a:expr, $b:expr) => {{
+            let (a, b) = ($a, $b);
+            _mm512_mask_blend_epi64(_mm512_test_epi64_mask(a, a), _mm512_add_epi64(tzv!(b, _mm512_add_epi64(b, m1)), c64), tzv!(a, _mm512_add_epi64(a, m1)))
+        }};
+    }
+    let w = tz128!(ld!(l.n0), ld!(l.n1));
+    let e = _mm512_mask_blend_epi64(_mm512_cmpeq_epi64_mask(tz128!(ld!(l.o0), ld!(l.o1)), w), k!(128), w);
+    sv!(l.e, e);
     sv!(l.cur, _mm512_mask_add_epi64(pv, live, pv, _mm512_add_epi64(e, one)));
+    // the commas and quotes before the newline: the bits below e of the low word and below e - 64 of the high one
+    // (a shift by 64 gives 0: all bits kept)
+    let (b0, b1) = (
+        _mm512_andnot_si512(_mm512_sllv_epi64(m1, _mm512_min_epu64(e, c64)), m1),
+        _mm512_andnot_si512(_mm512_sllv_epi64(m1, _mm512_max_epi64(_mm512_sub_epi64(e, c64), _mm512_setzero_si512())), m1),
+    );
+    let (q0, q1) = (_mm512_and_si512(ld!(l.q0), b0), _mm512_and_si512(ld!(l.q1), b1));
+    // the quotes counted: per byte from nibbles, then the bytes of each word summed
+    let nq = {
+        let lut = _mm512_set4_epi32(0x0403_0302, 0x0302_0201, 0x0302_0201, 0x0201_0100);
+        let nib = _mm512_set1_epi8(0x0F);
+        let cnt = |x: __m512i| _mm512_add_epi8(_mm512_shuffle_epi8(lut, _mm512_and_si512(x, nib)), _mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_srli_epi16::<4>(x), nib)));
+        _mm512_sad_epu8(_mm512_add_epi8(cnt(q0), cnt(q1)), _mm512_setzero_si512())
+    };
     // the first three commas of the 128-bit masks (lo, hi): from lo while it has one, then from hi
-    let (mut lo, mut hi) = (ld!(l.c0), ld!(l.c1));
+    let (mut lo, mut hi) = (_mm512_and_si512(ld!(l.c0), b0), _mm512_and_si512(ld!(l.c1), b1));
     macro_rules! comma {
         () => {{
             let klo = _mm512_test_epi64_mask(lo, lo);
@@ -1006,8 +1029,9 @@ unsafe fn click_batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &
     let p1 = comma!();
     let p2 = comma!();
     let p3 = comma!();
+    // no fourth comma before the newline (with fewer than three, p3 is 128: ts then has no room)
+    let k3 = _mm512_testn_epi64_mask(_mm512_or_si512(lo, hi), _mm512_or_si512(lo, hi));
     // the quote bit at a place 0..128 (0 for any other place: a shift by 64 or more gives 0)
-    let (q0, q1) = (ld!(l.q0), ld!(l.q1));
     macro_rules! qb {
         ($at:expr) => {{
             let at = $at;
@@ -1023,14 +1047,13 @@ unsafe fn click_batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &
         _mm512_or_si512(_mm512_xor_si512(qk, qb!(_mm512_add_epi64(p3, m1))), _mm512_xor_si512(qt, qb!(_mm512_add_epi64(e, m1)))),
     );
     let quoted = _mm512_add_epi64(_mm512_add_epi64(qc, qu), _mm512_add_epi64(qk, qt));
-    let want = _mm512_or_si512(k!(3), _mm512_slli_epi64::<9>(quoted));
     let cl = _mm512_sub_epi64(p1, _mm512_add_epi64(qc, qc));
     let ul = _mm512_sub_epi64(_mm512_sub_epi64(p2, s1), _mm512_add_epi64(qu, qu));
     let kl = _mm512_sub_epi64(_mm512_sub_epi64(p3, s2), _mm512_add_epi64(qk, qk));
     let tl = _mm512_sub_epi64(_mm512_sub_epi64(e, s3), _mm512_add_epi64(qt, qt));
     // a newline in the first 120 bytes after exactly three commas, well quoted; both IDs 1 to 48 bytes, the
     // campaign 0 to 7 (an empty one is in no file, as `get_short` finds out), ts 13, 20 or 25
-    let k_w = _mm512_mask_cmplt_epu64_mask(_mm512_mask_cmpeq_epi64_mask(_mm512_testn_epi64_mask(ends, ends) & live, ld!(l.n), want), e, k!(120));
+    let k_w = _mm512_mask_cmplt_epu64_mask(_mm512_mask_cmpeq_epi64_mask(_mm512_testn_epi64_mask(ends, ends) & live & k3, nq, _mm512_add_epi64(quoted, quoted)), e, k!(120));
     let k_len = _mm512_mask_cmplt_epu64_mask(_mm512_mask_cmplt_epu64_mask(k_w, _mm512_add_epi64(cl, m1), k!(48)), _mm512_add_epi64(ul, m1), k!(48));
     let k_len = _mm512_mask_cmple_epu64_mask(k_len, kl, k!(7));
     let (kf1, kf2, kf3) = (_mm512_mask_cmpeq_epi64_mask(k_len, tl, k!(20)), _mm512_mask_cmpeq_epi64_mask(k_len, tl, k!(25)), _mm512_mask_cmpeq_epi64_mask(k_len, tl, k!(13)));

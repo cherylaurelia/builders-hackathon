@@ -4234,14 +4234,46 @@ struct XRec {
     loc: u32,
 }
 
-/// `mark_duplicates` of bucket `b`'s events whose ID has a `LONG_EV` key (`Shard::lx`): all of an ID in one table,
-/// the copy with the smallest ingest_ts kept. Returns how many records there were.
-fn long_duplicates(cx: &Ctx, shards: &[Shard], b: usize, farx: &HashMap<((u8, u64, u64), u32), i64>, xt: &mut Vec<XRec>) -> usize {
+/// `mark_duplicates` of bucket `b`'s events whose ID is a byte and 32 hex digits (`Shard::lx`): as there, a bit
+/// filter on a hash of the ID finds the records that may have a copy, and a table on all of an ID keeps, of each
+/// such ID, the copy with the smallest ingest_ts. Returns how many records went to the table.
+fn long_duplicates(cx: &Ctx, shards: &[Shard], b: usize, farx: &HashMap<((u8, u64, u64), u32), i64>, seen: &mut Vec<u64>, xt: &mut Vec<XRec>) -> usize {
     let n: usize = shards.iter().map(|s| s.lx[b].len() / 2).sum();
     if n == 0 {
         return 0;
     }
-    let slots = (n + n / 2 + 1).next_power_of_two().max(16);
+    // two records an event, never split across blocks (both are pushed together; LG_BLOCK and the staging groups
+    // are even): per event (lo, hi) of its keys, (payload, first byte) of its payloads
+    let each = |f: &mut dyn FnMut(&[u64], &[u64])| {
+        for s in shards {
+            for (keys, pays) in s.lx[b].blocks() {
+                debug_assert!(keys.len() % 2 == 0);
+                for (k, p) in keys.chunks_exact(2).zip(pays.chunks_exact(2)) {
+                    f(k, p);
+                }
+            }
+        }
+    };
+    // 8 slots an event, 32 a word: "seen" bits in the low half, "again" bits in the high half
+    let sbits = (n * 8).next_power_of_two().trailing_zeros().max(5);
+    seen.clear();
+    seen.resize(1 << (sbits - 5), 0);
+    let slot = |k: &[u64], p: &[u64]| ((k[0] ^ k[1].rotate_left(32) ^ p[1]).wrapping_mul(0xA24B_AED4_963E_E407) >> (64 - sbits)) as usize;
+    each(&mut |k, p| {
+        let x = slot(k, p);
+        let (v, t) = (seen[x >> 5], 1u64 << (x & 31));
+        seen[x >> 5] = v | t | (v & t) << 32;
+    });
+    let mut cand = Vec::new();
+    each(&mut |k, p| {
+        let x = slot(k, p);
+        if (seen[x >> 5] >> 32 >> (x & 31)) & 1 != 0 {
+            let r = LRec::of(0, p[0]);
+            cand.push(XRec { lo: k[0], hi: k[1], c: p[1] as u8, ing: r.ing, loc: r.loc });
+        }
+    });
+    let c = cand.len();
+    let slots = (c + c / 2 + 1).next_power_of_two().max(16);
     let tshift = 64 - slots.trailing_zeros();
     xt.clear();
     xt.resize(slots, XRec { lo: 0, hi: 0, c: 0, ing: 0, loc: 0 });
@@ -4252,37 +4284,28 @@ fn long_duplicates(cx: &Ctx, shards: &[Shard], b: usize, farx: &HashMap<((u8, u6
             v => cx.ilo + (v as i64 - 1),
         }
     };
-    for s in shards {
-        for (keys, pays) in s.lx[b].blocks() {
-            // two records an event, never split across blocks (both are pushed together, LG_BLOCK and the
-            // staging groups are even)
-            debug_assert!(keys.len() % 2 == 0);
-            for (k, p) in keys.chunks_exact(2).zip(pays.chunks_exact(2)) {
-                let r = LRec::of(0, p[0]);
-                let x = XRec { lo: k[0], hi: k[1], c: p[1] as u8, ing: r.ing, loc: r.loc };
-                let mut h = ((x.lo ^ x.hi.rotate_left(32) ^ x.c as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93) >> tshift) as usize;
-                let best = loop {
-                    let e = &mut xt[h];
-                    if e.c == 0 {
-                        *e = x;
-                        break None;
-                    }
-                    if e.lo == x.lo && e.hi == x.hi && e.c == x.c {
-                        break Some(e);
-                    }
-                    h = (h + 1) & (slots - 1);
-                };
-                if let Some(best) = best {
-                    let lost = if ingest(&x) < ingest(best) { std::mem::replace(best, x) } else { x };
-                    if lost.loc != 0 {
-                        // SAFETY: as in `mark_duplicates`
-                        unsafe { (*rec_at(cx.abase, lost.loc)).ts = 0 };
-                    }
-                }
+    for x in cand {
+        let mut h = ((x.lo ^ x.hi.rotate_left(32) ^ x.c as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93) >> tshift) as usize;
+        let best = loop {
+            let e = &mut xt[h];
+            if e.c == 0 {
+                *e = x;
+                break None;
+            }
+            if e.lo == x.lo && e.hi == x.hi && e.c == x.c {
+                break Some(e);
+            }
+            h = (h + 1) & (slots - 1);
+        };
+        if let Some(best) = best {
+            let lost = if ingest(&x) < ingest(best) { std::mem::replace(best, x) } else { x };
+            if lost.loc != 0 {
+                // SAFETY: as in `mark_duplicates`
+                unsafe { (*rec_at(cx.abase, lost.loc)).ts = 0 };
             }
         }
     }
-    n
+    c
 }
 
 fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -> usize {
@@ -4298,7 +4321,7 @@ fn mark_duplicates(cx: &Ctx, shards: &[Shard], buckets: usize, threads: usize) -
         buckets,
         || (Vec::<u64>::new(), Vec::<(u64, usize)>::new(), Vec::<LRec>::new(), 0usize, Vec::<XRec>::new()),
         |(seen, cand, table, total, xt), b| {
-            *total += long_duplicates(cx, shards, b, farx, xt);
+            *total += long_duplicates(cx, shards, b, farx, seen, xt);
             let n: usize = shards.iter().map(|s| s.lg[b].len()).sum();
             if n == 0 {
                 return;

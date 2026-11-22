@@ -3642,12 +3642,13 @@ fn main() {
     let ids = IdTable::new(id_bits, pbits);
     // the long-ID table: one ID in eight is long in generated data, some 600 input bytes a distinct one; about
     // half full
-    // (`ev_hash` keeps v5's event_ids out of it: then user and click IDs alone, one per ~4800 input bytes, a table
-    // 35-55% full at one per 6400 bytes (v5 20M: 186K IDs in 2^19 slots, 60M: 555K in 2^20); SESS_NO_EVHASH puts
-    // them back)
+    // (`ev_hash` keeps v5's event_ids out of it, and click IDs are kept as they are: then user IDs alone, a table
+    // 17-27% full at one slot per 3200 input bytes (v5 20M: 186K IDs in 2^20 slots, 60M: 555K in 2^21);
+    // SESS_NO_EVHASH puts the event_ids back). Half as many slots (35-55% full) was 0.7% slower at 20M and 1.2% at
+    // 60M on the Intel VM: a search goes on past its home slot, into a line not asked for, more often
     let lbits = env_num("SESS_LONG_BITS")
         .map(|v| v as u32)
-        .unwrap_or(usize::BITS - ((ev_bytes + bytes(&ck_files)) / if std::env::var_os("SESS_NO_EVHASH").is_some() { 400 } else { 6400 }).leading_zeros())
+        .unwrap_or(usize::BITS - ((ev_bytes + bytes(&ck_files)) / if std::env::var_os("SESS_NO_EVHASH").is_some() { 400 } else { 3200 }).leading_zeros())
         .clamp(12, 28);
     let names = Interner::sized(lbits, threads);
     mark("files listed, ID table mapped");

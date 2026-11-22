@@ -332,6 +332,10 @@ struct Lanes {
     q1: [u64; 8],  // quotes
     odd: [u64; 8], // bytes of its first 64 below 0x20 or above 0x7F
     e2: [u64; 8],  // its newline is byte 64 + e2 (64: none in bytes 64..128)
+    // a line with a long ID (33 bytes, v5) is seen as if its long IDs were their first 9 bytes (`long_lane`): the
+    // bytes cut out before user_id (24 or 0) and before ts (0, 24 or 48)
+    sh1: [u64; 8],
+    sh2: [u64; 8],
     // B: where to copy from (buffer offsets)
     ae: [u64; 8],
     au: [u64; 8],
@@ -381,6 +385,15 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
                 // as signed bytes, those above 0x7F are below 0x20 too
                 *l.odd.get_unchecked_mut($j) = _mm512_cmplt_epi8_mask(v0, lowest);
                 *l.e2.get_unchecked_mut($j) = tz(_mm512_cmpeq_epi8_mask(v1, nv)) as u64;
+                // an ID longer than 9 bytes (with its quotes 11): the line through `long_lane`
+                let c0 = *l.c0.get_unchecked($j);
+                let (p1, p2) = (tz(c0), tz(c0 & c0.wrapping_sub(1)));
+                if (p1 > 11 || p2 - p1 > 12) && *l.cur.get_unchecked($j) < *l.lim.get_unchecked($j) {
+                    long_lane(cx, &mut l, $j, line);
+                } else {
+                    *l.sh1.get_unchecked_mut($j) = 0;
+                    *l.sh2.get_unchecked_mut($j) = 0;
+                }
             }};
         }
         loop {
@@ -400,6 +413,58 @@ pub unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, l
     }
     st.drain::<true>(cx);
     sfence();
+}
+
+/// A for the lane `j` of `l`, whose line at `line` (192 bytes readable) has a field before its second comma longer than
+/// 9 bytes: when event_id or user_id is 33 bytes (quotes left out), the masks are those of the line with the
+/// bytes 9..33 of each such ID cut out, and `sh1`/`sh2` say how many bytes were cut before user_id and before ts;
+/// otherwise the masks of the line itself. The table slots of the long IDs are asked for (`batch` looks them up).
+///
+/// The cut bytes are seen by no check here: the long-ID table takes only 32 lowercase hex digits after a 1-byte
+/// prefix (no comma, quote, newline or odd byte among them), and a lane whose ID it refuses goes to `event_line`.
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,avx2")]
+unsafe fn long_lane(cx: &Ctx, l: &mut Lanes, j: usize, line: *const u8) {
+    let (cm, qt, nv, lowest) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'"' as i8), _mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(0x20));
+    let v = [_mm512_loadu_si512(line as *const _), _mm512_loadu_si512(line.add(64) as *const _), _mm512_loadu_si512(line.add(128) as *const _)];
+    let m3 = |k: __m512i| [_mm512_cmpeq_epi8_mask(v[0], k), _mm512_cmpeq_epi8_mask(v[1], k), _mm512_cmpeq_epi8_mask(v[2], k)];
+    let (c, q, n) = (m3(cm), m3(qt), m3(nv));
+    let odd = [_mm512_cmplt_epi8_mask(v[0], lowest), _mm512_cmplt_epi8_mask(v[1], lowest), 0];
+    let lo = |m: [u64; 3]| m[0] as u128 | (m[1] as u128) << 64;
+    let cl = lo(c);
+    let ql = lo(q);
+    // event_id: from byte qe; user_id: from s1 + qu
+    let qe = (q[0] & 1) as u32;
+    let p1 = cl.trailing_zeros();
+    let s1 = p1 + 1;
+    let qu = if s1 < 128 { ((ql >> s1) & 1) as u32 } else { 0 };
+    let p2 = (cl & cl.wrapping_sub(1)).trailing_zeros();
+    let l0 = p1 < 128 && p1 == 33 + 2 * qe;
+    let l1 = p2 < 128 && p2 == s1 + 33 + 2 * qu;
+    // virtual byte k is real byte k below cut0, k + d1 below cut1, k + d2 from there
+    let d1 = if l0 { 24 } else { 0 };
+    let d2 = d1 + if l1 { 24 } else { 0 };
+    let cut0 = if l0 { qe + 9 } else { 0 };
+    let cut1 = if l1 { s1 + qu + 9 - d1 } else { 128 };
+    let low = |x: u32| if x >= 128 { !0u128 } else { (1u128 << x) - 1 };
+    let (m0, m1) = (low(cut0), low(cut1));
+    let shr = |m: [u64; 3], d: u32| if d == 0 { lo(m) } else { (lo(m) >> d) | ((m[2] as u128) << (128 - d)) };
+    let virt = |m: [u64; 3]| (lo(m) & m0) | (shr(m, d1) & !m0 & m1) | (shr(m, d2) & !m1);
+    let (vc, vq, vn, vo) = (virt(c), virt(q), virt(n), virt(odd));
+    *l.c0.get_unchecked_mut(j) = vc as u64;
+    *l.c1.get_unchecked_mut(j) = (vc >> 64) as u64;
+    *l.q0.get_unchecked_mut(j) = vq as u64;
+    *l.q1.get_unchecked_mut(j) = (vq >> 64) as u64;
+    *l.odd.get_unchecked_mut(j) = vo as u64;
+    *l.e2.get_unchecked_mut(j) = tz((vn >> 64) as u64) as u64;
+    *l.sh1.get_unchecked_mut(j) = d1 as u64;
+    *l.sh2.get_unchecked_mut(j) = d2 as u64;
+    if l0 {
+        cx.names.prefetch_long(line.add(qe as usize + 1));
+    }
+    if l1 {
+        cx.names.prefetch_long(line.add((s1 + qu) as usize + 1));
+    }
 }
 
 /// The lines the walks of `l` stand on (A filled in), each walk moved past its line: the usual ones into the
@@ -422,13 +487,14 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
 
     // ---- B, first part: where the four fields to copy start
     let (c0, q0, c1, q1, e2, pv) = (ld!(l.c0), ld!(l.q0), ld!(l.c1), ld!(l.q1), ld!(l.e2), ld!(l.cur));
+    let (sh1, sh2) = (ld!(l.sh1), ld!(l.sh2));
     // the walks that stand on a line of their part; each goes past its line (`event_line` below puts the walk
     // of a line that is not usual where that line really ends)
     let live = _mm512_cmplt_epu64_mask(pv, ld!(l.lim));
     if live == 0 {
         return false;
     }
-    sv!(l.cur, _mm512_mask_add_epi64(pv, live, pv, _mm512_add_epi64(e2, k!(65))));
+    sv!(l.cur, _mm512_mask_add_epi64(pv, live, pv, _mm512_add_epi64(_mm512_add_epi64(e2, k!(65)), sh2)));
     // the first three commas: p1, p2, p3
     let c0m = _mm512_add_epi64(c0, m1);
     let t1 = _mm512_and_si512(c0, c0m);
@@ -472,12 +538,12 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
     let k_pos = kf1 | kf2 | kf3;
     // any other lane copies from its line's start
     sv!(l.ae, _mm512_mask_add_epi64(pv, k_pos, pv, qe));
-    sv!(l.au, _mm512_mask_add_epi64(pv, k_pos, pv, us));
-    sv!(l.at, _mm512_mask_add_epi64(pv, k_pos, pv, tp));
-    sv!(l.ai, _mm512_mask_add_epi64(pv, k_pos, pv, ip));
+    sv!(l.au, _mm512_mask_add_epi64(pv, k_pos, pv, _mm512_add_epi64(us, sh1)));
+    sv!(l.at, _mm512_mask_add_epi64(pv, k_pos, pv, _mm512_add_epi64(tp, sh2)));
+    sv!(l.ai, _mm512_mask_add_epi64(pv, k_pos, pv, _mm512_add_epi64(ip, sh2)));
 
     // ---- C: the fields' bytes to their fixed places
-    // SAFETY: a start is at most 66 bytes into its line and 32 bytes are read: within the 144 readable ones
+    // SAFETY: a start is at most 66 + 48 bytes into its line and 32 bytes are read: within the PAD readable ones
     for i in 0..8 {
         copy16!(l.se, buf, l.ae, i);
         copy16!(l.su, buf, l.au, i);
@@ -509,9 +575,9 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
     let pl = _mm512_sub_epi64(_mm512_sub_epi64(r3, s5), _mm512_add_epi64(qp, qp));
     let s6 = _mm512_add_epi64(r3, one);
     let qc = qbit!(q2, s6);
-    sv!(l.ps, _mm512_add_epi64(_mm512_add_epi64(o, s5), qp));
+    sv!(l.ps, _mm512_add_epi64(_mm512_add_epi64(_mm512_add_epi64(o, s5), qp), sh2));
     sv!(l.pl, pl);
-    sv!(l.cs, _mm512_add_epi64(_mm512_add_epi64(o, s6), qc));
+    sv!(l.cs, _mm512_add_epi64(_mm512_add_epi64(_mm512_add_epi64(o, s6), qc), sh2));
     sv!(l.cl, _mm512_sub_epi64(_mm512_sub_epi64(r4, s6), _mm512_add_epi64(qc, qc)));
 
     // ---- D: the copies, a word of every line to a register
@@ -544,7 +610,34 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
     let k_buy = _mm512_mask_cmpeq_epi64_mask(_mm512_cmpeq_epi64_mask(kl, k!(8)), ty, k!(u64::from_le_bytes(*b"purchase")));
 
     // what becomes of each line
-    let usual = k_shape & kts & king & (k_vc | k_buy) & live;
+    let mut usual = k_shape & kts & king & (k_vc | k_buy) & live;
+    // a long ID: its key from the long-ID table; one the table does not take sends the line to `event_line`
+    let (mut ekey, mut ukey) = (ekey, ukey);
+    let zero = _mm512_setzero_si512();
+    let (kl0, kl1) = (_mm512_mask_cmpneq_epi64_mask(usual, sh1, zero), _mm512_mask_cmpneq_epi64_mask(usual, sh2, sh1));
+    if (kl0 | kl1) != 0 {
+        sv!(l.ek, ekey);
+        sv!(l.uk, ukey);
+        let mut m = kl0 as u32;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            match cx.names.long(buf.add(l.ae[i] as usize), 33) {
+                0 => usual &= !(1 << i),
+                k => l.ek[i] = k,
+            }
+        }
+        let mut m = kl1 as u32;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            match cx.names.long(buf.add(l.au[i] as usize), 33) {
+                0 => usual &= !(1 << i),
+                k => l.uk[i] = k,
+            }
+        }
+        (ekey, ukey) = (ld!(l.ek), ld!(l.uk));
+    }
     // rules.md "Events" 3 and 4: product_id not empty, ts in the window, ingested no more than 24 hours after it
     let ok = _mm512_mask_cmple_epi64_mask(
         _mm512_mask_cmplt_epu64_mask(_mm512_mask_cmpgt_epi64_mask(usual, pl, _mm512_setzero_si512()), trel, k!(cx.we - cx.ws)),
@@ -587,8 +680,8 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
     while m != 0 {
         let i = m.trailing_zeros() as usize;
         m &= m - 1;
-        // where the line starts: its walk went 65 + e2 past it
-        let line = buf.add((l.cur[i] - 65 - l.e2[i]) as usize);
+        // where the line starts: its walk went 65 + e2 + sh2 past it
+        let line = buf.add((l.cur[i] - 65 - l.e2[i] - l.sh2[i]) as usize);
         match parse_price(std::slice::from_raw_parts(line.add(l.cs[i] as usize), l.cl[i] as usize)) {
             None => (*st).log(cx, l.ek[i], l.ing[i] as i64, 0),
             Some(price) => {
@@ -626,7 +719,7 @@ unsafe fn batch(cx: &Ctx, buf: *const u8, len: usize, st: *mut Shard, l: &mut La
                 day_fill(cx.ws, buf.add(l.ai[i] as usize), &mut (*st).dv);
             }
         }
-        l.cur[i] = defer::<true>(cx, buf, (l.cur[i] - 65 - l.e2[i]) as usize, len, l.c0[i], l.c1[i], &mut *st) as u64;
+        l.cur[i] = defer::<true>(cx, buf, (l.cur[i] - 65 - l.e2[i] - l.sh2[i]) as usize, len, l.c0[i], l.c1[i], &mut *st) as u64;
     }
     true
 }

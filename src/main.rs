@@ -25,7 +25,7 @@ use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -247,17 +247,128 @@ unsafe fn pack_at(p: *const u8, len: usize) -> u64 {
     }
 }
 
+/// Bit 62 of an `INTERNED` key: the rest is the ID's slot in the long-ID table (`Interner::long`).
+const LONG: u64 = 1 << 62;
+
+/// A slot of the long-ID table: an ID of a short prefix (1..=8 bytes, each 1..=127) and 32 lowercase hex digits,
+/// as `meta` = LONG_READY | the prefix's `pack` >> 7 (0: free; LONG_BUSY while its finder writes the digits) and
+/// the 16 bytes the digits spell.
+#[repr(C, align(32))]
+struct LongSlot {
+    meta: AtomicU64,
+    lo: AtomicU64,
+    hi: AtomicU64,
+    _pad: u64,
+}
+const LONG_BUSY: u64 = 1 << 63;
+const LONG_READY: u64 = 1 << 62;
+/// Slots looked at before an ID goes to the locked maps instead (the table is then nearly full): an ID found or
+/// put within this many slots of its home always is, as slots are never emptied.
+const LONG_PROBES: usize = 1024;
+
+/// The 32 lowercase hex digits at `p` as 16 bytes (the first two digits the first byte, the low one of `lo`);
+/// None when one is not a digit or `a`..=`f`.
+#[inline(always)]
+unsafe fn hex32(p: *const u8) -> Option<(u64, u64)> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        let x = _mm256_loadu_si256(p as *const _);
+        let d = _mm256_sub_epi8(x, _mm256_set1_epi8(b'0' as i8));
+        let l = _mm256_sub_epi8(x, _mm256_set1_epi8(b'a' as i8));
+        let okd = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+        let okl = _mm256_cmpeq_epi8(_mm256_min_epu8(l, _mm256_set1_epi8(5)), l);
+        if _mm256_movemask_epi8(_mm256_or_si256(okd, okl)) != -1 {
+            return None;
+        }
+        let nib = _mm256_blendv_epi8(_mm256_add_epi8(l, _mm256_set1_epi8(10)), d, okd);
+        // digit pairs: the first times 16 plus the second, then the sixteen words to bytes in order
+        let v = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+        let r = _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1000>(_mm256_packus_epi16(v, v)));
+        return Some((_mm_cvtsi128_si64(r) as u64, _mm_extract_epi64::<1>(r) as u64));
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut w = [0u64; 2];
+        for i in 0..32 {
+            let c = *p.add(i);
+            let n = match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                _ => return None,
+            } as u64;
+            w[i / 16] |= n << (8 * ((i % 16) / 2) + if i % 2 == 0 { 4 } else { 0 });
+        }
+        Some((w[0], w[1]))
+    }
+}
+
 /// The IDs that do not pack (longer than 9 bytes, or a byte that is NUL or not ASCII): each gets a number, exact on
-/// its bytes. Locked and slow; generated data never comes here.
+/// its bytes. A prefix and 32 lowercase hex digits (one ID in eight of generated data) goes to a table without
+/// locks (`long`); anything else to locked maps, slow (generated data never comes there).
 struct Interner {
     shards: Vec<Mutex<(HashMap<Box<[u8]>, u32, BuildHasherDefault<BytesHasher>>, Vec<Box<[u8]>>)>>,
+    long: usize, // the table: 2^lbits `LongSlot`s
+    lbits: u32,
 }
 
 impl Interner {
     const SHARDS: usize = 64;
 
+    #[cfg(test)]
     fn new() -> Interner {
-        Interner { shards: (0..Self::SHARDS).map(|_| Mutex::new((HashMap::default(), Vec::new()))).collect() }
+        Interner::sized(12)
+    }
+
+    /// With a long-ID table of 2^lbits slots.
+    fn sized(lbits: u32) -> Interner {
+        let long = map_anon(std::mem::size_of::<LongSlot>() << lbits) as usize;
+        Interner { shards: (0..Self::SHARDS).map(|_| Mutex::new((HashMap::default(), Vec::new()))).collect(), long, lbits }
+    }
+
+    #[inline(always)]
+    fn slot(&self, i: usize) -> &LongSlot {
+        // SAFETY: i is masked to the table's size; the mapping lives as long as the run (zero pages are free slots)
+        unsafe { &*(self.long as *const LongSlot).add(i & ((1 << self.lbits) - 1)) }
+    }
+
+    /// The key of the `len` (33..=40) bytes at `p` from the long-ID table, when they are a prefix and 32 lowercase hex
+    /// digits and the table has room near the ID's home; else 0.
+    #[inline(never)]
+    unsafe fn long(&self, p: *const u8, len: usize) -> u64 {
+        let plen = len - 32;
+        let pre = pack_at(p, plen) >> 7;
+        if pre == 0 {
+            return 0;
+        }
+        let Some((lo, hi)) = hex32(p.add(plen)) else { return 0 };
+        let mut i = (mix(lo ^ hi.rotate_left(29) ^ pre) >> (64 - self.lbits)) as usize;
+        for _ in 0..LONG_PROBES {
+            let s = self.slot(i);
+            let mut m = s.meta.load(Acquire);
+            if m == 0 {
+                match s.meta.compare_exchange(0, LONG_BUSY | pre, Acquire, Acquire) {
+                    Ok(_) => {
+                        s.lo.store(lo, Relaxed);
+                        s.hi.store(hi, Relaxed);
+                        s.meta.store(LONG_READY | pre, Release);
+                        return INTERNED | LONG | (i & ((1 << self.lbits) - 1)) as u64;
+                    }
+                    Err(now) => m = now,
+                }
+            }
+            if m & !(LONG_BUSY | LONG_READY) == pre {
+                while m & LONG_BUSY != 0 {
+                    std::hint::spin_loop();
+                    m = s.meta.load(Acquire);
+                }
+                if s.lo.load(Relaxed) == lo && s.hi.load(Relaxed) == hi {
+                    return INTERNED | LONG | (i & ((1 << self.lbits) - 1)) as u64;
+                }
+            }
+            i += 1;
+        }
+        0
     }
 
     #[cold]
@@ -277,11 +388,24 @@ impl Interner {
         INTERNED | (s as u64) << 32 | i as u64
     }
 
+    /// The key of an ID that does not pack.
+    #[inline(always)]
+    fn unpacked(&self, b: &[u8]) -> u64 {
+        if (33..=40).contains(&b.len()) {
+            // SAFETY: the bytes are a slice of `len`
+            let k = unsafe { self.long(b.as_ptr(), b.len()) };
+            if k != 0 {
+                return k;
+            }
+        }
+        self.intern(b)
+    }
+
     /// The key of an ID.
     #[inline]
     fn key(&self, b: &[u8]) -> u64 {
         match pack(b) {
-            0 => self.intern(b),
+            0 => self.unpacked(b),
             k => k,
         }
     }
@@ -293,12 +417,26 @@ impl Interner {
         if k != 0 {
             return k;
         }
-        self.intern(std::slice::from_raw_parts(p, len))
+        self.unpacked(std::slice::from_raw_parts(p, len))
     }
 
     /// Appends the ID of `key` to `out`.
     #[inline]
     fn bytes(&self, key: u64, out: &mut Vec<u8>) {
+        if key & (INTERNED | LONG) == INTERNED | LONG {
+            let s = self.slot(key as usize);
+            let pre = s.meta.load(Acquire) & !(LONG_BUSY | LONG_READY);
+            self.bytes(pre << 7, out);
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            for w in [s.lo.load(Relaxed), s.hi.load(Relaxed)] {
+                for k in 0..8 {
+                    let b = (w >> (8 * k)) as u8;
+                    out.push(HEX[(b >> 4) as usize]);
+                    out.push(HEX[(b & 15) as usize]);
+                }
+            }
+            return;
+        }
         if key & INTERNED != 0 {
             let g = self.shards[((key >> 32) as usize) & (Self::SHARDS - 1)].lock().unwrap_or_else(|_| die("interner poisoned"));
             out.extend_from_slice(&g.1[key as u32 as usize]);
@@ -2755,7 +2893,10 @@ fn main() {
 
     // 1. links, on every thread; this one reads the small tables meanwhile
     let ids = IdTable::new(id_bits, pbits);
-    let names = Interner::new();
+    // the long-ID table: one ID in eight is long in generated data, some 600 input bytes a distinct one; about
+    // half full
+    let lbits = env_num("SESS_LONG_BITS").map(|v| v as u32).unwrap_or(usize::BITS - ((ev_bytes + bytes(&ck_files)) / 400).leading_zeros()).clamp(12, 28);
+    let names = Interner::sized(lbits);
     mark("files listed, ID table mapped");
     let (n_links, small) = std::thread::scope(|sc| {
         let links = sc.spawn(|| {
@@ -6072,6 +6213,48 @@ mod tests {
         let (a, b, c) = (names.key(b"user-with-dash"), names.key(b"user-with-dash"), names.key(" \u{e9}1".as_bytes()));
         assert!(a == b && a != c && a & INTERNED != 0);
         assert!(names.less(c, pack(b"u1")) && names.less(pack(b"u1"), a) && !names.less(a, a));
+        // a prefix and 32 lowercase hex digits: the long-ID table, exact, its bytes back, ordered by its bytes
+        let hex = |i: u64| format!("u{:016x}{:016x}", mix(i), mix(i + 1000));
+        let mut keys = Vec::new();
+        for i in 0..3000u64 {
+            let id = hex(i);
+            let k = names.key(id.as_bytes());
+            assert_eq!(k & (INTERNED | LONG), INTERNED | LONG, "{id}");
+            assert_eq!(names.key(format!("{id}").as_bytes()), k);
+            let mut back = Vec::new();
+            names.bytes(k, &mut back);
+            assert_eq!(back, id.as_bytes());
+            keys.push((id, k));
+        }
+        let all: std::collections::HashSet<u64> = keys.iter().map(|x| x.1).collect();
+        assert_eq!(all.len(), keys.len());
+        for w in keys.windows(2) {
+            assert_eq!(names.less(w[0].1, w[1].1), w[0].0 < w[1].0);
+            assert_eq!(names.less(w[0].1, pack(b"u5")), w[0].0.as_str() < "u5");
+        }
+        // a longer prefix too; upper case, another length or a byte that is not a digit: the locked maps
+        let k8 = names.key(b"abcdefgh0123456789abcdef0123456789abcdef");
+        assert_eq!(k8 & (INTERNED | LONG), INTERNED | LONG);
+        let mut back = Vec::new();
+        names.bytes(k8, &mut back);
+        assert_eq!(back, b"abcdefgh0123456789abcdef0123456789abcdef");
+        for odd in [&b"u0123456789ABCDEF0123456789abcdef"[..], b"u0123456789abcdef0123456789abcdeg", b"u0123456789abcdef0123456789abcde", b"\xe90123456789abcdef0123456789abcdef"] {
+            let k = names.key(odd);
+            assert_eq!(k & (INTERNED | LONG), INTERNED, "{odd:?}");
+            let mut back = Vec::new();
+            names.bytes(k, &mut back);
+            assert_eq!(back, odd);
+        }
+        // a full table sends the rest to the locked maps, and the keys stay exact
+        let small = Interner::sized(4);
+        let ks: Vec<u64> = (0..100).map(|i| small.key(hex(i).as_bytes())).collect();
+        assert_eq!(ks.iter().filter(|&&k| k & LONG != 0).count(), 16);
+        for (i, &k) in ks.iter().enumerate() {
+            assert_eq!(small.key(hex(i as u64).as_bytes()), k);
+            let mut back = Vec::new();
+            small.bytes(k, &mut back);
+            assert_eq!(back, hex(i as u64).as_bytes());
+        }
     }
 
     #[test]

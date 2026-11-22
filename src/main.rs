@@ -3083,14 +3083,46 @@ const PEND: usize = 8;
 unsafe impl Send for Shard {}
 unsafe impl Sync for Shard {}
 
-struct UserRow {
-    revenue: i64,
-    sessions: u32,
-    events: u32,
-    day: i32,
-    top: u16, // NO_CAT when there is no purchase
+/// A thread's user_daily rows, a column each, `len()` of them. The row writers store whole vectors: every column
+/// has room for `ROW_SLACK` entries past the rows, which they may scribble on.
+struct Rows {
+    day: Vec<i32>,
+    sessions: Vec<u32>,
+    events: Vec<u32>,
+    revenue: Vec<i64>,
+    top: Vec<u16>, // NO_CAT when there is no purchase
 }
 const NO_CAT: u16 = u16::MAX;
+const ROW_SLACK: usize = 16;
+
+impl Rows {
+    fn new(cap: usize) -> Rows {
+        Rows { day: huge_vec(cap), sessions: huge_vec(cap), events: huge_vec(cap), revenue: huge_vec(cap), top: huge_vec(cap) }
+    }
+    fn len(&self) -> usize {
+        self.day.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.day.is_empty()
+    }
+    /// Room for `n` more rows and the slack past them.
+    fn reserve(&mut self, n: usize) {
+        let n = n + ROW_SLACK;
+        self.day.reserve(n);
+        self.sessions.reserve(n);
+        self.events.reserve(n);
+        self.revenue.reserve(n);
+        self.top.reserve(n);
+    }
+    /// SAFETY: the first `n` entries of every column are written, within the room `reserve` made
+    unsafe fn set_len(&mut self, n: usize) {
+        self.day.set_len(n);
+        self.sessions.set_len(n);
+        self.events.set_len(n);
+        self.revenue.set_len(n);
+        self.top.set_len(n);
+    }
+}
 
 struct Ctx {
     ws: i64,
@@ -4655,7 +4687,7 @@ struct Sess {
 
 /// One sessions thread: its results, and scratch reused across partitions.
 struct Work {
-    rows: Vec<UserRow>,
+    rows: Rows,
     people: Vec<(u64, u32)>, // the people of `rows` in order: name, rows
     // Per campaign and day (cell = campaign * days + day), in arrays of their own so that the ones every session
     // touches stay small: sessions credited; sessions assisted, in 16 bits with the times each count went round
@@ -4704,7 +4736,7 @@ impl Work {
         let local = (1usize << cx.pshift) + 1;
         let nbins = ((cx.we - cx.base) / GAP) as usize + 2;
         Work {
-            rows: huge_vec(rows_cap),
+            rows: Rows::new(rows_cap),
             people: huge_vec(rows_cap / 2),
             cred: filled(cells, 0),
             assist: filled(cells, 0),
@@ -5064,10 +5096,12 @@ unsafe fn bin_events(evs: &[u32], bp: *mut Bin, wp: *mut u64) -> u64 {
 /// SAFETY: `wm` = the words of `wp` that are not zero; `sp` has room for a session per taken bin + 1 and `rp` for
 /// as many rows; `doff` + a bin's min is not negative.
 #[inline(never)]
-unsafe fn scan_bins(bp: *mut Bin, wp: *mut u64, mut wm: u64, sp: *mut Ses, rp: *mut UserRow, day0: i32, doff: i64) -> (usize, usize) {
+unsafe fn scan_bins(bp: *mut Bin, wp: *mut u64, mut wm: u64, sp: *mut Ses, [dp, np, ep]: [*mut u32; 3], day0: i32, doff: i64) -> (usize, usize) {
     let (mut ns, mut nr) = (0usize, 0usize);
     let mut prev_max = i64::MIN / 2;
     let mut prev_d = u32::MAX;
+    // the sessions and events of the row at hand, stored whole at every bin
+    let (mut rs, mut re) = (0u32, 0u32);
     while wm != 0 {
         let wi = wm.trailing_zeros() as usize;
         wm &= wm - 1;
@@ -5084,15 +5118,17 @@ unsafe fn scan_bins(bp: *mut Bin, wp: *mut u64, mut wm: u64, sp: *mut Ses, rp: *
             let d = ((mn as i64 + doff) as u32) / DAY as u32;
             let new_row = new & (d != prev_d) as usize;
             prev_d = if new != 0 { d } else { prev_d };
-            sp.add(ns).write(Ses { start: mn, d, row: 0, rev: 0 });
-            ns += new;
-            rp.add(nr).write(UserRow { revenue: 0, sessions: 0, events: 0, day: day0 + d as i32, top: NO_CAT });
+            dp.add(nr).write((day0 + d as i32) as u32);
             nr += new_row;
-            // the first bin starts a session and a row, so ns - 1 and nr - 1 are entries written here
-            let r = &mut *rp.add(nr - 1);
-            r.sessions += new as u32;
-            r.events += bin.cnt;
-            (*sp.add(ns - 1)).row = (nr - 1) as u32;
+            // the first bin starts a session and a row, so ns - 1 and nr - 1 are entries written here; a bin that
+            // starts no session leaves the row of the session at hand as it is
+            sp.add(ns).write(Ses { start: mn, d, row: (nr - 1) as u32, rev: 0 });
+            ns += new;
+            let keep = (new_row as u32).wrapping_sub(1); // 0 at a new row
+            rs = (rs & keep) + new as u32;
+            re = (re & keep) + bin.cnt;
+            np.add(nr - 1).write(rs);
+            ep.add(nr - 1).write(re);
             *bp.add(b) = Bin { sess: (ns - 1) as u32, ..FREE_BIN };
             if m == 0 {
                 break;
@@ -5122,8 +5158,18 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u32], pa: usize, np: usize, ca: usize
         let w0 = *wp & !1;
         *wp = w0;
         wm &= !((w0 == 0) as u64);
-        let (ns, nr) = scan_bins(bp, wp, wm, w.ses.as_mut_ptr(), w.rows.as_mut_ptr().add(row0), cx.day0 as i32, w.doff);
-        w.rows.set_len(row0 + nr);
+        let r = &mut w.rows;
+        let cols = [r.day.as_mut_ptr() as *mut u32, r.sessions.as_mut_ptr(), r.events.as_mut_ptr()].map(|p| p.add(row0));
+        let (ns, nr) = scan_bins(bp, wp, wm, w.ses.as_mut_ptr(), cols, cx.day0 as i32, w.doff);
+        // no revenue and no top category yet: whole vectors of them, ROW_SLACK rows a step
+        let (rv, tp) = (r.revenue.as_mut_ptr().add(row0), r.top.as_mut_ptr().add(row0));
+        let mut k = 0;
+        while k < nr {
+            std::ptr::write_bytes(rv.add(k), 0, ROW_SLACK);
+            std::ptr::write_bytes(tp.add(k), 0xff, ROW_SLACK); // NO_CAT
+            k += ROW_SLACK;
+        }
+        r.set_len(row0 + nr);
         if nr != 0 {
             w.people.push((name, nr as u32));
         }
@@ -5133,7 +5179,7 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u32], pa: usize, np: usize, ca: usize
     // purchases: into their session and row; then each row's top category
     if np != 0 {
         let Work { rows, pls, bins, ses, dcats, best, .. } = w;
-        let rows = &mut rows[row0..];
+        let (revenue, tops) = (&mut rows.revenue[row0..], &mut rows.top[row0..]);
         dcats.clear();
         for &(ts, pay) in &pls[pa..pa + np] {
             // the bin of a kept event is one this person took, so its `sess` is this person's
@@ -5141,7 +5187,7 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u32], pa: usize, np: usize, ca: usize
             let (price, cat) = ((pay & 0xff_ffff) as i64, (pay >> 24) as u16);
             s.rev += price;
             let g = s.row;
-            rows[g as usize].revenue += price;
+            revenue[g as usize] += price;
             match dcats.iter_mut().find(|c| c.0 == g && c.1 == cat) {
                 Some(c) => c.2 += price,
                 None => dcats.push((g, cat, price)),
@@ -5150,9 +5196,9 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u32], pa: usize, np: usize, ca: usize
         // the highest sum; a tie goes to the category that sorts first
         let rank = &cx.cat_rank;
         for &(g, cat, sum) in dcats.iter() {
-            let (r, top) = (&mut rows[g as usize], &mut best[g as usize]);
-            if r.top == NO_CAT || sum > *top || (sum == *top && rank[cat as usize] < rank[r.top as usize]) {
-                r.top = cat;
+            let (t, top) = (&mut tops[g as usize], &mut best[g as usize]);
+            if *t == NO_CAT || sum > *top || (sum == *top && rank[cat as usize] < rank[*t as usize]) {
+                *t = cat;
                 *top = sum;
             }
         }
@@ -5709,18 +5755,6 @@ fn plain_i64(buf: &mut Vec<u8>, vals: impl Iterator<Item = i64>) {
 }
 
 
-fn page_slices<'a>(segs: &[&'a [UserRow]], lo: usize, hi: usize, out: &mut Vec<&'a [UserRow]>) {
-    out.clear();
-    let mut base = 0;
-    for &s in segs {
-        let (a, b) = (base, base + s.len());
-        if b > lo && a < hi {
-            out.push(&s[lo.max(a) - a..hi.min(b) - a]);
-        }
-        base = b;
-    }
-}
-
 /// Appends the ID of key `k` as a PLAIN byte array: 4-byte length, then the bytes.
 #[inline]
 fn put_name(b: &mut Vec<u8>, names: &Interner, k: u64, tmp: &mut Vec<u8>) {
@@ -5900,11 +5934,9 @@ fn put_run(b: &mut Vec<u8>, run: usize, idx: u32, vb: usize) {
     b.extend_from_slice(&idx.to_le_bytes()[..vb]);
 }
 
-fn write_users(path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: &[Bytes], names: &Interner) -> std::io::Result<()> {
-    let segs: &[&[UserRow]] = &[rows];
+fn write_users(path: &Path, rows: &Rows, people: &[(u64, u32)], cat_names: &[Bytes], names: &Interner) -> std::io::Result<()> {
     let mut tmp = Vec::with_capacity(64);
-    let n: usize = segs.iter().map(|s| s.len()).sum();
-    let mut part: Vec<&[UserRow]> = Vec::new();
+    let n = rows.len();
     let mut run: Vec<u8> = Vec::new();
     // user_id is dictionary encoded: one entry per person (a person's days are consecutive rows), and the data
     // pages are runs of that entry's index. `at` = the person the next page starts in, and how many of its rows
@@ -5914,12 +5946,19 @@ fn write_users(path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: 
     // sessions and events stay far below 2^31: main() refuses inputs with that many events
     write_parquet(path, &USER_COLS, n, |c, lo, hi, b| {
         if c == 0 && lo == DICT_PAGE {
-            for &(name, _) in people {
+            b.reserve(entries * 16);
+            for (i, &(name, _)) in people.iter().enumerate() {
+                // a long-ID-table name is read from its slot, a line of the table far from the last: asked for
+                // some names ahead
+                if let Some(&(ahead, _)) = people.get(i + 16) {
+                    if ahead & (INTERNED | LONG) == INTERNED | LONG {
+                        prefetch(names.slot(ahead as usize));
+                    }
+                }
                 put_name(b, names, name, &mut tmp);
             }
             return entries;
         }
-        page_slices(segs, lo, hi, &mut part);
         match c {
             0 => {
                 let w = (usize::BITS - (entries.max(2) - 1).leading_zeros()) as usize;
@@ -5934,14 +5973,25 @@ fn write_users(path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: 
                 }
             }
             1..=4 => {
-                // straight from the rows, one loop per column
-                let rs = &rows[lo..hi];
-                // SAFETY (the four): put_delta asks for indices below rs.len()
+                // straight from the columns
+                // SAFETY (the four): put_delta asks for indices below hi - lo
                 match c {
-                    1 => put_delta(b, rs.len(), |i| unsafe { rs.get_unchecked(i) }.day as i64),
-                    2 => put_delta(b, rs.len(), |i| unsafe { rs.get_unchecked(i) }.sessions as i64),
-                    3 => put_delta(b, rs.len(), |i| unsafe { rs.get_unchecked(i) }.events as i64),
-                    _ => put_delta(b, rs.len(), |i| unsafe { rs.get_unchecked(i) }.revenue),
+                    1 => {
+                        let v = &rows.day[lo..hi];
+                        put_delta(b, v.len(), |i| *unsafe { v.get_unchecked(i) } as i64)
+                    }
+                    2 => {
+                        let v = &rows.sessions[lo..hi];
+                        put_delta(b, v.len(), |i| *unsafe { v.get_unchecked(i) } as i64)
+                    }
+                    3 => {
+                        let v = &rows.events[lo..hi];
+                        put_delta(b, v.len(), |i| *unsafe { v.get_unchecked(i) } as i64)
+                    }
+                    _ => {
+                        let v = &rows.revenue[lo..hi];
+                        put_delta(b, v.len(), |i| *unsafe { v.get_unchecked(i) })
+                    }
                 }
             }
             _ => {
@@ -5954,23 +6004,19 @@ fn write_users(path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: 
                     v >>= 7;
                 }
                 run.push(v as u8);
-                let (mut cur, mut k) = (0u8, 0);
-                for r in part.iter().flat_map(|s| s.iter()) {
-                    cur |= ((r.top != NO_CAT) as u8) << k;
-                    k += 1;
-                    if k == 8 {
-                        run.push(cur);
-                        (cur, k) = (0, 0);
-                    }
+                let tops = &rows.top[lo..hi];
+                let mut eight = tops.chunks_exact(8);
+                for t in &mut eight {
+                    run.push(t.iter().enumerate().fold(0u8, |a, (k, &t)| a | ((t != NO_CAT) as u8) << k));
                 }
-                if k > 0 {
-                    run.push(cur);
+                if !eight.remainder().is_empty() {
+                    run.push(eight.remainder().iter().enumerate().fold(0u8, |a, (k, &t)| a | ((t != NO_CAT) as u8) << k));
                 }
                 b.extend_from_slice(&((run.len()) as u32).to_le_bytes());
                 b.extend_from_slice(&run);
-                for r in part.iter().flat_map(|s| s.iter()) {
-                    if r.top != NO_CAT {
-                        let v = cat_names[r.top as usize];
+                for &t in tops {
+                    if t != NO_CAT {
+                        let v = cat_names[t as usize];
                         b.extend_from_slice(&(v.len() as u32).to_le_bytes());
                         b.extend_from_slice(v);
                     }

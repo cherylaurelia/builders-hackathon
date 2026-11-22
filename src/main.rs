@@ -380,18 +380,18 @@ unsafe fn ev_hash(p: *const u8) -> Option<(u64, [u64; 2])> {
 
 /// True when no two different event_ids got one key from `ev_hash`: per bucket, the records of every thread in
 /// a table by key.
-fn event_ids_distinct(shards: &mut [Shard], threads: usize) -> bool {
-    for s in shards.iter_mut() {
-        s.evh.iter_mut().for_each(Stream::finish);
-    }
-    let shards = &*shards;
+fn event_ids_distinct(shards: &[Shard], threads: usize) -> bool {
     let clash = AtomicBool::new(false);
     // per thread, used again for every bucket: the bucket's records in one run, and a table of their places + 1
     // (0 = free); some 40K records a bucket at 20M events, so both stay in the core's cache
+    // room for the largest bucket from the start: a vector that grows takes the address-space lock for writing
+    // (mremap), and every other thread's page fault waits for it
+    let most = (0..EVH_BUCKETS).map(|b| shards.iter().map(|s| s.evh[b].len(EVH_BLOCK)).sum::<usize>()).max().unwrap_or(0);
+    let cap = |n: usize| (n + n / 2).next_power_of_two().max(2);
     par(
         threads,
         EVH_BUCKETS,
-        || (Vec::<[u64; 2]>::new(), Vec::<u32>::new()),
+        || (Vec::<[u64; 2]>::with_capacity(most), Vec::<u32>::with_capacity(cap(most))),
         |(v, t), b| {
             v.clear();
             for s in shards {
@@ -402,7 +402,7 @@ fn event_ids_distinct(shards: &mut [Shard], threads: usize) -> bool {
             if v.is_empty() {
                 return;
             }
-            let cap = (v.len() + v.len() / 2).next_power_of_two().max(2);
+            let cap = cap(v.len());
             t.clear();
             t.resize(cap, 0);
             for (n, r) in v.iter().enumerate() {
@@ -2896,6 +2896,11 @@ fn mark(what: &str) {
 
 /// Runs `work(state, i)` for i in 0..n across `threads` threads; returns each thread's state.
 fn par<S: Send>(threads: usize, n: usize, init: impl Fn() -> S + Sync, work: impl Fn(&mut S, usize) + Sync) -> Vec<S> {
+    par_then(threads, n, init, work, |_| {})
+}
+
+/// `par`, and each thread ends with `fin(state)` once the queue is empty, while the others still work.
+fn par_then<S: Send>(threads: usize, n: usize, init: impl Fn() -> S + Sync, work: impl Fn(&mut S, usize) + Sync, fin: impl Fn(&mut S) + Sync) -> Vec<S> {
     let next = AtomicUsize::new(0);
     std::thread::scope(|sc| {
         let hs: Vec<_> = (0..threads)
@@ -2909,6 +2914,7 @@ fn par<S: Send>(threads: usize, n: usize, init: impl Fn() -> S + Sync, work: imp
                         }
                         work(&mut s, i);
                     }
+                    fin(&mut s);
                     s
                 })
             })
@@ -2917,15 +2923,16 @@ fn par<S: Send>(threads: usize, n: usize, init: impl Fn() -> S + Sync, work: imp
     })
 }
 
-/// `par` with the states given, one thread each.
-fn par_from<S: Send>(states: Vec<S>, n: usize, work: impl Fn(&mut S, usize) + Sync) -> Vec<S> {
+/// `par_then` with the states given, one thread each, and each thread starts with `pre(state)`.
+fn par_from<S: Send>(states: Vec<S>, n: usize, pre: impl Fn(&mut S) + Sync, work: impl Fn(&mut S, usize) + Sync, fin: impl Fn(&mut S) + Sync) -> Vec<S> {
     let next = AtomicUsize::new(0);
     std::thread::scope(|sc| {
         let hs: Vec<_> = states
             .into_iter()
             .map(|mut s| {
-                let (next, work) = (&next, &work);
+                let (next, pre, work, fin) = (&next, &pre, &work, &fin);
                 sc.spawn(move || {
+                    pre(&mut s);
                     loop {
                         let i = next.fetch_add(1, Relaxed);
                         if i >= n {
@@ -2933,6 +2940,7 @@ fn par_from<S: Send>(states: Vec<S>, n: usize, work: impl Fn(&mut S, usize) + Sy
                         }
                         work(&mut s, i);
                     }
+                    fin(&mut s);
                     s
                 })
             })
@@ -3543,12 +3551,13 @@ fn main() {
             st.buf = buf;
             piece_done(f, s);
     };
-    let mut shards = par(threads, n_evw, || Shard::new(np, nq), &parse);
-    // the records of groups not yet full, written by this thread (each parse thread fenced its own before the join)
-    for s in &mut shards {
+    // each thread then writes the records of its groups not yet full (it fenced its own stores before), its stage
+    // lines still in its cache
+    let mut shards = par_then(threads, n_evw, || Shard::new(np, nq), &parse, |s| {
         s.ev.iter_mut().for_each(Stream::finish);
         s.lg.iter_mut().for_each(Log::finish);
-    }
+        s.evh.iter_mut().for_each(Stream::finish);
+    });
     let n_ev: usize = shards.iter().flat_map(|s| s.ev.iter()).map(|s| s.len(EV_BLOCK)).sum();
     lap(&format!("parsed: {n_ev} valid events"));
     if n_ev >= i32::MAX as usize {
@@ -3556,7 +3565,7 @@ fn main() {
     }
 
     if cx.evhash {
-        if !event_ids_distinct(&mut shards, threads) {
+        if !event_ids_distinct(&shards, threads) {
             restart_without_evhash();
         }
         for s in &mut shards {
@@ -3568,18 +3577,17 @@ fn main() {
     // 3. duplicates
     let n_dups = mark_duplicates(&cx, &shards, nq, threads);
     lap(&format!("duplicates marked: {n_dups} candidates"));
-    // the dedup records are read for the last time: the sessions' blocks reuse their pages, already written,
-    // where new ones would each take a fault and a zeroed page
-    for s in &mut shards {
+    // the dedup records are read for the last time: the clicks' blocks reuse their pages, already written, where
+    // new ones would each take a fault and a zeroed page (each thread gives back its own shard's)
+    let pre = |s: &mut Shard| {
         s.lg = Vec::new();
         s.larena.recycle();
         s.arena.close(); // the rest of the events' last chunk has no memory behind it yet
-    }
-    let mut shards = par_from(shards, work.len() - n_evw, |st, i| parse(st, n_evw + i));
-    for s in &mut shards {
+    };
+    let shards = par_from(shards, work.len() - n_evw, pre, |st, i| parse(st, n_evw + i), |s| {
         s.ck.iter_mut().for_each(Stream::finish);
         s.arena.give_back();
-    }
+    });
     let n_ck: usize = shards.iter().flat_map(|s| s.ck.iter()).map(|s| s.len(CK_BLOCK)).sum();
     lap(&format!("parsed: {n_ck} valid clicks"));
 
@@ -7010,6 +7018,14 @@ mod tests {
         }
     }
 
+    /// `event_ids_distinct` on shards whose parse is over: their staged records written out, as `main` does.
+    fn evh_distinct<const N: usize>(mut shards: [Shard; N]) -> bool {
+        for s in &mut shards {
+            s.evh.iter_mut().for_each(Stream::finish);
+        }
+        event_ids_distinct(&shards, N)
+    }
+
     #[test]
     fn long_event_ids_are_keyed_by_their_digits_and_checked() {
         let c = ctx();
@@ -7035,7 +7051,7 @@ mod tests {
         for i in 0..100u64 {
             other.ekey(&c, id(i).as_bytes());
         }
-        assert!(event_ids_distinct(&mut [st, other], 2));
+        assert!(evh_distinct([st, other]));
         // two IDs of one key are not: same top 61 bits of the second half, any other difference
         let k = |s: &str| unsafe { ev_hash(s.as_ptr()) }.unwrap().0;
         let (a, b) = ("e00000000000000001000000000000000", "e00000000000000011700000000000000");
@@ -7043,16 +7059,16 @@ mod tests {
         let (mut x, mut y) = (Shard::new(16, 16), Shard::new(16, 16));
         x.ekey(&c, a.as_bytes());
         y.ekey(&c, b.as_bytes());
-        assert!(!event_ids_distinct(&mut [x, y], 2));
+        assert!(!evh_distinct([x, y]));
         // the all-zero digits against a second half below 8
         let (mut x, mut y) = (Shard::new(16, 16), Shard::new(16, 16));
         x.ekey(&c, b"e00000000000000000000000000000000");
         y.ekey(&c, b"e00000000000000000700000000000000");
-        assert!(!event_ids_distinct(&mut [x, y], 2));
+        assert!(!evh_distinct([x, y]));
         let (mut x, mut y) = (Shard::new(16, 16), Shard::new(16, 16));
         x.ekey(&c, b"e00000000000000000000000000000000");
         y.ekey(&c, b"e00000000000000000000000000000000");
-        assert!(event_ids_distinct(&mut [x, y], 2));
+        assert!(evh_distinct([x, y]));
     }
 
     #[test]

@@ -5569,7 +5569,14 @@ const DICT_PAGE: usize = usize::MAX;
 /// A Thrift PageHeader into `page[at..HDR_ROOM]`, written backwards from `HDR_ROOM`; returns `at`.
 /// `dict`: a dictionary page of `nvals` entries; else a data page of `nvals` values in encoding `enc`.
 fn page_header(page: &mut [u8], dict: bool, nvals: usize, enc: i32) -> usize {
-    let size = (page.len() - HDR_ROOM) as i32;
+    let h = header_of(dict, nvals, enc, (page.len() - HDR_ROOM) as i32);
+    let at = HDR_ROOM - h.b.len();
+    page[at..HDR_ROOM].copy_from_slice(&h.b);
+    at
+}
+
+/// The page header of a page of `size` bytes (see page_header).
+fn header_of(dict: bool, nvals: usize, enc: i32, size: i32) -> Thrift {
     let mut h = Thrift::new();
     h.begin();
     h.i32(1, if dict { 2 } else { 0 }); // DICTIONARY_PAGE, DATA_PAGE
@@ -5589,50 +5596,72 @@ fn page_header(page: &mut [u8], dict: bool, nvals: usize, enc: i32) -> usize {
     h.end();
     h.end();
     assert!(h.b.len() <= HDR_ROOM);
-    let at = HDR_ROOM - h.b.len();
-    page[at..HDR_ROOM].copy_from_slice(&h.b);
-    at
+    h
 }
 
 /// Writes `path` with one row group of `n` rows. `fill(i, lo, hi, buf)` appends the body of the data page of column i
 /// holding rows lo..hi to `buf` (PLAIN, or RLE_DICTIONARY for a dictionary column: bit width, then RLE/bit-packed
 /// indices); for the optional column the definition levels come first, as a length-prefixed RLE/bit-packed run.
 /// A dictionary column (`dict`, when n > 0) first gets `fill(i, DICT_PAGE, 0, buf)`: the PLAIN dictionary page, whose
-/// number of entries `fill` returns.
-fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(usize, usize, usize, &mut Vec<u8>) -> usize) -> std::io::Result<()> {
-    use std::io::Write;
+/// number of entries `fill` returns. A data page body the caller already has, `pre(i, lo)`, is written from where it
+/// is instead (fill is not called for it).
+fn write_parquet<'a>(
+    path: &Path,
+    cols: &[ColSpec],
+    n: usize,
+    mut fill: impl FnMut(usize, usize, usize, &mut Vec<u8>) -> usize,
+    pre: impl Fn(usize, usize) -> Option<&'a [u8]>,
+) -> std::io::Result<()> {
+    use std::io::{IoSlice, Write};
     let mut f = std::fs::File::create(path)?;
-    // the whole file is built in memory and written by one call: a write(2) per page cost 10 ms a file when eight
-    // threads wrote at once (journal and page-cache locks), the one big call does not
-    let mut out: Vec<u8> = huge_vec(n * 12 + (1 << 20));
-    out.extend_from_slice(b"PAR1");
+    // The file goes out in one vectored write: pieces of `own` (the headers, the pages `fill` makes, the footer) and
+    // the caller's page bodies, none of them copied into one buffer first. A write(2) per page cost 10 ms a file when
+    // eight threads wrote at once (journal and page-cache locks), the one big call does not.
+    let mut own: Vec<u8> = huge_vec(n * 8 + (1 << 20));
+    enum Piece<'a> {
+        Own(usize, usize),
+        Pre(&'a [u8]),
+    }
+    let mut pieces: Vec<Piece> = Vec::with_capacity(2 * cols.len() * (n / PAGE_ROWS + 2) + 2);
+    own.extend_from_slice(b"PAR1");
+    pieces.push(Piece::Own(0, 4));
     let mut off = 4i64;
-    let mut page = Vec::new();
     let mut chunks = Vec::with_capacity(cols.len()); // (offset, size, dictionary page offset, first data page offset)
     for (i, c) in cols.iter().enumerate() {
         let (start, use_dict) = (off, c.dict && n > 0);
         let (mut dict_off, mut data_off) = (None, off);
         if use_dict {
-            page.clear();
-            page.resize(HDR_ROOM, 0);
-            let entries = fill(i, DICT_PAGE, 0, &mut page);
-            i32::try_from(page.len() - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
-            let at = page_header(&mut page, true, entries, 0);
-            out.extend_from_slice(&page[at..]);
+            let s = own.len();
+            own.resize(s + HDR_ROOM, 0);
+            let entries = fill(i, DICT_PAGE, 0, &mut own);
+            i32::try_from(own.len() - s - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
+            let at = s + page_header(&mut own[s..], true, entries, 0);
+            pieces.push(Piece::Own(at, own.len()));
             dict_off = Some(off);
-            off += (page.len() - at) as i64;
+            off += (own.len() - at) as i64;
             data_off = off;
         }
         let mut lo = 0;
         loop {
             let hi = (lo + PAGE_ROWS).min(n);
-            page.clear();
-            page.resize(HDR_ROOM, 0);
-            fill(i, lo, hi, &mut page);
-            i32::try_from(page.len() - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
-            let at = page_header(&mut page, false, hi - lo, if use_dict { 8 } else if c.delta { 5 } else { 0 }); // RLE_DICTIONARY, DELTA_BINARY_PACKED, PLAIN
-            out.extend_from_slice(&page[at..]);
-            off += (page.len() - at) as i64;
+            let enc = if use_dict { 8 } else if c.delta { 5 } else { 0 }; // RLE_DICTIONARY, DELTA_BINARY_PACKED, PLAIN
+            if let Some(body) = pre(i, lo) {
+                let size = i32::try_from(body.len()).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
+                let h = header_of(false, hi - lo, enc, size);
+                let s = own.len();
+                own.extend_from_slice(&h.b);
+                pieces.push(Piece::Own(s, own.len()));
+                pieces.push(Piece::Pre(body));
+                off += (h.b.len() + body.len()) as i64;
+            } else {
+                let s = own.len();
+                own.resize(s + HDR_ROOM, 0);
+                fill(i, lo, hi, &mut own);
+                i32::try_from(own.len() - s - HDR_ROOM).map_err(|_| std::io::Error::other("page over 2 GiB"))?;
+                let at = s + page_header(&mut own[s..], false, hi - lo, enc);
+                pieces.push(Piece::Own(at, own.len()));
+                off += (own.len() - at) as i64;
+            }
             lo = hi;
             if lo >= n {
                 break;
@@ -5706,8 +5735,28 @@ fn write_parquet(path: &Path, cols: &[ColSpec], n: usize, mut fill: impl FnMut(u
     let len = t.b.len() as u32;
     t.b.extend_from_slice(&len.to_le_bytes());
     t.b.extend_from_slice(b"PAR1");
-    out.extend_from_slice(&t.b);
-    f.write_all(&out)
+    let s = own.len();
+    own.extend_from_slice(&t.b);
+    pieces.push(Piece::Own(s, own.len()));
+    let mut io: Vec<IoSlice> = pieces
+        .iter()
+        .map(|p| match *p {
+            Piece::Own(a, b) => IoSlice::new(&own[a..b]),
+            Piece::Pre(b) => IoSlice::new(b),
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    // at most 1024 pieces a call (IOV_MAX); a short write goes on from where it stopped
+    let mut rest: &mut [IoSlice] = &mut io;
+    while !rest.is_empty() {
+        let k = rest.len().min(1024);
+        let w = f.write_vectored(&rest[..k])?;
+        if w == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write returned 0"));
+        }
+        IoSlice::advance_slices(&mut rest, w);
+    }
+    Ok(())
 }
 
 fn plain_bytes<'a>(buf: &mut Vec<u8>, vals: impl Iterator<Item = &'a [u8]>) {
@@ -6006,11 +6055,15 @@ fn write_users(path: &Path, rows: &[UserRow], people: &[(u64, u32)], cat_names: 
                 at = if used + run == people[i].1 as usize { (i + 1, 0) } else { (i, used + run) };
             }
         } else {
-            let p = lo / PAGE_ROWS;
-            let start = if p == 0 { 0 } else { ends[p - 1][c - 1] };
-            b.extend_from_slice(&body[c - 1][start..ends[p][c - 1]]);
+            unreachable!("columns 1 to 5 come from `pre`");
         }
         0
+    }, |c, lo| {
+        (c > 0).then(|| {
+            let p = lo / PAGE_ROWS;
+            let start = if p == 0 { 0 } else { ends[p - 1][c - 1] };
+            &body[c - 1][start..ends[p][c - 1]]
+        })
     })
 }
 
@@ -6088,7 +6141,7 @@ fn write_camps(path: &Path, rows: &[CampRow]) -> std::io::Result<()> {
             _ => plain_i64(b, rows.iter().map(|r| r.6)),
         }
         0
-    })
+    }, |_, _| None)
 }
 
 #[cfg(test)]

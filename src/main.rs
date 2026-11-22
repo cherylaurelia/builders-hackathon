@@ -1233,16 +1233,19 @@ impl IdTable {
     }
 
     /// Bit j set when slot j of the line at `home` holds `key`, and bit j set when it is empty. Each key is read
-    /// whole (an aligned 8 bytes is never seen half written).
+    /// whole (an aligned 8 bytes is never seen half written) and once: both masks come from the same read of a
+    /// slot. Two reads would let another thread's insert land between them, and the slot would look neither
+    /// empty nor `key`; the key would then go into the next free slot as well, one ID as two people.
     #[inline(always)]
     fn look(&self, home: u32, key: u64) -> (u32, u32) {
         // SAFETY: home is a multiple of 4 below the (power of two, >= 2^16) quarter count: the first quarter of
-        // a line, 64 readable bytes
+        // a line, 64 readable bytes, 64-byte aligned
         let l = unsafe { self.slots.as_ptr().add(home as usize) };
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         unsafe {
             use std::arch::x86_64::*;
-            let (a, b) = (_mm256_loadu_si256(l as *const __m256i), _mm256_loadu_si256((l as *const __m256i).add(1)));
+            // volatile: one load each, never folded into the compares below as two memory operands
+            let (a, b) = (std::ptr::read_volatile(l as *const __m256i), std::ptr::read_volatile((l as *const __m256i).add(1)));
             // the first four keys, and the fifth: the other three words of `b` are not keys
             let m = |x: __m256i| (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, x))) | (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, x))) & 1) << 4) as u32;
             return (m(_mm256_set1_epi64x(key as i64)), m(_mm256_setzero_si256()));
@@ -1250,7 +1253,8 @@ impl IdTable {
         #[allow(unreachable_code)]
         {
             let k = unsafe { &(*(l as *const Line)).key };
-            let m = |x: u64| (0..5).fold(0, |m, j| m | ((k[j].load(Relaxed) == x) as u32) << j);
+            let v: [u64; 5] = std::array::from_fn(|j| k[j].load(Relaxed));
+            let m = |x: u64| (0..5).fold(0, |m, j| m | ((v[j] == x) as u32) << j);
             (m(key), m(0))
         }
     }

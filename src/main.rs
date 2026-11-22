@@ -324,25 +324,57 @@ unsafe fn ev_hash(p: *const u8) -> Option<(u64, [u64; 2])> {
     Some((EVHASH | (hi >> 3), [hi, lo]))
 }
 
-/// True when no two different event_ids got one key from `ev_hash`: per bucket, the records of every thread in
-/// a table by key.
+/// True when no two different event_ids got one key from `ev_hash`: per bucket, in two passes over the records of
+/// every thread, as `mark_duplicates` does. The first sets a bit per record in a table of 8 slots a record (by a
+/// hash of its key), and a second bit where the slot was set already; the second takes the records whose slot has
+/// that "again" bit, which every record of a key that comes twice has, into a table by key that compares their
+/// digits. Some 125K records a bucket at 60M events: the bits (128 KiB) stay in the core's cache, and only about
+/// one record in six (copies of an event, and slots shared by chance) is copied and looked up.
 fn event_ids_distinct(shards: &mut [Shard], threads: usize) -> bool {
     for s in shards.iter_mut() {
         s.evh.iter_mut().for_each(Stream::finish);
     }
     let shards = &*shards;
     let clash = AtomicBool::new(false);
-    // per thread, used again for every bucket: the bucket's records in one run, and a table of their places + 1
-    // (0 = free); some 40K records a bucket at 20M events, so both stay in the core's cache
+    // per thread, used again for every bucket: the bits, the records of the "again" slots, a table of their places
+    // + 1 (0 = free)
     par(
         threads,
         EVH_BUCKETS,
-        || (Vec::<[u64; 2]>::new(), Vec::<u32>::new()),
-        |(v, t), b| {
+        || (Vec::<u64>::new(), Vec::<[u64; 2]>::new(), Vec::<u32>::new()),
+        |(seen, v, t), b| {
+            let n: usize = shards.iter().map(|s| s.evh[b].len(EVH_BLOCK)).sum();
+            if n == 0 {
+                return;
+            }
+            // 32 slots a word: "seen" bits in the low half, "again" bits in the high half
+            let sbits = (n * 8).next_power_of_two().trailing_zeros().clamp(5, 63);
+            seen.clear();
+            seen.resize(1 << (sbits - 5), 0);
+            let s0 = 64 - sbits;
+            let sp = seen.as_mut_ptr();
+            for s in shards {
+                for blk in s.evh[b].slices(EVH_BLOCK) {
+                    for r in blk {
+                        let x = spread(r[0] >> 3) >> s0;
+                        // SAFETY: x < 2^sbits, so x >> 5 is a word of `seen`
+                        unsafe {
+                            let w = sp.add((x >> 5) as usize);
+                            let (o, m) = (*w, 1u64 << (x & 31));
+                            *w = o | m | (o & m) << 32;
+                        }
+                    }
+                }
+            }
             v.clear();
             for s in shards {
                 for blk in s.evh[b].slices(EVH_BLOCK) {
-                    v.extend_from_slice(blk);
+                    for r in blk {
+                        let x = spread(r[0] >> 3) >> s0;
+                        if (seen[(x >> 5) as usize] >> 32 >> (x & 31)) & 1 != 0 {
+                            v.push(*r);
+                        }
+                    }
                 }
             }
             if v.is_empty() {
@@ -352,7 +384,7 @@ fn event_ids_distinct(shards: &mut [Shard], threads: usize) -> bool {
             t.clear();
             t.resize(cap, 0);
             for (n, r) in v.iter().enumerate() {
-                let mut i = (spread(r[0] >> 3) >> (64 - cap.trailing_zeros())) as usize;
+                let mut i = (spread(r[0] >> 3).rotate_left(32) >> (64 - cap.trailing_zeros())) as usize;
                 loop {
                     let e = t[i];
                     if e == 0 {

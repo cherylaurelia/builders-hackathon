@@ -1192,6 +1192,17 @@ fn prefetch<T>(p: *const T) {
     let _ = p;
 }
 
+/// Asks for the cache line at `p`, to be written; a hint only.
+#[inline(always)]
+fn prefetch_w<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_ET0 }>(p as *const i8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
 // ---------------------------------------------------------------- the ID table
 
 /// In `Line::up` while the links are joined: the ID hangs under another, the rest is 1 + that one's slot.
@@ -3623,9 +3634,9 @@ fn main() {
                         }
                     }
                     let cred: Vec<Cred> =
-                        w.cell.iter().zip(&w.cwrap).zip(&w.buy).map(|((c, &x), b)| Cred { sessions: c[0] as u32 + (x << 8), purchasing: b.purchasing }).collect();
+                        w.cells.iter().zip(&w.round).zip(&w.buy).map(|((c, r), b)| Cred { sessions: c[0] as u32 + (r[0] << 16), purchasing: b.purchasing }).collect();
                     let rev: Vec<i64> = w.buy.iter().map(|b| b.revenue).collect();
-                    let assist: Vec<u32> = w.cell.iter().zip(&w.around).map(|(c, &r)| c[1] as u32 + (r << 8)).collect();
+                    let assist: Vec<u32> = w.cells.iter().zip(&w.round).map(|(c, r)| c[1] as u32 + (r[1] << 16)).collect();
                     tx.send((cred, rev, assist)).unwrap_or_else(|_| die("campaign merger gone"));
                     // thread 0 writes even with no rows: the table needs at least one file
                     if t == 0 || nrows > 0 {
@@ -4692,12 +4703,11 @@ struct Sess {
 struct Work {
     rows: Vec<UserRow>,
     people: Vec<(u64, u32)>, // the people of `rows` in order: name, rows
-    // Per campaign and day (cell = campaign * days + day), in arrays of their own so that the ones every session
-    // touches stay small: sessions credited; sessions assisted, in 16 bits with the times each count went round
-    // apart (`around`); and for the credited sessions with a purchase their number and revenue.
-    cell: Vec<[u8; 2]>, // sessions credited, sessions assisted: each modulo 256, in one line of the cache
-    cwrap: Vec<u32>,    // the times the credit count went round
-    around: Vec<u32>,   // the times the assist count went round
+    // Per campaign and day (cell = campaign * days + day): sessions credited and sessions assisted side by side in
+    // 16 bits each (the campaign a session is credited to assists it that day: one line for both), with the times
+    // each count went round apart (`round`); and for the credited sessions with a purchase their number and revenue.
+    cells: Vec<[u16; 2]>,
+    round: Vec<[u32; 2]>,
     buy: Vec<Buy>,
     doff: i64, // ts (ms after `Ctx::base`) + doff = ms after the midnight that starts day 0 of the window
     start: Vec<u32>, // see partition_work
@@ -4715,12 +4725,16 @@ struct Work {
     // the ts and the campaign of the clicks of the person at hand (up to 64), as arrays for the vector passes
     cts: A32,
     ccamp: A32,
+    ccid: A32, // and its campaign
     bins: Vec<Bin>, // the bins of the person at hand (all free between people)
     bits: Vec<u64>, // which bins are taken
     // the sessions of the person at hand
     ses: Vec<Ses>,
     dcats: Vec<(u32, u16, i64)>, // (row, category, price sum)
     best: Vec<i64>,              // price sum of a row's top category
+    csum: Vec<i64>,              // with many purchases: the price sum per row * 256 + category,
+    cmark: Vec<u32>,             // valid where its mark is `cstamp`
+    cstamp: u32,
     eq: [u64; 64],               // per click of the person at hand, the clicks of the same campaign
     // people with more than 64 clicks
     sessions: Vec<Sess>,
@@ -4742,9 +4756,8 @@ impl Work {
         Work {
             rows: huge_vec(rows_cap),
             people: huge_vec(rows_cap / 2),
-            cell: filled(cells, [0, 0]),
-            cwrap: filled(cells, 0),
-            around: filled(cells, 0),
+            cells: filled(cells, [0, 0]),
+            round: filled(cells, [0, 0]),
             buy: filled(cells, Buy { purchasing: 0, revenue: 0 }),
             doff: cx.base - cx.day0 * DAY,
             start: filled(local + 2, 0),
@@ -4761,11 +4774,15 @@ impl Work {
             sat: vec![0; nbins.next_multiple_of(8) + 3],
             cts: A32([0; 72]),
             ccamp: A32([0; 72]),
+            ccid: A32([0; 72]),
             bins: vec![FREE_BIN; nbins],
             bits: vec![0; nbins / 64 + 1],
             ses: vec![Ses { start: 0, d: 0, row: 0, rev: 0 }; nbins + 1],
             dcats: Vec::new(),
             best: vec![0; nbins + 1],
+            csum: vec![0; (cx.ndays + 1) * 256],
+            cmark: vec![0; (cx.ndays + 1) * 256],
+            cstamp: 0,
             eq: [0; 64],
             sessions: Vec::new(),
             sbit: vec![0; nbins / 64 + 1],
@@ -4930,6 +4947,12 @@ unsafe fn offsets(st: *mut u32, local: usize, act: *mut u32) -> (u32, usize) {
     (run, na)
 }
 
+/// How many records ahead the counting sorts of `partition_work` ask for the line a record goes to.
+const PLACE_PF: usize = 32;
+
+/// How many people ahead `partition_work` asks for a name's line.
+const NAME_PF: usize = 16;
+
 /// rules.md "Events" 5-7 and "Clicks" 4-7 for person partition `p`: the people whose slot number starts with p.
 #[inline(never)]
 fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
@@ -4988,16 +5011,25 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
                 pl.push([l as u32, r.ts, (*(r as *const ERec).sub(1)).ts]);
             }
         };
+        // the line the record PLACE_PF ahead goes to is asked for: a partition's ~20K people spread the stores
+        // over more lines of `ev` than the core's caches keep, so most stores would wait for their line
+        let ahead = |r: &ERec| prefetch_w(ev.add(*st.add(ev_bin(r) + 1) as usize));
         for s in shards {
             for blk in s.ev.slices(p, EV_BLOCK) {
-                let mut four = blk.chunks_exact(4);
-                for r in &mut four {
-                    place(&r[0]);
-                    place(&r[1]);
-                    place(&r[2]);
-                    place(&r[3]);
+                let (bp, n) = (blk.as_ptr(), blk.len());
+                let mut i = 0;
+                while i + 4 <= n {
+                    ahead(&*bp.add((i + PLACE_PF).min(n - 1)));
+                    ahead(&*bp.add((i + PLACE_PF + 1).min(n - 1)));
+                    ahead(&*bp.add((i + PLACE_PF + 2).min(n - 1)));
+                    ahead(&*bp.add((i + PLACE_PF + 3).min(n - 1)));
+                    place(&*bp.add(i));
+                    place(&*bp.add(i + 1));
+                    place(&*bp.add(i + 2));
+                    place(&*bp.add(i + 3));
+                    i += 4;
                 }
-                four.remainder().iter().for_each(&mut place);
+                blk[i..].iter().for_each(&mut place);
             }
         }
         // the purchases by person: `pstart[l]..pstart[l + 1]` of `pls`, as (ts, pay)
@@ -5037,7 +5069,10 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
         let ckp = w.ck.as_mut_ptr();
         for s in shards {
             for blk in s.ck.slices(p, CK_BLOCK) {
-                for r in blk {
+                let (bp, n) = (blk.as_ptr(), blk.len());
+                for i in 0..n {
+                    prefetch_w(ckp.add(*ct.add(ck_bin(&*bp.add((i + PLACE_PF).min(n - 1))) + 1) as usize));
+                    let r = &*bp.add(i);
                     let f = ct.add(ck_bin(r) + 1);
                     *ckp.add(*f as usize) = *r;
                     *f += 1;
@@ -5047,16 +5082,9 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     }
 
     let ev = std::mem::take(&mut w.ev);
-    // the people's names are a cache miss each (Intel 60M: 13% of this function waited there): asked for eight
-    // people ahead
-    const AHEAD: usize = 8;
-    for i in 0..w.nact.min(AHEAD) {
-        cx.ids.prefetch_name(((p << cx.pshift) | w.act[i] as usize) as u32);
-    }
     for i in 0..w.nact {
-        if i + AHEAD < w.nact {
-            cx.ids.prefetch_name(((p << cx.pshift) | w.act[i + AHEAD] as usize) as u32);
-        }
+        // the name's line is read once, a miss: asked for some people ahead
+        cx.ids.prefetch_name(((p << cx.pshift) | w.act[(i + NAME_PF).min(w.nact - 1)] as usize) as u32);
         let l = w.act[i] as usize;
         let (a, b) = (w.start[l] as usize, w.start[l + 1] as usize);
         let name = cx.ids.name(((p << cx.pshift) | l) as u32);
@@ -5077,16 +5105,18 @@ unsafe fn bin_events(evs: &[u32], bp: *mut Bin, wp: *mut u64) -> u64 {
     let mut one = |ts: u32| {
         let b = (ts / GAP as u32) as usize;
         let bin = bp.add(b);
-        (*bin).cnt += 1;
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
             use std::arch::x86_64::*;
-            // lanes (ts, !ts) against the bin's (min, nmax)
-            let t = _mm_xor_si128(_mm_set1_epi32(ts as i32), _mm_setr_epi32(0, -1, 0, 0));
-            _mm_storel_epi64(bin as *mut __m128i, _mm_min_epu32(_mm_loadl_epi64(bin as *const __m128i), t));
+            // the whole bin at once: lanes (ts, !ts, MAX, MAX) against (min, nmax, cnt, sess), then cnt + 1
+            let t = _mm_xor_si128(_mm_set1_epi32(ts as i32), _mm_setr_epi32(0, -1, -1, -1));
+            let t = _mm_or_si128(t, _mm_setr_epi32(0, 0, -1, -1));
+            let v = _mm_min_epu32(_mm_loadu_si128(bin as *const __m128i), t);
+            _mm_storeu_si128(bin as *mut __m128i, _mm_add_epi32(v, _mm_setr_epi32(0, 0, 1, 0)));
         }
         #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
         {
+            (*bin).cnt += 1;
             (*bin).min = (*bin).min.min(ts);
             (*bin).nmax = (*bin).nmax.min(!ts);
         }
@@ -5178,9 +5208,18 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u32], pa: usize, np: usize, ca: usize
 
     // purchases: into their session and row; then each row's top category
     if np != 0 {
-        let Work { rows, pls, bins, ses, dcats, best, .. } = w;
+        let Work { rows, pls, bins, ses, dcats, best, csum, cmark, cstamp, .. } = w;
         let rows = &mut rows[row0..];
         dcats.clear();
+        // many purchases: the sums in a table by row and category (8 bits) instead of a search of the list
+        let table = np > 8 && rows.len() * 256 <= csum.len();
+        if table {
+            *cstamp = cstamp.wrapping_add(1);
+            if *cstamp == 0 {
+                cmark.fill(0);
+                *cstamp = 1;
+            }
+        }
         for &(ts, pay) in &pls[pa..pa + np] {
             // the bin of a kept event is one this person took, so its `sess` is this person's
             let s = &mut ses[bins[(ts / GAP as u32) as usize].sess as usize];
@@ -5188,9 +5227,24 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u32], pa: usize, np: usize, ca: usize
             s.rev += price;
             let g = s.row;
             rows[g as usize].revenue += price;
+            if table {
+                let k = g as usize * 256 + (cat & 0xff) as usize;
+                if cmark[k] != *cstamp {
+                    cmark[k] = *cstamp;
+                    csum[k] = 0;
+                    dcats.push((g, cat, 0));
+                }
+                csum[k] += price;
+                continue;
+            }
             match dcats.iter_mut().find(|c| c.0 == g && c.1 == cat) {
                 Some(c) => c.2 += price,
                 None => dcats.push((g, cat, price)),
+            }
+        }
+        if table {
+            for c in dcats.iter_mut() {
+                c.2 = csum[c.0 as usize * 256 + (c.1 & 0xff) as usize];
             }
         }
         // the highest sum; a tie goes to the category that sorts first
@@ -5206,10 +5260,10 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u32], pa: usize, np: usize, ca: usize
 
     // credit and assists
     if nc == 0 {
-        let Work { cell, cwrap, buy, ses, .. } = w;
+        let Work { cells, round, buy, ses, .. } = w;
         let (width, organic) = (cx.ndays, cx.ncamp);
         for s in &ses[..ns] {
-            credit(cell, cwrap, buy, organic * width + s.d as usize, s.rev);
+            credit(cells, round, buy, organic * width + s.d as usize, s.rev);
         }
     } else if nc <= 64 {
         credit_clicks(cx, ca, nc, ns, w);
@@ -5220,21 +5274,21 @@ fn person_work(cx: &Ctx, name: u64, evs: &[u32], pa: usize, np: usize, ca: usize
 
 /// `n` more sessions assisted by the campaign on the day of cell `at`.
 #[inline(always)]
-fn assisted(cell: &mut [[u8; 2]], around: &mut [u32], at: usize, n: u32) {
-    let v = cell[at][1] as u32 + n;
-    cell[at][1] = v as u8;
-    if v >> 8 != 0 {
-        around[at] += v >> 8;
+fn assisted(cells: &mut [[u16; 2]], round: &mut [[u32; 2]], at: usize, n: u32) {
+    let v = cells[at][1] as u32 + n;
+    cells[at][1] = v as u16;
+    if v >> 16 != 0 {
+        round[at][1] += v >> 16;
     }
 }
 
 /// A session credited to the campaign and day of cell `at`.
 #[inline(always)]
-fn credit(cell: &mut [[u8; 2]], cwrap: &mut [u32], buy: &mut [Buy], at: usize, revenue: i64) {
-    let v = cell[at][0].wrapping_add(1);
-    cell[at][0] = v;
-    if v == 0 {
-        cwrap[at] += 1;
+fn credit(cells: &mut [[u16; 2]], round: &mut [[u32; 2]], buy: &mut [Buy], at: usize, revenue: i64) {
+    let v = cells[at][0] as u32 + 1;
+    cells[at][0] = v as u16;
+    if v >> 16 != 0 {
+        round[at][0] += 1;
     }
     if revenue != 0 {
         let b = &mut buy[at];
@@ -5249,19 +5303,24 @@ fn credit(cell: &mut [[u8; 2]], cwrap: &mut [u32], buy: &mut [Buy], at: usize, r
 #[inline(never)]
 fn credit_clicks(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
     let (width, organic) = (cx.ndays, cx.ncamp);
-    let Work { cell, cwrap, around, buy, ses, ck, cts, ccamp, eq, .. } = w;
+    let Work { cells, round, buy, ses, ck, cts, ccamp, ccid, eq, seen, sctr, .. } = w;
     let cs = &ck[ca..ca + nc];
-    assert!(nc <= 64 && cell.len() == (organic + 1) * width);
+    assert!(nc <= 64 && cells.len() == (organic + 1) * width);
     for (j, c) in cs.iter().enumerate() {
         // SAFETY: j < nc <= 64, and the arrays hold 72
         unsafe {
             *cts.0.get_unchecked_mut(j) = c.ts();
             *ccamp.0.get_unchecked_mut(j) = c.camp() * width as u32; // the campaign's first cell
+            *ccid.0.get_unchecked_mut(j) = c.camp();
         }
+        // its days are one or two lines, read by the sessions below
+        prefetch(cells.as_ptr().wrapping_add(c.camp() as usize * width));
     }
     // the vector passes read up to 8 entries past the last click: the arrays hold 72
     let (tp, cp) = (cts.0.as_ptr(), ccamp.0.as_ptr());
-    unsafe { same_campaign(cp, nc, eq) };
+    if nc <= 8 {
+        unsafe { same_campaign(cp, nc, eq) };
+    }
     for s in &ses[..ns] {
         let d = s.d as usize;
         // SAFETY: a bit of m or e is below nc, the index of one of the person's clicks; a click's campaign is
@@ -5282,19 +5341,45 @@ fn credit_clicks(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
             }
             let at = if m != 0 { *cp.add(best) as usize } else { organic * width } + d;
             // assists: one click of each campaign in the window
-            let day = cell.as_mut_ptr().add(d);
+            let day = cells.as_mut_ptr().add(d);
+            if nc <= 8 {
+                // every click, with no data-dependent branch: it adds 1 when it is in the window and no click
+                // before it in the window has its campaign
+                for j in 0..nc {
+                    let first = (m & *eq.get_unchecked(j) & ((1u64 << j) - 1) == 0) as u32;
+                    let cell = *cp.add(j) as usize;
+                    let a = day.add(cell);
+                    let v = (*a)[1] as u32 + (((m >> j) as u32) & first & 1);
+                    (*a)[1] = v as u16;
+                    if v >> 16 != 0 {
+                        round[cell + d][1] += 1;
+                    }
+                }
+                credit(cells, round, buy, at, s.rev);
+                continue;
+            }
+            // each click of the window, adding 1 when its campaign has no mark of this session yet
+            if *sctr == u32::MAX {
+                seen.fill(0);
+                *sctr = 0;
+            }
+            *sctr += 1;
             let mut c = m;
             while c != 0 {
                 let j = c.trailing_zeros() as usize;
-                let a = day.add(*cp.add(j) as usize);
-                let v = (*a)[1].wrapping_add(1);
-                (*a)[1] = v;
-                if v == 0 {
-                    around[*cp.add(j) as usize + d] += 1;
+                c &= c - 1;
+                let k = *ccid.0.get_unchecked(j) as usize;
+                let first = (*seen.get_unchecked(k) != *sctr) as u32;
+                *seen.get_unchecked_mut(k) = *sctr;
+                let cell = *cp.add(j) as usize;
+                let a = day.add(cell);
+                let v = (*a)[1] as u32 + first;
+                (*a)[1] = v as u16;
+                if v >> 16 != 0 {
+                    round[cell + d][1] += 1;
                 }
-                c &= !*eq.get_unchecked(j);
             }
-            credit(cell, cwrap, buy, at, s.rev);
+            credit(cells, round, buy, at, s.rev);
         }
     }
 }
@@ -5340,7 +5425,7 @@ fn sort_clicks(v: &mut [CRec], tmp: &mut Vec<CRec>, cnt: &mut [u32]) {
 fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
     let width = cx.ndays;
     let organic = cx.ncamp;
-    let Work { cell, cwrap, around, buy, stamp, iv, seen, sctr, sessions, touched, ck, ckt, bts, sat, ses, sbit, spre, sday, .. } = w;
+    let Work { cells, round, buy, stamp, iv, seen, sctr, sessions, touched, ck, ckt, bts, sat, ses, sbit, spre, sday, .. } = w;
     sort_clicks(&mut ck[ca..ca + nc], ckt, sat);
     let cs: &[CRec] = &ck[ca..ca + nc];
     // the ts in order with a sentinel above every session start: the sweeps below stop on it, with no bounds check
@@ -5397,11 +5482,11 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
                     let kk = ccamp(c);
                     if seen[kk] != *sctr {
                         seen[kk] = *sctr;
-                        assisted(cell, around, kk * width + s.d, 1);
+                        assisted(cells, round, kk * width + s.d, 1);
                     }
                 }
             }
-            credit(cell, cwrap, buy, camp * width + s.d, s.revenue);
+            credit(cells, round, buy, camp * width + s.d, s.revenue);
         }
     } else {
         // credit: latest click with start - 7d <= ts <= start
@@ -5416,7 +5501,7 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
             if q > 0 && s.start - cts(&cs[q - 1]) <= WEEK {
                 camp = latest(0, q);
             }
-            credit(cell, cwrap, buy, camp * width + s.d, s.revenue);
+            credit(cells, round, buy, camp * width + s.d, s.revenue);
         }
         // assists: a click at t assists sessions starting in [t, t + 7d]; merge per campaign. The sessions of an
         // interval without a search: at most one session starts in a 30-minute bin (two starts are more than 30
@@ -5454,7 +5539,7 @@ fn credit_big(cx: &Ctx, ca: usize, nc: usize, ns: usize, w: &mut Work) {
                 return;
             }
             for d in ses[a].d as usize..=ses[b - 1].d as usize {
-                assisted(cell, around, k * width + d, (sday[d + 1] as usize).min(b) as u32 - (sday[d] as usize).max(a) as u32);
+                assisted(cells, round, k * width + d, (sday[d + 1] as usize).min(b) as u32 - (sday[d] as usize).max(a) as u32);
             }
         };
         touched.clear();

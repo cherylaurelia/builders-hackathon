@@ -3273,6 +3273,15 @@ fn log2_near(n: usize) -> u32 {
 
 fn main() {
     let t0 = *START.get_or_init(Instant::now);
+    // glibc gives a thread's malloc heap its memory a page at a time (one mprotect per growth), and every such
+    // call takes the address space lock for writing, which stalls the page faults of all the other threads (the
+    // parse's arenas, the sessions phase's buffers). With a top pad of 64 MiB a new heap is writable whole from the
+    // start (untouched pages cost nothing): 609 mprotect calls a run -> 145. Intel 20M: sessions 96 -> 93 ms,
+    // parse -2 ms. A refused setting costs speed only.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::mallopt(libc::M_TOP_PAD, 64 << 20);
+    }
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let threads: usize = env_num("NCPU")
